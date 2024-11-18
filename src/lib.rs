@@ -1,8 +1,13 @@
+mod error;
+
 use crossbeam_utils::CachePadded;
-use std::io::Write;
+use std::io::Read;
 use std::mem::ManuallyDrop;
-use std::ptr::{slice_from_raw_parts, slice_from_raw_parts_mut, NonNull};
+use std::ptr::{copy_nonoverlapping, slice_from_raw_parts, slice_from_raw_parts_mut, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+// re-export
+pub use error::Result;
 
 const FRAME_HEADER_PADDING_MASK: u32 = 0x80000000;
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x7FFFFFFF;
@@ -15,13 +20,15 @@ struct Header {
 }
 
 impl Header {
-    fn data_ptr(&self) -> *const u8 {
+    #[inline]
+    const fn data_ptr(&self) -> *const u8 {
         let header_ptr: *const Header = self;
         unsafe { header_ptr.add(1) as *const u8 }
     }
 
-    fn data_ptr_mut(&mut self) -> *mut u8 {
-        let header_ptr: *mut Header = self;
+    #[inline]
+    const fn data_ptr_mut(&self) -> *mut u8 {
+        let header_ptr = self as *const Header as *mut Header;
         unsafe { header_ptr.add(1) as *mut u8 }
     }
 }
@@ -32,45 +39,55 @@ struct FrameHeader {
 }
 
 impl FrameHeader {
-    fn new(payload_len: u32, is_padding: bool) -> Self {
+    #[inline]
+    const fn new(payload_len: u32, is_padding: bool) -> Self {
         let fields = (payload_len & FRAME_HEADER_MSG_LEN_MASK) | ((is_padding as u32) << 31);
         FrameHeader { fields }
     }
 
-    fn new_padding() -> Self {
+    #[inline]
+    const fn new_padding() -> Self {
         let fields = FRAME_HEADER_PADDING_MASK;
         FrameHeader { fields }
     }
 
-    fn is_padding(&self) -> bool {
+    #[inline]
+    const fn is_padding(&self) -> bool {
         (self.fields & FRAME_HEADER_PADDING_MASK) != 0
     }
 
-    fn payload_len(&self) -> u32 {
+    #[inline]
+    const fn payload_len(&self) -> u32 {
         self.fields & FRAME_HEADER_MSG_LEN_MASK
     }
 
     #[inline]
-    fn get_payload_ptr(&self) -> *const FrameHeader {
-        let message_header_ptr: *const FrameHeader = self;
-        unsafe { message_header_ptr.add(1) }
+    const fn unpack_fields(&self) -> (u32, bool) {
+        let fields = self.fields;
+        (fields & FRAME_HEADER_MSG_LEN_MASK, (fields & FRAME_HEADER_PADDING_MASK) != 0)
     }
 
-    #[inline]
-    fn payload(&mut self, size: usize) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.get_payload_ptr() as *mut u8, size) }
-    }
-
-    #[inline]
-    fn get_payload_ptr_mut(&mut self) -> *mut FrameHeader {
-        let message_header_ptr: *mut FrameHeader = self;
-        unsafe { message_header_ptr.add(1) }
-    }
-
-    #[inline]
-    fn payload_mut(&mut self, size: usize) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.get_payload_ptr_mut() as *mut u8, size) }
-    }
+    // #[inline]
+    // const fn get_payload_ptr(&self) -> *const FrameHeader {
+    //     let message_header_ptr: *const FrameHeader = self;
+    //     unsafe { message_header_ptr.add(1) }
+    // }
+    //
+    // #[inline]
+    // const fn payload(&self, size: usize) -> &[u8] {
+    //     unsafe { std::slice::from_raw_parts(self.get_payload_ptr() as *mut u8, size) }
+    // }
+    //
+    // #[inline]
+    // const fn get_payload_ptr_mut(&self) -> *mut FrameHeader {
+    //     let message_header_ptr = self as *const FrameHeader as *mut FrameHeader;
+    //     unsafe { message_header_ptr.add(1) }
+    // }
+    //
+    // #[inline]
+    // fn payload_mut(&self, size: usize) -> &mut [u8] {
+    //     unsafe { std::slice::from_raw_parts_mut(self.get_payload_ptr_mut() as *mut u8, size) }
+    // }
 }
 
 #[inline]
@@ -101,18 +118,27 @@ impl RingBuffer {
     }
 
     #[inline]
-    const fn header(&self) -> &Header {
+    const fn header(&self) -> &'static Header {
         unsafe { self.ptr.as_ref() }
     }
 
     #[inline]
-    fn header_mut(&mut self) -> &mut Header {
+    fn header_mut(&mut self) -> &'static mut Header {
         unsafe { self.ptr.as_mut() }
     }
 
     fn into_writer(self) -> Writer {
         let capacity = self.header().capacity.load(Ordering::SeqCst);
         Writer {
+            ring: self,
+            position: 0,
+            capacity,
+        }
+    }
+
+    fn into_reader(self) -> Reader {
+        let capacity = self.header().capacity.load(Ordering::SeqCst);
+        Reader {
             ring: self,
             position: 0,
             capacity,
@@ -140,13 +166,15 @@ struct Claim<'a> {
 }
 
 impl<'a> Claim<'a> {
-    fn get_buffer(&self) -> &[u8] {
+    #[inline]
+    const fn get_buffer(&self) -> &[u8] {
         unsafe {
             let ptr = self.writer.ring.header().data_ptr();
             &*slice_from_raw_parts(ptr.add(self.writer.index() + size_of::<FrameHeader>()), self.limit)
         }
     }
 
+    #[inline]
     fn get_buffer_mut(&mut self) -> &mut [u8] {
         unsafe {
             let ptr = self.writer.ring.header_mut().data_ptr_mut();
@@ -154,13 +182,15 @@ impl<'a> Claim<'a> {
         }
     }
 
-    fn frame_header(&self) -> &FrameHeader {
+    #[inline]
+    const fn frame_header(&self) -> &FrameHeader {
         unsafe {
             let ptr = self.writer.ring.header().data_ptr();
             &*(ptr.add(self.writer.index()) as *const FrameHeader)
         }
     }
 
+    #[inline]
     fn frame_header_mut(&mut self) -> &mut FrameHeader {
         unsafe {
             let ptr = self.writer.ring.header_mut().data_ptr_mut();
@@ -178,7 +208,11 @@ impl<'a> Claim<'a> {
     fn commit_impl(&mut self) {
         println!("[{}] index before commit: {}", self.is_padding, self.writer.index());
         println!("[{}] position before commit: {}", self.is_padding, self.writer.position);
-        println!("[{}] position before commit: {}", self.is_padding, self.writer.ring.header().producer_position.load(Ordering::SeqCst));
+        println!(
+            "[{}] position before commit: {}",
+            self.is_padding,
+            self.writer.ring.header().producer_position.load(Ordering::SeqCst)
+        );
 
         // update frame header
         let fields = (self.limit as u32 & FRAME_HEADER_MSG_LEN_MASK) | ((self.is_padding as u32) << 31);
@@ -196,7 +230,11 @@ impl<'a> Claim<'a> {
 
         println!("[{}] index after commit: {}", self.is_padding, self.writer.index());
         println!("[{}] position after commit: {}", self.is_padding, self.writer.position);
-        println!("[{}] position after commit: {}", self.is_padding, self.writer.ring.header().producer_position.load(Ordering::SeqCst));
+        println!(
+            "[{}] position after commit: {}",
+            self.is_padding,
+            self.writer.ring.header().producer_position.load(Ordering::SeqCst)
+        );
     }
 }
 
@@ -241,10 +279,156 @@ impl Writer {
     }
 }
 
+struct Reader {
+    ring: RingBuffer,
+    position: usize, // local position
+    capacity: usize, // ring buffer capacity
+}
+
+struct Message {
+    header: &'static Header,
+    position: usize, // marks beginning of message payload
+    len: usize,      // message length
+    capacity: usize, // ring buffer capacity
+    is_padding: bool,
+}
+
+impl Message {
+    #[inline]
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    const fn index(&self) -> usize {
+        self.position & (self.capacity - 1)
+    }
+
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> Result<()> {
+        let producer_position_before = self.header.producer_position.load(Ordering::Acquire);
+
+        // TODO add validation
+        
+        unsafe {
+            copy_nonoverlapping(self.header.data_ptr().add(self.index()), buf.as_mut_ptr(), self.len);
+        }
+        let producer_position_after = self.header.producer_position.load(Ordering::Acquire);
+
+        match producer_position_after > producer_position_before + self.capacity {
+            true => Err(error::Error::Overrun(self.position)),
+            false => Ok(()),
+        }
+    }
+}
+
+struct BatchIter<'a> {
+    reader: &'a mut Reader,
+    limit: usize,     // producer position snapshot
+    remaining: usize, // how many bytes we can consume
+}
+
+// msg_type: u32
+// payload_length: u32
+
+// packed as u64?
+// use u32::MAX as PADDING_FRAME -> check for reserved (cold)
+// use 0 as not UNSPECIFIED
+
+impl<'a> Iterator for BatchIter<'a> {
+    type Item = Result<Message>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // we reached the batch limit
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let producer_position_before = self.reader.position;
+
+        let frame_header = self.reader.current_frame_header();
+        let (payload_len, is_padding) = frame_header.unpack_fields();
+
+        let producer_position_after = self.reader.ring.header().producer_position.load(Ordering::Acquire);
+
+        // ensure we have not been overrun
+        if producer_position_after > producer_position_before + self.reader.capacity {
+            return Some(Err(error::Error::Overrun(self.reader.position)));
+        }
+
+        let message = Message {
+            header: self.reader.ring.header(),
+            position: self.reader.position + size_of::<FrameHeader>(),
+            len: payload_len as usize,
+            capacity: self.reader.capacity,
+            is_padding,
+        };
+
+        let aligned_payload_len = get_aligned_size(message.len() as u64) as usize;
+        self.remaining -= aligned_payload_len + size_of::<FrameHeader>();
+        self.reader.position += aligned_payload_len + size_of::<FrameHeader>();
+
+        Some(Ok(message))
+    }
+}
+
+impl Reader {
+    #[inline]
+    const fn current_frame_header(&self) -> &'static FrameHeader {
+        unsafe { &*(self.ring.header().data_ptr().add(self.index()) as *const FrameHeader) }
+    }
+
+    #[inline]
+    const fn index(&self) -> usize {
+        self.position & (self.capacity - 1)
+    }
+
+    #[inline]
+    fn batch_iter(&mut self) -> BatchIter {
+        let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
+        let limit = producer_position - self.position;
+        BatchIter {
+            reader: self,
+            limit,
+            remaining: limit,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering::SeqCst;
+
+    #[test]
+    fn reader_and_writer() {
+        let bytes = CachePadded::new([0u8; size_of::<Header>() + 128]);
+        let mut writer = RingBuffer::new(&*bytes).into_writer();
+        let mut reader = RingBuffer::new(&*bytes).into_reader();
+        
+        let mut claim = writer.claim(5);
+        claim.get_buffer_mut().copy_from_slice(b"hello");
+        claim.commit();
+
+        let mut claim = writer.claim(5);
+        claim.get_buffer_mut().copy_from_slice(b"world");
+        claim.commit();
+        
+        let mut iter = reader.batch_iter();
+        
+        let mut msg = iter.next().unwrap().unwrap();
+        let mut payload = [0u8; 1024];
+        msg.read(&mut payload).unwrap();
+        let payload = &payload[..msg.len()];
+        assert_eq!(payload, b"hello");
+
+        let mut msg = iter.next().unwrap().unwrap();
+        let mut payload = [0u8; 1024];
+        msg.read(&mut payload).unwrap();
+        let payload = &payload[..msg.len()];
+        assert_eq!(payload, b"world");
+
+    }
 
     #[test]
     fn frame_header() {
@@ -276,7 +460,6 @@ mod tests {
         assert_eq!(16, get_aligned_size(13));
         assert_eq!(16, get_aligned_size(16));
     }
-
 
     #[test]
     fn should_insert_padding() {
@@ -344,11 +527,9 @@ mod tests {
     }
 
     #[test]
-    fn it_works() {
+    fn should_construct_ring_buffer() {
         let data = CachePadded::new([0u8; 1024]);
-
         let rb = RingBuffer::new(&*data);
-
         assert_eq!(0, rb.header().producer_position.load(SeqCst));
         assert_eq!(1024, rb.header().capacity.load(SeqCst));
     }

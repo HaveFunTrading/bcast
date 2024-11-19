@@ -1,5 +1,6 @@
 mod error;
 
+use std::io;
 use crossbeam_utils::CachePadded;
 use std::io::Read;
 use std::mem::ManuallyDrop;
@@ -13,6 +14,7 @@ const FRAME_HEADER_PADDING_MASK: u32 = 0x80000000;
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x7FFFFFFF;
 const FRAME_HEADER_ALIGNMENT: usize = align_of::<FrameHeader>();
 
+#[derive(Debug)]
 #[repr(C)]
 struct Header {
     producer_position: CachePadded<AtomicUsize>, // will always increase
@@ -245,6 +247,8 @@ impl<'a> Drop for Claim<'a> {
 }
 
 impl Writer {
+    
+    // TODO should return Result if we exceed MTU
     #[inline]
     fn claim(&mut self, len: u32) -> Claim {
         let remaining = self.remaining();
@@ -285,6 +289,7 @@ struct Reader {
     capacity: usize, // ring buffer capacity
 }
 
+#[derive(Debug, Clone)]
 struct Message {
     header: &'static Header,
     position: usize, // marks beginning of message payload
@@ -305,11 +310,11 @@ impl Message {
     }
 
     #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> Result<()> {
+    fn read(&self, buf: &mut [u8]) -> Result<()> {
         let producer_position_before = self.header.producer_position.load(Ordering::Acquire);
 
         // TODO add validation
-        
+
         unsafe {
             copy_nonoverlapping(self.header.data_ptr().add(self.index()), buf.as_mut_ptr(), self.len);
         }
@@ -339,18 +344,37 @@ impl<'a> Iterator for BatchIter<'a> {
     type Item = Result<Message>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // attempt to receive next frame
+        // if the frame is padding will skip it and attempt to return next frame
+        match self.receive_next() {
+            None => None,
+            Some(msg) => match msg {
+                Ok(msg) if !msg.is_padding => Some(Ok(msg)),
+                Ok(_) => self.receive_next(),
+                Err(err) => Some(Err(err)),
+            },
+        }
+    }
+}
+
+impl<'a> BatchIter<'a> {
+    fn receive_next(&mut self) -> Option<Result<Message>> {
         // we reached the batch limit
         if self.remaining == 0 {
             return None;
         }
 
+        // extract frame header fields
         let producer_position_before = self.reader.position;
-
         let frame_header = self.reader.current_frame_header();
         let (payload_len, is_padding) = frame_header.unpack_fields();
-
         let producer_position_after = self.reader.ring.header().producer_position.load(Ordering::Acquire);
 
+        // I read something at position 100 is it still valid
+        // it's only valid if current producer position has not lapped us
+        // so if the current producer position is 1000, capacity 200, reading at position 100 is an error
+        // but reading at position 250 is ok
+        
         // ensure we have not been overrun
         if producer_position_after > producer_position_before + self.reader.capacity {
             return Some(Err(error::Error::Overrun(self.reader.position)));
@@ -374,7 +398,7 @@ impl<'a> Iterator for BatchIter<'a> {
 
 impl Reader {
     #[inline]
-    const fn current_frame_header(&self) -> &'static FrameHeader {
+    const fn current_frame_header(&self) -> &FrameHeader {
         unsafe { &*(self.ring.header().data_ptr().add(self.index()) as *const FrameHeader) }
     }
 
@@ -402,10 +426,10 @@ mod tests {
 
     #[test]
     fn reader_and_writer() {
-        let bytes = CachePadded::new([0u8; size_of::<Header>() + 128]);
+        let bytes = CachePadded::new([0u8; size_of::<Header>() + 64]);
         let mut writer = RingBuffer::new(&*bytes).into_writer();
         let mut reader = RingBuffer::new(&*bytes).into_reader();
-        
+
         let mut claim = writer.claim(5);
         claim.get_buffer_mut().copy_from_slice(b"hello");
         claim.commit();
@@ -413,21 +437,55 @@ mod tests {
         let mut claim = writer.claim(5);
         claim.get_buffer_mut().copy_from_slice(b"world");
         claim.commit();
-        
+
         let mut iter = reader.batch_iter();
-        
-        let mut msg = iter.next().unwrap().unwrap();
+
+        let msg = iter.next().unwrap().unwrap();
         let mut payload = [0u8; 1024];
         msg.read(&mut payload).unwrap();
         let payload = &payload[..msg.len()];
         assert_eq!(payload, b"hello");
 
-        let mut msg = iter.next().unwrap().unwrap();
+        let msg = iter.next().unwrap().unwrap();
         let mut payload = [0u8; 1024];
         msg.read(&mut payload).unwrap();
         let payload = &payload[..msg.len()];
         assert_eq!(payload, b"world");
 
+        assert_eq!(32, writer.index());
+        assert_eq!(32, writer.remaining());
+        assert_eq!(32, iter.reader.index());
+        
+        assert!(iter.next().is_none());
+        
+        assert_eq!(32, iter.reader.index());
+        assert_eq!(32, iter.reader.position);
+        assert_eq!(32, writer.position);
+        assert_eq!(32, writer.remaining());
+
+        let claim = writer.claim(15);
+        claim.commit();
+
+        assert_eq!(56, writer.index());
+        assert_eq!(56, writer.position);
+
+        let mut claim = writer.claim(4);
+        claim.get_buffer_mut().copy_from_slice(b"test");
+        claim.commit();
+
+        let mut iter = reader.batch_iter();
+        
+        // skip big message
+        let _ = iter.next().unwrap().unwrap();
+        let msg = iter.next().unwrap().unwrap();
+
+        let mut payload = [0u8; 1024];
+        msg.read(&mut payload).unwrap();
+        let payload = &payload[..msg.len()];
+        assert_eq!(payload, b"test");
+        
+        assert_eq!(reader.index(), writer.index());
+        assert_eq!(reader.position, writer.position);
     }
 
     #[test]

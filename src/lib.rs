@@ -1,6 +1,5 @@
 mod error;
 
-use std::io;
 use crossbeam_utils::CachePadded;
 use std::io::Read;
 use std::mem::ManuallyDrop;
@@ -10,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // re-export
 pub use error::Result;
 
+pub const HEADER_SIZE: usize = size_of::<Header>();
 const FRAME_HEADER_PADDING_MASK: u32 = 0x80000000;
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x7FFFFFFF;
 const FRAME_HEADER_ALIGNMENT: usize = align_of::<FrameHeader>();
@@ -140,9 +140,10 @@ impl RingBuffer {
 
     fn into_reader(self) -> Reader {
         let capacity = self.header().capacity.load(Ordering::SeqCst);
+        let producer_position = self.header().producer_position.load(Ordering::SeqCst);
         Reader {
             ring: self,
-            position: 0,
+            position: producer_position,
             capacity,
         }
     }
@@ -247,7 +248,6 @@ impl<'a> Drop for Claim<'a> {
 }
 
 impl Writer {
-    
     // TODO should return Result if we exceed MTU
     #[inline]
     fn claim(&mut self, len: u32) -> Claim {
@@ -300,8 +300,13 @@ struct Message {
 
 impl Message {
     #[inline]
-    const fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
+    }
+
+    #[inline]
+    pub const fn is_padding(&self) -> bool {
+        self.is_padding
     }
 
     #[inline]
@@ -309,28 +314,33 @@ impl Message {
         self.position & (self.capacity - 1)
     }
 
+    /// Read the message into specified buffer. It will return error if the provided buffer
+    /// is too small. Will also return error if at any point the producer has overrun the reader.
+    /// On success, it will return the number of bytes written to the buffer.
     #[inline]
-    fn read(&self, buf: &mut [u8]) -> Result<()> {
-        let producer_position_before = self.header.producer_position.load(Ordering::Acquire);
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        if self.len > buf.len() {
+            return Err(error::Error::InsufficientBufferSize(buf.len(), self.len));
+        }
 
-        // TODO add validation
-
+        // attempt to copy message data into provided buffer
+        let producer_position_before = self.position;
         unsafe {
             copy_nonoverlapping(self.header.data_ptr().add(self.index()), buf.as_mut_ptr(), self.len);
         }
         let producer_position_after = self.header.producer_position.load(Ordering::Acquire);
 
+        // ensure we have not been overrun by the producer
         match producer_position_after > producer_position_before + self.capacity {
             true => Err(error::Error::Overrun(self.position)),
-            false => Ok(()),
+            false => Ok(self.len),
         }
     }
 }
 
 struct BatchIter<'a> {
     reader: &'a mut Reader,
-    limit: usize,     // producer position snapshot
-    remaining: usize, // how many bytes we can consume
+    remaining: usize, // remaining bytes to consume
 }
 
 // msg_type: u32
@@ -366,14 +376,9 @@ impl<'a> BatchIter<'a> {
 
         // extract frame header fields
         let producer_position_before = self.reader.position;
-        let frame_header = self.reader.current_frame_header();
+        let frame_header = self.reader.as_frame_header();
         let (payload_len, is_padding) = frame_header.unpack_fields();
         let producer_position_after = self.reader.ring.header().producer_position.load(Ordering::Acquire);
-
-        // I read something at position 100 is it still valid
-        // it's only valid if current producer position has not lapped us
-        // so if the current producer position is 1000, capacity 200, reading at position 100 is an error
-        // but reading at position 250 is ok
         
         // ensure we have not been overrun
         if producer_position_after > producer_position_before + self.reader.capacity {
@@ -398,7 +403,7 @@ impl<'a> BatchIter<'a> {
 
 impl Reader {
     #[inline]
-    const fn current_frame_header(&self) -> &FrameHeader {
+    const fn as_frame_header(&self) -> &FrameHeader {
         unsafe { &*(self.ring.header().data_ptr().add(self.index()) as *const FrameHeader) }
     }
 
@@ -408,12 +413,11 @@ impl Reader {
     }
 
     #[inline]
-    fn batch_iter(&mut self) -> BatchIter {
+    pub fn batch_iter(&mut self) -> BatchIter {
         let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
         let limit = producer_position - self.position;
         BatchIter {
             reader: self,
-            limit,
             remaining: limit,
         }
     }
@@ -423,9 +427,10 @@ impl Reader {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering::SeqCst;
+    use crate::error::Error;
 
     #[test]
-    fn reader_and_writer() {
+    fn should_read_messages_in_batch() {
         let bytes = CachePadded::new([0u8; size_of::<Header>() + 64]);
         let mut writer = RingBuffer::new(&*bytes).into_writer();
         let mut reader = RingBuffer::new(&*bytes).into_reader();
@@ -455,9 +460,9 @@ mod tests {
         assert_eq!(32, writer.index());
         assert_eq!(32, writer.remaining());
         assert_eq!(32, iter.reader.index());
-        
+
         assert!(iter.next().is_none());
-        
+
         assert_eq!(32, iter.reader.index());
         assert_eq!(32, iter.reader.position);
         assert_eq!(32, writer.position);
@@ -474,7 +479,7 @@ mod tests {
         claim.commit();
 
         let mut iter = reader.batch_iter();
-        
+
         // skip big message
         let _ = iter.next().unwrap().unwrap();
         let msg = iter.next().unwrap().unwrap();
@@ -483,11 +488,29 @@ mod tests {
         msg.read(&mut payload).unwrap();
         let payload = &payload[..msg.len()];
         assert_eq!(payload, b"test");
+
+        assert!(iter.next().is_none());
         
         assert_eq!(reader.index(), writer.index());
         assert_eq!(reader.position, writer.position);
     }
 
+    #[test]
+    fn should_overrun_reader() {
+        let bytes = CachePadded::new([0u8; HEADER_SIZE + 64]);
+        let mut writer = RingBuffer::new(&*bytes).into_writer();
+        let mut reader = RingBuffer::new(&*bytes).into_reader();
+        
+        writer.claim(16).commit();
+        writer.claim(16).commit();
+        writer.claim(16).commit();
+        writer.claim(16).commit();
+        
+        let mut iter = reader.batch_iter();
+        let msg = iter.next().unwrap();
+        assert!(matches!(msg.unwrap_err(), Error::Overrun(_)));
+    }
+    
     #[test]
     fn frame_header() {
         assert_eq!(8, FRAME_HEADER_ALIGNMENT);
@@ -550,7 +573,7 @@ mod tests {
 
     #[test]
     fn should_ensure_frame_alignment() {
-        let bytes = CachePadded::new([0u8; 1024]);
+        let bytes = CachePadded::new([0u8; size_of::<Header>() + 1024]);
         let mut writer = RingBuffer::new(&*bytes).into_writer();
 
         let header_ptr = writer.ring.header() as *const Header;
@@ -586,7 +609,7 @@ mod tests {
 
     #[test]
     fn should_construct_ring_buffer() {
-        let data = CachePadded::new([0u8; 1024]);
+        let data = CachePadded::new([0u8; size_of::<Header>() + 1024]);
         let rb = RingBuffer::new(&*data);
         assert_eq!(0, rb.header().producer_position.load(SeqCst));
         assert_eq!(1024, rb.header().capacity.load(SeqCst));

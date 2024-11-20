@@ -115,7 +115,7 @@ impl RingBuffer {
         Self {
             ptr: NonNull::new(header).unwrap(),
             capacity,
-            mtu: capacity - size_of::<FrameHeader>(),
+            mtu: capacity / 2 - size_of::<FrameHeader>(),
         }
     }
 
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn should_insert_padding() {
-        let bytes = CachePadded::new([0u8; size_of::<Header>() + 32]);
+        let bytes = CachePadded::new([0u8; HEADER_SIZE + 64]);
         let mut writer = RingBuffer::new(&*bytes).into_writer();
 
         assert_eq!(0, writer.index());
@@ -551,20 +551,20 @@ mod tests {
         claim.commit();
 
         assert_eq!(24, writer.index());
-        assert_eq!(8, writer.remaining());
+        assert_eq!(40, writer.remaining());
 
         let claim = writer.claim(5).unwrap();
         assert_eq!(5, claim.get_buffer().len());
         claim.commit();
 
-        assert_eq!(16, writer.index());
-        assert_eq!(16, writer.remaining());
+        assert_eq!(40, writer.index());
+        assert_eq!(24, writer.remaining());
 
-        let claim = writer.claim(8).unwrap();
-        assert_eq!(8, claim.get_buffer().len());
+        let claim = writer.claim(17).unwrap();
+        assert_eq!(17, claim.get_buffer().len());
         claim.commit();
 
-        assert_eq!(0, writer.index());
+        assert_eq!(32, writer.index());
         assert_eq!(32, writer.remaining());
     }
 

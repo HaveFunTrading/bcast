@@ -12,7 +12,6 @@ pub use error::Result;
 pub const HEADER_SIZE: usize = size_of::<Header>();
 const FRAME_HEADER_PADDING_MASK: u32 = 0x80000000;
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x7FFFFFFF;
-const FRAME_HEADER_ALIGNMENT: usize = align_of::<FrameHeader>();
 
 #[derive(Debug)]
 #[repr(C)]
@@ -36,20 +35,20 @@ impl Header {
 
 #[repr(C, align(8))]
 struct FrameHeader {
-    fields: u32, // contains padding flag and payload length
+    fields: u32,       // contains padding flag and payload length
+    user_defined: u32, // user defined field
 }
 
 impl FrameHeader {
     #[inline]
-    const fn new(payload_len: u32, is_padding: bool) -> Self {
+    const fn new(payload_len: u32, user_defined: u32, is_padding: bool) -> Self {
         let fields = (payload_len & FRAME_HEADER_MSG_LEN_MASK) | ((is_padding as u32) << 31);
-        FrameHeader { fields }
+        FrameHeader { fields, user_defined }
     }
 
     #[inline]
     const fn new_padding() -> Self {
-        let fields = FRAME_HEADER_PADDING_MASK;
-        FrameHeader { fields }
+        Self::new(0, 0, true)
     }
 
     #[inline]
@@ -63,9 +62,9 @@ impl FrameHeader {
     }
 
     #[inline]
-    const fn unpack_fields(&self) -> (u32, bool) {
+    const fn unpack_fields(&self) -> (u32, bool, u32) {
         let fields = self.fields;
-        (fields & FRAME_HEADER_MSG_LEN_MASK, (fields & FRAME_HEADER_PADDING_MASK) != 0)
+        (fields & FRAME_HEADER_MSG_LEN_MASK, (fields & FRAME_HEADER_PADDING_MASK) != 0, self.user_defined)
     }
 
     // #[inline]
@@ -94,7 +93,7 @@ impl FrameHeader {
 #[inline]
 const fn get_aligned_size(payload_length: u64) -> u64 {
     // Calculate the number of bytes needed to ensure frame header alignment
-    const ALIGNMENT_MASK: u64 = FRAME_HEADER_ALIGNMENT as u64 - 1;
+    const ALIGNMENT_MASK: u64 = align_of::<FrameHeader>() as u64 - 1;
     (payload_length + ALIGNMENT_MASK) & !ALIGNMENT_MASK
 }
 
@@ -102,7 +101,7 @@ const fn get_aligned_size(payload_length: u64) -> u64 {
 struct RingBuffer {
     ptr: NonNull<Header>,
     capacity: usize,
-    mtu: usize, // TODO should this be 0.5 capacity?
+    mtu: usize,
 }
 
 impl RingBuffer {
@@ -273,16 +272,16 @@ struct Reader {
 #[derive(Debug, Clone)]
 struct Message {
     header: &'static Header,
-    position: usize, // marks beginning of message payload
-    len: usize,      // message length
-    capacity: usize, // ring buffer capacity
-    is_padding: bool,
+    position: usize,    // marks beginning of message payload
+    capacity: usize,    // ring buffer capacity
+    payload_len: usize, // message length
+    is_padding: bool,   // indicates padding frame
 }
 
 impl Message {
     #[inline]
     pub const fn len(&self) -> usize {
-        self.len
+        self.payload_len
     }
 
     #[inline]
@@ -300,21 +299,21 @@ impl Message {
     /// On success, it will return the number of bytes written to the buffer.
     #[inline]
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        if self.len > buf.len() {
-            return Err(error::Error::InsufficientBufferSize(buf.len(), self.len));
+        if self.payload_len > buf.len() {
+            return Err(error::Error::InsufficientBufferSize(buf.len(), self.payload_len));
         }
 
         // attempt to copy message data into provided buffer
         let producer_position_before = self.position;
         unsafe {
-            copy_nonoverlapping(self.header.data_ptr().add(self.index()), buf.as_mut_ptr(), self.len);
+            copy_nonoverlapping(self.header.data_ptr().add(self.index()), buf.as_mut_ptr(), self.payload_len);
         }
         let producer_position_after = self.header.producer_position.load(Ordering::Acquire);
 
         // ensure we have not been overrun by the producer
         match producer_position_after > producer_position_before + self.capacity {
             true => Err(error::Error::Overrun(self.position)),
-            false => Ok(self.len),
+            false => Ok(self.payload_len),
         }
     }
 }
@@ -358,7 +357,7 @@ impl<'a> BatchIter<'a> {
         // extract frame header fields
         let producer_position_before = self.reader.position;
         let frame_header = self.reader.as_frame_header();
-        let (payload_len, is_padding) = frame_header.unpack_fields();
+        let (payload_len, is_padding, _) = frame_header.unpack_fields();
         let producer_position_after = self.reader.ring.header().producer_position.load(Ordering::Acquire);
 
         // ensure we have not been overrun
@@ -369,7 +368,7 @@ impl<'a> BatchIter<'a> {
         let message = Message {
             header: self.reader.ring.header(),
             position: self.reader.position + size_of::<FrameHeader>(),
-            len: payload_len as usize,
+            payload_len: payload_len as usize,
             capacity: self.reader.ring.capacity,
             is_padding,
         };
@@ -510,21 +509,21 @@ mod tests {
 
     #[test]
     fn frame_header() {
-        assert_eq!(8, FRAME_HEADER_ALIGNMENT);
+        assert_eq!(8, align_of::<FrameHeader>());
 
-        let frame = FrameHeader::new(10, false);
+        let frame = FrameHeader::new(10, 0, false);
         assert!(!frame.is_padding());
         assert_eq!(10, frame.payload_len());
 
-        let frame = FrameHeader::new(10, true);
+        let frame = FrameHeader::new(10, 0, true);
         assert!(frame.is_padding());
         assert_eq!(10, frame.payload_len());
 
-        let frame = FrameHeader::new(0, false);
+        let frame = FrameHeader::new(0, 0, false);
         assert!(!frame.is_padding());
         assert_eq!(0, frame.payload_len());
 
-        let frame = FrameHeader::new(0, true);
+        let frame = FrameHeader::new(0, 0, true);
         assert!(frame.is_padding());
         assert_eq!(0, frame.payload_len());
 

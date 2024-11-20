@@ -18,7 +18,6 @@ const FRAME_HEADER_ALIGNMENT: usize = align_of::<FrameHeader>();
 #[repr(C)]
 struct Header {
     producer_position: CachePadded<AtomicUsize>, // will always increase
-    capacity: CachePadded<AtomicUsize>,
 }
 
 impl Header {
@@ -102,6 +101,8 @@ const fn get_aligned_size(payload_length: u64) -> u64 {
 #[derive(Clone)]
 struct RingBuffer {
     ptr: NonNull<Header>,
+    capacity: usize,
+    mtu: usize, // TODO should this be 0.5 capacity?
 }
 
 impl RingBuffer {
@@ -109,13 +110,12 @@ impl RingBuffer {
         assert!(bytes.len() > size_of::<Header>(), "insufficient size for the header");
         assert!((bytes.len() - size_of::<Header>()).is_power_of_two(), "buffer len must be power of two");
 
-        unsafe {
-            let header = bytes.as_ptr() as *mut Header;
-            (*header).producer_position = CachePadded::new(AtomicUsize::new(0));
-            (*header).capacity = CachePadded::new(AtomicUsize::new(bytes.len() - size_of::<Header>()));
-            Self {
-                ptr: NonNull::new(header).unwrap(),
-            }
+        let header = bytes.as_ptr() as *mut Header;
+        let capacity = bytes.len() - size_of::<Header>();
+        Self {
+            ptr: NonNull::new(header).unwrap(),
+            capacity,
+            mtu: capacity - size_of::<FrameHeader>(),
         }
     }
 
@@ -130,21 +130,17 @@ impl RingBuffer {
     }
 
     fn into_writer(self) -> Writer {
-        let capacity = self.header().capacity.load(Ordering::SeqCst);
         Writer {
             ring: self,
             position: 0,
-            capacity,
         }
     }
 
     fn into_reader(self) -> Reader {
-        let capacity = self.header().capacity.load(Ordering::SeqCst);
         let producer_position = self.header().producer_position.load(Ordering::SeqCst);
         Reader {
             ring: self,
             position: producer_position,
-            capacity,
         }
     }
 }
@@ -152,7 +148,6 @@ impl RingBuffer {
 struct Writer {
     ring: RingBuffer,
     position: usize,
-    capacity: usize,
 }
 
 impl From<RingBuffer> for Writer {
@@ -209,14 +204,6 @@ impl<'a> Claim<'a> {
 
     #[inline]
     fn commit_impl(&mut self) {
-        println!("[{}] index before commit: {}", self.is_padding, self.writer.index());
-        println!("[{}] position before commit: {}", self.is_padding, self.writer.position);
-        println!(
-            "[{}] position before commit: {}",
-            self.is_padding,
-            self.writer.ring.header().producer_position.load(Ordering::SeqCst)
-        );
-
         // update frame header
         let fields = (self.limit as u32 & FRAME_HEADER_MSG_LEN_MASK) | ((self.is_padding as u32) << 31);
         let header = self.frame_header_mut();
@@ -230,14 +217,6 @@ impl<'a> Claim<'a> {
             .producer_position
             .fetch_add(self.len + size_of::<FrameHeader>(), Ordering::Release);
         self.writer.position = previous_position + self.len + size_of::<FrameHeader>();
-
-        println!("[{}] index after commit: {}", self.is_padding, self.writer.index());
-        println!("[{}] position after commit: {}", self.is_padding, self.writer.position);
-        println!(
-            "[{}] position after commit: {}",
-            self.is_padding,
-            self.writer.ring.header().producer_position.load(Ordering::SeqCst)
-        );
     }
 }
 
@@ -248,9 +227,12 @@ impl<'a> Drop for Claim<'a> {
 }
 
 impl Writer {
-    // TODO should return Result if we exceed MTU
     #[inline]
-    fn claim(&mut self, len: u32) -> Claim {
+    pub fn claim(&mut self, len: usize) -> Result<Claim> {
+        if len > self.ring.mtu {
+            return Err(error::Error::MtuLimitExceeded(len, self.ring.mtu));
+        }
+
         let remaining = self.remaining();
         let aligned_len = get_aligned_size(len as u64);
 
@@ -264,29 +246,28 @@ impl Writer {
             };
         }
 
-        Claim {
+        Ok(Claim {
             writer: self,
             len: aligned_len as usize,
-            limit: len as usize,
+            limit: len,
             is_padding: false,
-        }
+        })
     }
 
     #[inline]
     const fn index(&self) -> usize {
-        self.position & (self.capacity - 1)
+        self.position & (self.ring.capacity - 1)
     }
 
     #[inline]
     const fn remaining(&self) -> usize {
-        self.capacity - self.index()
+        self.ring.capacity - self.index()
     }
 }
 
 struct Reader {
     ring: RingBuffer,
     position: usize, // local position
-    capacity: usize, // ring buffer capacity
 }
 
 #[derive(Debug, Clone)]
@@ -379,9 +360,9 @@ impl<'a> BatchIter<'a> {
         let frame_header = self.reader.as_frame_header();
         let (payload_len, is_padding) = frame_header.unpack_fields();
         let producer_position_after = self.reader.ring.header().producer_position.load(Ordering::Acquire);
-        
+
         // ensure we have not been overrun
-        if producer_position_after > producer_position_before + self.reader.capacity {
+        if producer_position_after > producer_position_before + self.reader.ring.capacity {
             return Some(Err(error::Error::Overrun(self.reader.position)));
         }
 
@@ -389,7 +370,7 @@ impl<'a> BatchIter<'a> {
             header: self.reader.ring.header(),
             position: self.reader.position + size_of::<FrameHeader>(),
             len: payload_len as usize,
-            capacity: self.reader.capacity,
+            capacity: self.reader.ring.capacity,
             is_padding,
         };
 
@@ -409,7 +390,7 @@ impl Reader {
 
     #[inline]
     const fn index(&self) -> usize {
-        self.position & (self.capacity - 1)
+        self.position & (self.ring.capacity - 1)
     }
 
     #[inline]
@@ -426,8 +407,8 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering::SeqCst;
     use crate::error::Error;
+    use std::sync::atomic::Ordering::SeqCst;
 
     #[test]
     fn should_read_messages_in_batch() {
@@ -435,11 +416,11 @@ mod tests {
         let mut writer = RingBuffer::new(&*bytes).into_writer();
         let mut reader = RingBuffer::new(&*bytes).into_reader();
 
-        let mut claim = writer.claim(5);
+        let mut claim = writer.claim(5).unwrap();
         claim.get_buffer_mut().copy_from_slice(b"hello");
         claim.commit();
 
-        let mut claim = writer.claim(5);
+        let mut claim = writer.claim(5).unwrap();
         claim.get_buffer_mut().copy_from_slice(b"world");
         claim.commit();
 
@@ -468,13 +449,13 @@ mod tests {
         assert_eq!(32, writer.position);
         assert_eq!(32, writer.remaining());
 
-        let claim = writer.claim(15);
+        let claim = writer.claim(15).unwrap();
         claim.commit();
 
         assert_eq!(56, writer.index());
         assert_eq!(56, writer.position);
 
-        let mut claim = writer.claim(4);
+        let mut claim = writer.claim(4).unwrap();
         claim.get_buffer_mut().copy_from_slice(b"test");
         claim.commit();
 
@@ -490,7 +471,7 @@ mod tests {
         assert_eq!(payload, b"test");
 
         assert!(iter.next().is_none());
-        
+
         assert_eq!(reader.index(), writer.index());
         assert_eq!(reader.position, writer.position);
     }
@@ -500,17 +481,33 @@ mod tests {
         let bytes = CachePadded::new([0u8; HEADER_SIZE + 64]);
         let mut writer = RingBuffer::new(&*bytes).into_writer();
         let mut reader = RingBuffer::new(&*bytes).into_reader();
-        
-        writer.claim(16).commit();
-        writer.claim(16).commit();
-        writer.claim(16).commit();
-        writer.claim(16).commit();
-        
+
+        writer.claim(16).unwrap().commit();
+        writer.claim(16).unwrap().commit();
+        writer.claim(16).unwrap().commit();
+        writer.claim(16).unwrap().commit();
+
         let mut iter = reader.batch_iter();
         let msg = iter.next().unwrap();
         assert!(matches!(msg.unwrap_err(), Error::Overrun(_)));
     }
-    
+
+    #[test]
+    fn should_start_read_from_last_producer_position() {
+        let bytes = CachePadded::new([0u8; HEADER_SIZE + 64]);
+        let mut writer = RingBuffer::new(&*bytes).into_writer();
+
+        writer.claim(16).unwrap().commit();
+
+        assert_eq!(24, writer.position);
+        assert_eq!(24, writer.index());
+
+        let reader = RingBuffer::new(&*bytes).into_reader();
+
+        assert_eq!(reader.position, writer.position);
+        assert_eq!(reader.index(), writer.index());
+    }
+
     #[test]
     fn frame_header() {
         assert_eq!(8, FRAME_HEADER_ALIGNMENT);
@@ -549,21 +546,21 @@ mod tests {
 
         assert_eq!(0, writer.index());
 
-        let claim = writer.claim(10);
+        let claim = writer.claim(10).unwrap();
         assert_eq!(10, claim.get_buffer().len());
         claim.commit();
 
         assert_eq!(24, writer.index());
         assert_eq!(8, writer.remaining());
 
-        let claim = writer.claim(5);
+        let claim = writer.claim(5).unwrap();
         assert_eq!(5, claim.get_buffer().len());
         claim.commit();
 
         assert_eq!(16, writer.index());
         assert_eq!(16, writer.remaining());
 
-        let claim = writer.claim(8);
+        let claim = writer.claim(8).unwrap();
         assert_eq!(8, claim.get_buffer().len());
         claim.commit();
 
@@ -579,7 +576,7 @@ mod tests {
         let header_ptr = writer.ring.header() as *const Header;
         let data_ptr = writer.ring.header().data_ptr();
 
-        let claim = writer.claim(16);
+        let claim = writer.claim(16).unwrap();
         let buf_ptr_0 = claim.get_buffer().as_ptr();
         let frame_ptr_0 = claim.frame_header() as *const FrameHeader;
 
@@ -589,18 +586,18 @@ mod tests {
         assert_eq!(size_of::<Header>() + size_of::<FrameHeader>(), buf_ptr_0 as usize - header_ptr as usize);
         assert_eq!(size_of::<FrameHeader>(), buf_ptr_0 as usize - data_ptr as usize);
         assert_eq!(16, claim.get_buffer().len());
-        assert_eq!(256, size_of::<Header>());
+        assert_eq!(128, size_of::<Header>());
         assert_eq!(8, size_of::<FrameHeader>());
         assert_eq!(8, align_of::<FrameHeader>());
         assert_eq!(size_of::<Header>(), frame_ptr_0 as usize - bytes.as_ptr() as usize);
 
         claim.commit();
 
-        let claim = writer.claim(13);
+        let claim = writer.claim(13).unwrap();
         let buf_ptr_1 = claim.get_buffer().as_ptr();
         let frame_ptr_1 = claim.frame_header() as *const FrameHeader;
 
-        assert_eq!(256 + 24, frame_ptr_1 as usize - bytes.as_ptr() as usize);
+        assert_eq!(size_of::<Header>() + 24, frame_ptr_1 as usize - bytes.as_ptr() as usize);
         assert_eq!(16 + size_of::<FrameHeader>(), buf_ptr_1 as usize - buf_ptr_0 as usize);
         assert_eq!(16 + size_of::<FrameHeader>(), frame_ptr_1 as usize - frame_ptr_0 as usize);
 
@@ -609,9 +606,9 @@ mod tests {
 
     #[test]
     fn should_construct_ring_buffer() {
-        let data = CachePadded::new([0u8; size_of::<Header>() + 1024]);
+        let data = CachePadded::new([0u8; HEADER_SIZE + 1024]);
         let rb = RingBuffer::new(&*data);
         assert_eq!(0, rb.header().producer_position.load(SeqCst));
-        assert_eq!(1024, rb.header().capacity.load(SeqCst));
+        assert_eq!(1024, rb.capacity);
     }
 }

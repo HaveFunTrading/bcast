@@ -1,5 +1,6 @@
 mod error;
 
+use std::cmp::min;
 use crossbeam_utils::CachePadded;
 use std::io::Read;
 use std::mem::ManuallyDrop;
@@ -92,7 +93,7 @@ impl FrameHeader {
 
 #[inline]
 const fn get_aligned_size(payload_length: u64) -> u64 {
-    // Calculate the number of bytes needed to ensure frame header alignment
+    // calculate the number of bytes needed to ensure frame header alignment
     const ALIGNMENT_MASK: u64 = align_of::<FrameHeader>() as u64 - 1;
     (payload_length + ALIGNMENT_MASK) & !ALIGNMENT_MASK
 }
@@ -108,13 +109,16 @@ impl RingBuffer {
     fn new(bytes: &[u8]) -> Self {
         assert!(bytes.len() > size_of::<Header>(), "insufficient size for the header");
         assert!((bytes.len() - size_of::<Header>()).is_power_of_two(), "buffer len must be power of two");
+        
+        // represents the max value we can encode on the frame header for the payload length
+        const MAX_PAYLOAD_LEN: usize = 1 << 31;
 
         let header = bytes.as_ptr() as *mut Header;
         let capacity = bytes.len() - size_of::<Header>();
         Self {
             ptr: NonNull::new(header).unwrap(),
             capacity,
-            mtu: capacity / 2 - size_of::<FrameHeader>(),
+            mtu: min(capacity / 2 - size_of::<FrameHeader>(), MAX_PAYLOAD_LEN)
         }
     }
 

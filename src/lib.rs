@@ -2,7 +2,6 @@ mod error;
 
 use std::cmp::min;
 use crossbeam_utils::CachePadded;
-use std::io::Read;
 use std::mem::ManuallyDrop;
 use std::ptr::{copy_nonoverlapping, slice_from_raw_parts, slice_from_raw_parts_mut, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -92,21 +91,21 @@ impl FrameHeader {
 }
 
 #[inline]
-const fn get_aligned_size(payload_length: u64) -> u64 {
+const fn get_aligned_size(payload_length: usize) -> usize {
     // calculate the number of bytes needed to ensure frame header alignment
-    const ALIGNMENT_MASK: u64 = align_of::<FrameHeader>() as u64 - 1;
+    const ALIGNMENT_MASK: usize = align_of::<FrameHeader>() - 1;
     (payload_length + ALIGNMENT_MASK) & !ALIGNMENT_MASK
 }
 
 #[derive(Clone)]
-struct RingBuffer {
+pub struct RingBuffer {
     ptr: NonNull<Header>,
     capacity: usize,
     mtu: usize,
 }
 
 impl RingBuffer {
-    fn new(bytes: &[u8]) -> Self {
+    pub fn new(bytes: &[u8]) -> Self {
         assert!(bytes.len() > size_of::<Header>(), "insufficient size for the header");
         assert!((bytes.len() - size_of::<Header>()).is_power_of_two(), "buffer len must be power of two");
         
@@ -132,14 +131,17 @@ impl RingBuffer {
         unsafe { self.ptr.as_mut() }
     }
 
-    fn into_writer(self) -> Writer {
+    /// Will consume `self` and return instance of writer backed by this ring buffer.
+    pub fn into_writer(self) -> Writer {
         Writer {
             ring: self,
             position: 0,
         }
     }
 
-    fn into_reader(self) -> Reader {
+    /// Will consume `self` and return instance of reader backed by this ring buffer. The reader
+    /// position will be set to producer most up-to-date position.
+    pub fn into_reader(self) -> Reader {
         let producer_position = self.header().producer_position.load(Ordering::SeqCst);
         Reader {
             ring: self,
@@ -148,7 +150,7 @@ impl RingBuffer {
     }
 }
 
-struct Writer {
+pub struct Writer {
     ring: RingBuffer,
     position: usize,
 }
@@ -159,16 +161,17 @@ impl From<RingBuffer> for Writer {
     }
 }
 
-struct Claim<'a> {
-    writer: &'a mut Writer,
-    len: usize,
-    limit: usize,
-    is_padding: bool,
+pub struct Claim<'a> {
+    writer: &'a mut Writer, // underlying writer
+    len: usize,             // frame header aligned payload length
+    limit: usize,           // actual payload length
+    is_padding: bool,       // indicates padding frame
+    user_defined: u32,      // user defined field
 }
 
 impl<'a> Claim<'a> {
     #[inline]
-    const fn get_buffer(&self) -> &[u8] {
+    pub const fn get_buffer(&self) -> &[u8] {
         unsafe {
             let ptr = self.writer.ring.header().data_ptr();
             &*slice_from_raw_parts(ptr.add(self.writer.index() + size_of::<FrameHeader>()), self.limit)
@@ -176,7 +179,7 @@ impl<'a> Claim<'a> {
     }
 
     #[inline]
-    fn get_buffer_mut(&mut self) -> &mut [u8] {
+    pub fn get_buffer_mut(&mut self) -> &mut [u8] {
         unsafe {
             let ptr = self.writer.ring.header_mut().data_ptr_mut();
             &mut *slice_from_raw_parts_mut(ptr.add(self.writer.index() + size_of::<FrameHeader>()), self.limit)
@@ -200,7 +203,7 @@ impl<'a> Claim<'a> {
     }
 
     #[inline]
-    fn commit(self) {
+    pub fn commit(self) {
         // we need to ensure the destructor will not be called in this case
         ManuallyDrop::new(self).commit_impl();
     }
@@ -209,8 +212,10 @@ impl<'a> Claim<'a> {
     fn commit_impl(&mut self) {
         // update frame header
         let fields = (self.limit as u32 & FRAME_HEADER_MSG_LEN_MASK) | ((self.is_padding as u32) << 31);
+        let user_defined = self.user_defined;
         let header = self.frame_header_mut();
         header.fields = fields;
+        header.user_defined = user_defined;
 
         // update header
         let previous_position = self
@@ -232,28 +237,35 @@ impl<'a> Drop for Claim<'a> {
 impl Writer {
     #[inline]
     pub fn claim(&mut self, len: usize) -> Result<Claim> {
+        self.claim_with_user_defined(len, 0)
+    }
+
+    #[inline]
+    pub fn claim_with_user_defined(&mut self, len: usize, user_defined: u32) -> Result<Claim> {
         if len > self.ring.mtu {
             return Err(error::Error::MtuLimitExceeded(len, self.ring.mtu));
         }
 
         let remaining = self.remaining();
-        let aligned_len = get_aligned_size(len as u64);
+        let aligned_len = get_aligned_size(len);
 
         // insert padding frame if required
-        if aligned_len as usize + size_of::<FrameHeader>() > remaining {
+        if aligned_len + size_of::<FrameHeader>() > remaining {
             let _ = Claim {
                 writer: self,
                 len: remaining - size_of::<FrameHeader>(),
                 limit: 0,
                 is_padding: true,
+                user_defined: 0,
             };
         }
 
         Ok(Claim {
             writer: self,
-            len: aligned_len as usize,
+            len: aligned_len,
             limit: len,
             is_padding: false,
+            user_defined
         })
     }
 
@@ -268,31 +280,26 @@ impl Writer {
     }
 }
 
-struct Reader {
+pub struct Reader {
     ring: RingBuffer,
     position: usize, // local position
 }
 
 #[derive(Debug, Clone)]
-struct Message {
-    header: &'static Header,
-    position: usize,    // marks beginning of message payload
-    capacity: usize,    // ring buffer capacity
-    payload_len: usize, // message length
-    is_padding: bool,   // indicates padding frame
+pub struct Message {
+    header: &'static Header, // channel header
+    position: usize,         // marks beginning of message payload
+    capacity: usize,         // ring buffer capacity
+    /// Message length.
+    pub payload_len: usize,
+    /// Indicates padding frame.
+    pub is_padding: bool,
+    /// User defined field.
+    pub user_defined: u32,
 }
 
 impl Message {
-    #[inline]
-    pub const fn len(&self) -> usize {
-        self.payload_len
-    }
-
-    #[inline]
-    pub const fn is_padding(&self) -> bool {
-        self.is_padding
-    }
-
+    
     #[inline]
     const fn index(&self) -> usize {
         self.position & (self.capacity - 1)
@@ -322,17 +329,10 @@ impl Message {
     }
 }
 
-struct BatchIter<'a> {
+pub struct BatchIter<'a> {
     reader: &'a mut Reader,
     remaining: usize, // remaining bytes to consume
 }
-
-// msg_type: u32
-// payload_length: u32
-
-// packed as u64?
-// use u32::MAX as PADDING_FRAME -> check for reserved (cold)
-// use 0 as not UNSPECIFIED
 
 impl<'a> Iterator for BatchIter<'a> {
     type Item = Result<Message>;
@@ -361,7 +361,7 @@ impl<'a> BatchIter<'a> {
         // extract frame header fields
         let producer_position_before = self.reader.position;
         let frame_header = self.reader.as_frame_header();
-        let (payload_len, is_padding, _) = frame_header.unpack_fields();
+        let (payload_len, is_padding, user_defined) = frame_header.unpack_fields();
         let producer_position_after = self.reader.ring.header().producer_position.load(Ordering::Acquire);
 
         // ensure we have not been overrun
@@ -375,9 +375,10 @@ impl<'a> BatchIter<'a> {
             payload_len: payload_len as usize,
             capacity: self.reader.ring.capacity,
             is_padding,
+            user_defined,
         };
 
-        let aligned_payload_len = get_aligned_size(message.len() as u64) as usize;
+        let aligned_payload_len = get_aligned_size(message.payload_len);
         self.remaining -= aligned_payload_len + size_of::<FrameHeader>();
         self.reader.position += aligned_payload_len + size_of::<FrameHeader>();
 
@@ -432,13 +433,13 @@ mod tests {
         let msg = iter.next().unwrap().unwrap();
         let mut payload = [0u8; 1024];
         msg.read(&mut payload).unwrap();
-        let payload = &payload[..msg.len()];
+        let payload = &payload[..msg.payload_len];
         assert_eq!(payload, b"hello");
 
         let msg = iter.next().unwrap().unwrap();
         let mut payload = [0u8; 1024];
         msg.read(&mut payload).unwrap();
-        let payload = &payload[..msg.len()];
+        let payload = &payload[..msg.payload_len];
         assert_eq!(payload, b"world");
 
         assert_eq!(32, writer.index());
@@ -470,7 +471,7 @@ mod tests {
 
         let mut payload = [0u8; 1024];
         msg.read(&mut payload).unwrap();
-        let payload = &payload[..msg.len()];
+        let payload = &payload[..msg.payload_len];
         assert_eq!(payload, b"test");
 
         assert!(iter.next().is_none());
@@ -512,8 +513,9 @@ mod tests {
     }
 
     #[test]
-    fn frame_header() {
+    fn should_align_frame_header() {
         assert_eq!(8, align_of::<FrameHeader>());
+        assert_eq!(8, size_of::<FrameHeader>());
 
         let frame = FrameHeader::new(10, 0, false);
         assert!(!frame.is_padding());
@@ -534,12 +536,6 @@ mod tests {
         let frame = FrameHeader::new_padding();
         assert!(frame.is_padding());
         assert_eq!(0, frame.payload_len());
-
-        assert_eq!(0, get_aligned_size(0));
-        assert_eq!(8, get_aligned_size(3));
-        assert_eq!(8, get_aligned_size(8));
-        assert_eq!(16, get_aligned_size(13));
-        assert_eq!(16, get_aligned_size(16));
     }
 
     #[test]
@@ -582,10 +578,7 @@ mod tests {
         let claim = writer.claim(16).unwrap();
         let buf_ptr_0 = claim.get_buffer().as_ptr();
         let frame_ptr_0 = claim.frame_header() as *const FrameHeader;
-
-        println!("buffer address: {:p}", buf_ptr_0);
-        println!("buffer address: {:#x}", buf_ptr_0 as usize);
-
+        
         assert_eq!(size_of::<Header>() + size_of::<FrameHeader>(), buf_ptr_0 as usize - header_ptr as usize);
         assert_eq!(size_of::<FrameHeader>(), buf_ptr_0 as usize - data_ptr as usize);
         assert_eq!(16, claim.get_buffer().len());

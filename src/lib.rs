@@ -1,7 +1,8 @@
 mod error;
+pub mod mem;
 
-use std::cmp::min;
 use crossbeam_utils::CachePadded;
+use std::cmp::min;
 use std::mem::ManuallyDrop;
 use std::ptr::{copy_nonoverlapping, slice_from_raw_parts, slice_from_raw_parts_mut, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -108,7 +109,7 @@ impl RingBuffer {
     pub fn new(bytes: &[u8]) -> Self {
         assert!(bytes.len() > size_of::<Header>(), "insufficient size for the header");
         assert!((bytes.len() - size_of::<Header>()).is_power_of_two(), "buffer len must be power of two");
-        
+
         // represents the max value we can encode on the frame header for the payload length
         const MAX_PAYLOAD_LEN: usize = 1 << 31;
 
@@ -117,7 +118,7 @@ impl RingBuffer {
         Self {
             ptr: NonNull::new(header).unwrap(),
             capacity,
-            mtu: min(capacity / 2 - size_of::<FrameHeader>(), MAX_PAYLOAD_LEN)
+            mtu: min(capacity / 2 - size_of::<FrameHeader>(), MAX_PAYLOAD_LEN),
         }
     }
 
@@ -165,11 +166,39 @@ pub struct Claim<'a> {
     writer: &'a mut Writer, // underlying writer
     len: usize,             // frame header aligned payload length
     limit: usize,           // actual payload length
-    is_padding: bool,       // indicates padding frame
     user_defined: u32,      // user defined field
 }
 
 impl<'a> Claim<'a> {
+    
+    pub fn new(writer: &'a mut Writer, len: usize, limit: usize, user_defined: u32) -> Self {
+
+        // insert padding frame if required
+        let remaining = writer.remaining();
+        if len + size_of::<FrameHeader>() > remaining {
+            let padding_len = remaining - size_of::<FrameHeader>();
+            let fields = (padding_len as u32 & FRAME_HEADER_MSG_LEN_MASK) | ((true as u32) << 31);
+
+            let header = unsafe {
+                let ptr = writer.ring.header_mut().data_ptr_mut();
+                &mut *(ptr.add(writer.index()) as *mut FrameHeader)
+            };
+            
+            // TODO writer should define method to get header not the claim
+            
+            header.fields = fields;
+            header.user_defined = 0;
+            writer.position += padding_len + size_of::<FrameHeader>();
+        };
+        
+        Self {
+            writer,
+            len,
+            limit,
+            user_defined,
+        }
+    }
+    
     #[inline]
     pub const fn get_buffer(&self) -> &[u8] {
         unsafe {
@@ -210,21 +239,32 @@ impl<'a> Claim<'a> {
 
     #[inline]
     fn commit_impl(&mut self) {
+        // let remaining = self.writer.remaining();
+        // 
+        // // insert padding frame if required
+        // if self.len + size_of::<FrameHeader>() > remaining {
+        //     let padding_len = remaining - size_of::<FrameHeader>();
+        //     let fields = (padding_len as u32 & FRAME_HEADER_MSG_LEN_MASK) | ((true as u32) << 31);
+        //     let header = self.frame_header_mut();
+        //     header.fields = fields;
+        //     header.user_defined = 0;
+        //     self.writer.position += padding_len + size_of::<FrameHeader>();
+        // }
+
         // update frame header
-        let fields = (self.limit as u32 & FRAME_HEADER_MSG_LEN_MASK) | ((self.is_padding as u32) << 31);
+        let fields = (self.limit as u32 & FRAME_HEADER_MSG_LEN_MASK) | ((false as u32) << 31);
         let user_defined = self.user_defined;
         let header = self.frame_header_mut();
         header.fields = fields;
         header.user_defined = user_defined;
+        self.writer.position += self.len + size_of::<FrameHeader>();
 
-        // update header
-        let previous_position = self
-            .writer
+        // signal updated producer position
+        self.writer
             .ring
             .header()
             .producer_position
-            .fetch_add(self.len + size_of::<FrameHeader>(), Ordering::Release);
-        self.writer.position = previous_position + self.len + size_of::<FrameHeader>();
+            .store(self.writer.position, Ordering::Release);
     }
 }
 
@@ -242,31 +282,14 @@ impl Writer {
 
     #[inline]
     pub fn claim_with_user_defined(&mut self, len: usize, user_defined: u32) -> Result<Claim> {
+        // TODO should this be aligned_len?
         if len > self.ring.mtu {
             return Err(error::Error::MtuLimitExceeded(len, self.ring.mtu));
         }
 
-        let remaining = self.remaining();
         let aligned_len = get_aligned_size(len);
-
-        // insert padding frame if required
-        if aligned_len + size_of::<FrameHeader>() > remaining {
-            let _ = Claim {
-                writer: self,
-                len: remaining - size_of::<FrameHeader>(),
-                limit: 0,
-                is_padding: true,
-                user_defined: 0,
-            };
-        }
-
-        Ok(Claim {
-            writer: self,
-            len: aligned_len,
-            limit: len,
-            is_padding: false,
-            user_defined
-        })
+        
+        Ok(Claim::new(self, aligned_len, len, user_defined))
     }
 
     #[inline]
@@ -282,7 +305,7 @@ impl Writer {
 
 pub struct Reader {
     ring: RingBuffer,
-    position: usize, // local position
+    position: usize, // local position that will always increase
 }
 
 #[derive(Debug, Clone)]
@@ -299,7 +322,6 @@ pub struct Message {
 }
 
 impl Message {
-    
     #[inline]
     const fn index(&self) -> usize {
         self.position & (self.capacity - 1)
@@ -331,7 +353,8 @@ impl Message {
 
 pub struct BatchIter<'a> {
     reader: &'a mut Reader,
-    remaining: usize, // remaining bytes to consume
+    remaining: usize,         // remaining bytes to consume
+    position_snapshot: usize, // reader position snapshot
 }
 
 impl<'a> Iterator for BatchIter<'a> {
@@ -359,7 +382,7 @@ impl<'a> BatchIter<'a> {
         }
 
         // extract frame header fields
-        let producer_position_before = self.reader.position;
+        let producer_position_before = self.position_snapshot;
         let frame_header = self.reader.as_frame_header();
         let (payload_len, is_padding, user_defined) = frame_header.unpack_fields();
         let producer_position_after = self.reader.ring.header().producer_position.load(Ordering::Acquire);
@@ -379,8 +402,23 @@ impl<'a> BatchIter<'a> {
         };
 
         let aligned_payload_len = get_aligned_size(message.payload_len);
+
+        println!(
+            "#1 remaining {}, index: {}, payload_len: {}, is_padding: {}",
+            self.remaining,
+            self.reader.index(),
+            payload_len,
+            is_padding
+        );
+
         self.remaining -= aligned_payload_len + size_of::<FrameHeader>();
         self.reader.position += aligned_payload_len + size_of::<FrameHeader>();
+
+        println!("#2 remaining {}, index: {}", self.remaining, self.reader.index());
+
+        if is_padding {
+            println!("padding")
+        }
 
         Some(Ok(message))
     }
@@ -401,9 +439,11 @@ impl Reader {
     pub fn batch_iter(&mut self) -> BatchIter {
         let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
         let limit = producer_position - self.position;
+        let position_snapshot = self.position;
         BatchIter {
             reader: self,
             remaining: limit,
+            position_snapshot,
         }
     }
 }
@@ -578,7 +618,7 @@ mod tests {
         let claim = writer.claim(16).unwrap();
         let buf_ptr_0 = claim.get_buffer().as_ptr();
         let frame_ptr_0 = claim.frame_header() as *const FrameHeader;
-        
+
         assert_eq!(size_of::<Header>() + size_of::<FrameHeader>(), buf_ptr_0 as usize - header_ptr as usize);
         assert_eq!(size_of::<FrameHeader>(), buf_ptr_0 as usize - data_ptr as usize);
         assert_eq!(16, claim.get_buffer().len());

@@ -8,7 +8,7 @@ const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024;
 fn main() -> anyhow::Result<()> {
     let ptr = alloc_aligned(RING_BUFFER_SIZE, CACHE_LINE_SIZE);
     let addr = ptr as usize;
-    
+
     let writer_task = std::thread::spawn(move || {
         let bytes = unsafe { from_raw_parts(addr as *const u8, RING_BUFFER_SIZE) };
         let mut writer = RingBuffer::new(bytes).into_writer();

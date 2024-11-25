@@ -43,22 +43,26 @@ struct FrameHeader {
 
 impl FrameHeader {
     #[inline]
+    #[cfg(test)]
     const fn new(payload_len: u32, user_defined: u32, is_padding: bool) -> Self {
         let fields = (payload_len & FRAME_HEADER_MSG_LEN_MASK) | ((is_padding as u32) << 31);
         FrameHeader { fields, user_defined }
     }
 
     #[inline]
+    #[cfg(test)]
     const fn new_padding() -> Self {
         Self::new(0, 0, true)
     }
 
     #[inline]
+    #[cfg(test)]
     const fn is_padding(&self) -> bool {
         (self.fields & FRAME_HEADER_PADDING_MASK) != 0
     }
 
     #[inline]
+    #[cfg(test)]
     const fn payload_len(&self) -> u32 {
         self.fields & FRAME_HEADER_MSG_LEN_MASK
     }
@@ -618,5 +622,33 @@ mod tests {
         let rb = RingBuffer::new(bytes);
         assert_eq!(0, rb.header().producer_position.load(SeqCst));
         assert_eq!(1024, rb.capacity);
+    }
+
+    #[test]
+    fn should_construct_ring_buffer_from_vec() {
+        let bytes = vec![0u8; HEADER_SIZE + 1024];
+        let rb = RingBuffer::new(&bytes);
+        assert_eq!(0, rb.header().producer_position.load(SeqCst));
+        assert_eq!(1024, rb.capacity);
+    }
+
+    #[test]
+    fn should_read_message_into_vec() {
+        let bytes = vec![0u8; HEADER_SIZE + 1024];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let mut reader = RingBuffer::new(&bytes).into_reader();
+
+        let mut claim = writer.claim(11).unwrap();
+        claim.get_buffer_mut().copy_from_slice(b"hello world");
+        claim.commit();
+
+        let mut iter = reader.batch_iter();
+        let msg = iter.next().unwrap().unwrap();
+
+        let mut payload = vec![0u8; 1024];
+        unsafe { payload.set_len(msg.payload_len) };
+        msg.read(&mut payload).unwrap();
+
+        assert_eq!(payload, b"hello world");
     }
 }

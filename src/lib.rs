@@ -1,4 +1,4 @@
-mod error;
+pub mod error;
 pub mod mem;
 
 use crossbeam_utils::CachePadded;

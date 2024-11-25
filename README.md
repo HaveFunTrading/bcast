@@ -35,16 +35,14 @@ claim.commit();
 ```
 
 The `commit` operation is optional as the new producer position (as a result of us writing to the buffer) will be made
-visible to other processes (threads) the moment the `Claim` is dropped.
-
-The `Reader` is constructed in similar way by attaching it to some 'shared' memory.
+visible to other processes (threads) the moment the `Claim` is dropped. The `Reader` is constructed in similar way by attaching it to some 'shared' memory.
 
 ```rust
 let bytes: &[u8] = ...;
 let mut reader = RingBuffer::new(bytes).into_reader();
 ```
 
-The reader is batch aware (it knows how far behind a producer it is) and provides elegant way to process pending
+The `Reader` is batch aware (it knows how far behind a producer it is) and provides elegant way to process pending
 messages in form of an iterator.
 
 ```rust
@@ -69,6 +67,6 @@ match msg.read(&mut payload) {
 ```
 
 This also means that messages are consumed in a 'lazy' way with the `read` operation delayed until it is required. As a
-result it is possible to `clone` each `Message`. This approach is particularly useful if we want to delay the
+result it is possible to `clone` each `Message`. This approach is particularly useful if it's desired to delay
 actual consumption of messages (e.g. when we want to combine and expose data from various sources to the application in
 a single step).

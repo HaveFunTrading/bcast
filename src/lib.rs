@@ -7,6 +7,9 @@ use std::mem::ManuallyDrop;
 use std::ptr::{copy_nonoverlapping, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use std::mem::align_of;
+use std::mem::size_of;
+
 // re-export
 pub use error::Result;
 

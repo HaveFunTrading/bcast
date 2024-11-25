@@ -13,7 +13,7 @@ feed handler).
 ## Supported Platforms
 The crate has been developed and tested exclusively on `x86_64-linux`. It should also work (but it's by 
 no means guaranteed) on CPU architectures with weaker memory ordering semantics. If you want a particular platform
-to be properly supported feel free to contribute and raise a pull request.
+to be properly supported feel free to contribute and submit a pull request.
 
 ## Example
 

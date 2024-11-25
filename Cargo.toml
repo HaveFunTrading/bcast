@@ -2,6 +2,13 @@
 name = "bcast"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Low latency broadcast buffer."
+readme = "./README.md"
+documentation = "https://docs.rs/bcast"
+repository = "https://github.com/HaveFunTrading/bcast"
+keywords = ["ipc", "broadcast", "shared-memory", "low-latency", "ring-buffer"]
+categories = ["data-structures", "concurrency", "asynchronous"]
 rust-version = "1.73.0"
 
 [dependencies]

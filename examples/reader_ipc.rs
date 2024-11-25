@@ -1,29 +1,28 @@
-use bcast::{RingBuffer};
+use crate::common::reader;
 use memmap2::MmapOptions;
 use std::fs::OpenOptions;
+
+mod common;
+
+/// This example assumes a memory mapped file has already been created and will
+/// attach a reader to it. The memory mapped file must be initialised (it's length set) by the
+/// writer before it can be used.
 
 fn main() -> anyhow::Result<()> {
     let file = OpenOptions::new().read(true).open("test.dat")?;
 
+    // wait until file has been initialised
+    loop {
+        let len = file.metadata()?.len() as usize;
+        if len > 0 {
+            break;
+        }
+    }
+
     let mmap = unsafe { MmapOptions::new().map(&file)? };
     let bytes = mmap.as_ref();
-    
-    let mut reader = RingBuffer::new(bytes).into_reader();
-    loop {
-        let mut count = 0;
-        for msg in reader.batch_iter() {
-            count += 1;
-            let msg = msg?;
-            let mut payload = [0u8; 1024];
-            msg.read(&mut payload)?;
-            let payload = &payload[..msg.payload_len];
-            assert!(payload.iter().all(|b| *b == msg.user_defined as u8));
-            println!("{}", std::str::from_utf8(payload)?);
-        }
-        if count > 0 {
-            println!("batch_size: {}", count);
-        }
-        // adding delay here to simulate impact of batching
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+
+    reader(bytes)?;
+
+    Ok(())
 }

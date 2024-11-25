@@ -119,7 +119,7 @@ impl RingBuffer {
         assert!((bytes.len() - size_of::<Header>()).is_power_of_two(), "buffer len must be power of two");
 
         // represents the max value we can encode on the frame header for the payload length
-        const MAX_PAYLOAD_LEN: usize = 1 << 31;
+        const MAX_PAYLOAD_LEN: usize = (1 << 31) - 1;
 
         let header = bytes.as_ptr() as *mut Header;
         let capacity = bytes.len() - size_of::<Header>();

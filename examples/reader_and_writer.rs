@@ -1,4 +1,4 @@
-use bcast::mem::{allocate_aligned, CACHE_LINE_SIZE};
+use bcast::mem::{alloc_aligned, CACHE_LINE_SIZE};
 use bcast::{RingBuffer, HEADER_SIZE};
 use rand::{thread_rng, Rng};
 use std::slice::from_raw_parts;
@@ -6,7 +6,7 @@ use std::slice::from_raw_parts;
 const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024;
 
 fn main() -> anyhow::Result<()> {
-    let ptr = allocate_aligned(RING_BUFFER_SIZE, CACHE_LINE_SIZE);
+    let ptr = alloc_aligned(RING_BUFFER_SIZE, CACHE_LINE_SIZE);
     let addr = ptr as usize;
     
     let writer_task = std::thread::spawn(move || {

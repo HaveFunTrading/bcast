@@ -7,7 +7,7 @@ description = "Low latency broadcast buffer."
 readme = "./README.md"
 documentation = "https://docs.rs/bcast"
 repository = "https://github.com/HaveFunTrading/bcast"
-keywords = ["ipc", "broadcast", "shared-memory", "low-latency", "ring-buffer"]
+keywords = ["ipc", "spmc", "shared-memory", "low-latency", "ring-buffer"]
 categories = ["data-structures", "concurrency", "asynchronous"]
 rust-version = "1.73.0"
 

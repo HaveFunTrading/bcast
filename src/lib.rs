@@ -388,21 +388,8 @@ impl<'a> BatchIter<'a> {
         };
 
         let aligned_payload_len = get_aligned_size(message.payload_len);
-
-        #[cfg(debug_assertions)]
-        println!(
-            "#1 remaining {}, index: {}, payload_len: {}, is_padding: {}",
-            self.remaining,
-            self.reader.index(),
-            payload_len,
-            is_padding
-        );
-
         self.remaining -= aligned_payload_len + size_of::<FrameHeader>();
         self.reader.position += aligned_payload_len + size_of::<FrameHeader>();
-
-        #[cfg(debug_assertions)]
-        println!("#2 remaining {}, index: {}", self.remaining, self.reader.index());
 
         Some(Ok(message))
     }
@@ -422,7 +409,6 @@ impl Reader {
     #[inline]
     pub fn batch_iter(&mut self) -> BatchIter {
         let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
-        println!("{} {}", producer_position, self.position);
         let limit = producer_position - self.position;
         let position_snapshot = self.position;
         BatchIter {
@@ -430,6 +416,41 @@ impl Reader {
             remaining: limit,
             position_snapshot,
         }
+    }
+
+    #[inline]
+    pub fn receive_next(&mut self) -> Option<Result<Message>> {
+        let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
+
+        // no new messages
+        if producer_position_before - self.position == 0 {
+            return None;
+        }
+
+        // extract frame header fields
+        let frame_header = self.as_frame_header();
+        let (payload_len, is_padding, user_defined) = frame_header.unpack_fields();
+        let producer_position_after = self.ring.header().producer_position.load(Ordering::Acquire);
+
+        // ensure we have not been overrun
+        if producer_position_after > producer_position_before + self.ring.capacity {
+            return Some(Err(error::Error::Overrun(self.position)));
+        }
+
+        let message = Message {
+            header: self.ring.header(),
+            position: self.position + size_of::<FrameHeader>(),
+            payload_len: payload_len as usize,
+            capacity: self.ring.capacity,
+            is_padding,
+            user_defined,
+        };
+
+        let aligned_payload_len = get_aligned_size(message.payload_len);
+
+        self.position += aligned_payload_len + size_of::<FrameHeader>();
+
+        Some(Ok(message))
     }
 }
 
@@ -545,6 +566,42 @@ mod tests {
         assert_eq!(b"c", &payload);
 
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn should_read_next_message() {
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let mut reader = RingBuffer::new(&bytes).into_reader();
+
+        let mut claim = writer.claim(1).unwrap();
+        claim.get_buffer_mut().copy_from_slice(b"a");
+        claim.commit();
+
+        let mut claim = writer.claim(1).unwrap();
+        claim.get_buffer_mut().copy_from_slice(b"b");
+        claim.commit();
+
+        let mut claim = writer.claim(1).unwrap();
+        claim.get_buffer_mut().copy_from_slice(b"c");
+        claim.commit();
+
+        let msg = reader.receive_next().unwrap().unwrap();
+        let mut payload = [0u8; 1];
+        msg.read(&mut payload).unwrap();
+        assert_eq!(b"a", &payload);
+
+        let msg = reader.receive_next().unwrap().unwrap();
+        let mut payload = [0u8; 1];
+        msg.read(&mut payload).unwrap();
+        assert_eq!(b"b", &payload);
+
+        let msg = reader.receive_next().unwrap().unwrap();
+        let mut payload = [0u8; 1];
+        msg.read(&mut payload).unwrap();
+        assert_eq!(b"c", &payload);
+
+        assert!(reader.receive_next().is_none());
     }
 
     #[test]

@@ -67,6 +67,6 @@ match msg.read(&mut payload) {
 ```
 
 This also means that messages are consumed in a 'lazy' way with the `read` operation delayed until it is required. As a
-result it is possible to `clone` each `Message`. This approach is particularly useful if it's desired to delay
+result, it is possible to `clone` each `Message`. This approach is particularly useful if it's desired to delay
 actual consumption of messages (e.g. when we want to combine and expose data from various sources to the application in
 a single step).

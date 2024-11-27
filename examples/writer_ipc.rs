@@ -9,7 +9,6 @@ mod common;
 /// This example will create a memory mapped file and attach a writer to it.
 /// If the file exists it will be removed so that any potential readers can detect message
 /// loss and act accordingly.
-
 fn main() -> anyhow::Result<()> {
     let path = Path::new("test.dat");
     if path.exists() {

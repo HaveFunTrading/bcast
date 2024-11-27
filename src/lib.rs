@@ -1,5 +1,4 @@
 pub mod error;
-pub mod mem;
 
 use crossbeam_utils::CachePadded;
 use std::cmp::min;
@@ -106,7 +105,7 @@ const fn get_aligned_size(payload_length: usize) -> usize {
     (payload_length + ALIGNMENT_MASK) & !ALIGNMENT_MASK
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RingBuffer {
     ptr: NonNull<Header>,
     capacity: usize,
@@ -159,6 +158,7 @@ impl RingBuffer {
     }
 }
 
+#[derive(Debug)]
 pub struct Writer {
     ring: RingBuffer,
     position: usize, // local producer position
@@ -183,6 +183,11 @@ impl Writer {
             return Err(error::Error::MtuLimitExceeded(len, self.ring.mtu));
         }
         Ok(Claim::new(self, aligned_len, len, user_defined))
+    }
+
+    #[inline]
+    pub const fn mtu(&self) -> usize {
+        self.ring.mtu
     }
 
     #[inline]
@@ -212,6 +217,7 @@ impl Writer {
     }
 }
 
+#[derive(Debug)]
 pub struct Claim<'a> {
     writer: &'a mut Writer, // underlying writer
     len: usize,             // frame header aligned payload length
@@ -416,6 +422,7 @@ impl Reader {
     #[inline]
     pub fn batch_iter(&mut self) -> BatchIter {
         let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
+        println!("{} {}", producer_position, self.position);
         let limit = producer_position - self.position;
         let position_snapshot = self.position;
         BatchIter {
@@ -430,14 +437,13 @@ impl Reader {
 mod tests {
     use super::*;
     use crate::error::Error;
-    use crate::mem::{new_slice_aligned, CACHE_LINE_SIZE};
     use std::sync::atomic::Ordering::SeqCst;
 
     #[test]
     fn should_read_messages_in_batch() {
-        let bytes = new_slice_aligned(HEADER_SIZE + 64, CACHE_LINE_SIZE);
-        let mut writer = RingBuffer::new(bytes).into_writer();
-        let mut reader = RingBuffer::new(bytes).into_reader();
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let mut reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim(5).unwrap();
         claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -500,10 +506,52 @@ mod tests {
     }
 
     #[test]
+    fn should_read_in_batch_with_limit() {
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let mut reader = RingBuffer::new(&bytes).into_reader();
+
+        let mut claim = writer.claim(1).unwrap();
+        claim.get_buffer_mut().copy_from_slice(b"a");
+        claim.commit();
+
+        let mut claim = writer.claim(1).unwrap();
+        claim.get_buffer_mut().copy_from_slice(b"b");
+        claim.commit();
+
+        let mut claim = writer.claim(1).unwrap();
+        claim.get_buffer_mut().copy_from_slice(b"c");
+        claim.commit();
+
+        let mut iter = reader.batch_iter().take(2);
+
+        let msg = iter.next().unwrap().unwrap();
+        let mut payload = [0u8; 1];
+        msg.read(&mut payload).unwrap();
+        assert_eq!(b"a", &payload);
+
+        let msg = iter.next().unwrap().unwrap();
+        let mut payload = [0u8; 1];
+        msg.read(&mut payload).unwrap();
+        assert_eq!(b"b", &payload);
+
+        assert!(iter.next().is_none());
+
+        let mut iter = reader.batch_iter();
+
+        let msg = iter.next().unwrap().unwrap();
+        let mut payload = [0u8; 1];
+        msg.read(&mut payload).unwrap();
+        assert_eq!(b"c", &payload);
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
     fn should_overrun_reader() {
-        let bytes = new_slice_aligned(HEADER_SIZE + 64, CACHE_LINE_SIZE);
-        let mut writer = RingBuffer::new(bytes).into_writer();
-        let mut reader = RingBuffer::new(bytes).into_reader();
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let mut reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim(16).unwrap().commit();
         writer.claim(16).unwrap().commit();
@@ -516,16 +564,26 @@ mod tests {
     }
 
     #[test]
+    fn should_error_if_mtu_exceeded() {
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        assert_eq!(24, writer.mtu());
+        let claim = writer.claim(32);
+        assert!(claim.is_err());
+        assert_eq!(Error::MtuLimitExceeded(32, 24), claim.unwrap_err());
+    }
+
+    #[test]
     fn should_start_read_from_last_producer_position() {
-        let bytes = new_slice_aligned(HEADER_SIZE + 64, CACHE_LINE_SIZE);
-        let mut writer = RingBuffer::new(bytes).into_writer();
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         writer.claim(16).unwrap().commit();
 
         assert_eq!(24, writer.position);
         assert_eq!(24, writer.index());
 
-        let reader = RingBuffer::new(bytes).into_reader();
+        let reader = RingBuffer::new(&bytes).into_reader();
 
         assert_eq!(reader.position, writer.position);
         assert_eq!(reader.index(), writer.index());
@@ -559,8 +617,8 @@ mod tests {
 
     #[test]
     fn should_insert_padding() {
-        let bytes = new_slice_aligned(HEADER_SIZE + 64, CACHE_LINE_SIZE);
-        let mut writer = RingBuffer::new(bytes).into_writer();
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         assert_eq!(0, writer.index());
 
@@ -588,8 +646,8 @@ mod tests {
 
     #[test]
     fn should_ensure_frame_alignment() {
-        let bytes = new_slice_aligned(HEADER_SIZE + 1024, CACHE_LINE_SIZE);
-        let mut writer = RingBuffer::new(bytes).into_writer();
+        let bytes = [0u8; HEADER_SIZE + 1024];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         let header_ptr = writer.ring.header() as *const Header;
         let data_ptr = writer.ring.header().data_ptr();
@@ -621,18 +679,18 @@ mod tests {
 
     #[test]
     fn should_construct_ring_buffer() {
-        let bytes = new_slice_aligned(HEADER_SIZE + 1024, CACHE_LINE_SIZE);
-        let rb = RingBuffer::new(bytes);
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let rb = RingBuffer::new(&bytes);
         assert_eq!(0, rb.header().producer_position.load(SeqCst));
-        assert_eq!(1024, rb.capacity);
+        assert_eq!(64, rb.capacity);
     }
 
     #[test]
     fn should_construct_ring_buffer_from_vec() {
-        let bytes = vec![0u8; HEADER_SIZE + 1024];
+        let bytes = vec![0u8; HEADER_SIZE + 64];
         let rb = RingBuffer::new(&bytes);
         assert_eq!(0, rb.header().producer_position.load(SeqCst));
-        assert_eq!(1024, rb.capacity);
+        assert_eq!(64, rb.capacity);
     }
 
     #[test]

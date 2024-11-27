@@ -2,7 +2,7 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Eq, PartialEq)]
 pub enum Error {
     #[error("overran by the producer, reader position: {0}")]
     Overrun(usize),

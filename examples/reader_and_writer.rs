@@ -1,5 +1,4 @@
 use crate::common::{reader, writer};
-use bcast::mem::{alloc_aligned, CACHE_LINE_SIZE};
 use bcast::HEADER_SIZE;
 use std::slice::from_raw_parts;
 
@@ -11,7 +10,8 @@ mod common;
 const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024;
 
 fn main() -> anyhow::Result<()> {
-    let ptr = alloc_aligned(RING_BUFFER_SIZE, CACHE_LINE_SIZE);
+    let bytes = [0u8; RING_BUFFER_SIZE];
+    let ptr = bytes.as_ptr();
     let addr = ptr as usize;
 
     let writer_task = std::thread::spawn(move || {

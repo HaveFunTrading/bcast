@@ -7,7 +7,6 @@ mod common;
 /// This example assumes a memory mapped file has already been created and will
 /// attach a reader to it. The memory mapped file must be initialised (it's length set) by the
 /// writer before it can be used.
-
 fn main() -> anyhow::Result<()> {
     let file = OpenOptions::new().read(true).open("test.dat")?;
 

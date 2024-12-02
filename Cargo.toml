@@ -9,7 +9,7 @@ documentation = "https://docs.rs/bcast"
 repository = "https://github.com/HaveFunTrading/bcast"
 keywords = ["ipc", "spmc", "shared-memory", "low-latency", "ring-buffer"]
 categories = ["data-structures", "concurrency", "asynchronous"]
-rust-version = "1.73.0"
+rust-version = "1.83.0"
 
 [dependencies]
 thiserror = "2.0.3"

@@ -151,7 +151,7 @@ impl FrameHeader {
 
     /// Get message payload as mutable byte slice.
     #[inline]
-    fn payload_mut(&mut self, size: usize) -> &mut [u8] {
+    const fn payload_mut(&mut self, size: usize) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.get_payload_ptr_mut() as *mut u8, size) }
     }
 }
@@ -198,7 +198,7 @@ impl RingBuffer {
 
     /// Get mutable reference to ring buffer header.
     #[inline]
-    fn header_mut(&mut self) -> &'static mut Header {
+    const fn header_mut(&mut self) -> &'static mut Header {
         unsafe { self.ptr.as_mut() }
     }
 
@@ -285,7 +285,7 @@ impl Writer {
 
     /// Get mutable reference to the next (unpublished) message frame header;
     #[inline]
-    fn frame_header_mut(&mut self) -> &mut FrameHeader {
+    const fn frame_header_mut(&mut self) -> &mut FrameHeader {
         unsafe {
             let ptr = self.ring.header_mut().data_ptr_mut();
             &mut *(ptr.add(self.index()) as *mut FrameHeader)
@@ -304,7 +304,8 @@ pub struct Claim<'a> {
 
 impl<'a> Claim<'a> {
     /// Create new claim.
-    fn new(writer: &'a mut Writer, len: usize, limit: usize, user_defined: u32) -> Self {
+    #[inline]
+    const fn new(writer: &'a mut Writer, len: usize, limit: usize, user_defined: u32) -> Self {
         // insert padding frame if required
         let remaining = writer.remaining();
         if len + size_of::<FrameHeader>() > remaining {
@@ -333,7 +334,7 @@ impl<'a> Claim<'a> {
 
     /// Get next message payload as mutable byte slice.
     #[inline]
-    pub fn get_buffer_mut(&mut self) -> &mut [u8] {
+    pub const fn get_buffer_mut(&mut self) -> &mut [u8] {
         self.writer.frame_header_mut().payload_mut(self.limit)
     }
 
@@ -532,6 +533,7 @@ impl Iterator for BatchIter<'_> {
 }
 
 impl BatchIter<'_> {
+    #[inline]
     fn receive_next(&mut self) -> Option<Result<Message>> {
         // we reached the batch limit
         if self.remaining == 0 {

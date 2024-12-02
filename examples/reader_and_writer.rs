@@ -4,8 +4,8 @@ use std::slice::from_raw_parts;
 
 mod common;
 
-/// This example will demonstrate the use shared buffer in order to achieve in-process communication
-/// between reader and writer that are running on separate threads.
+// This example will demonstrate the use shared buffer in order to achieve in-process communication
+// between reader and writer that are running on separate threads.
 
 const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024;
 

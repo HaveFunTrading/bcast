@@ -283,7 +283,7 @@ impl<'a> Claim<'a> {
     }
 }
 
-impl<'a> Drop for Claim<'a> {
+impl Drop for Claim<'_> {
     fn drop(&mut self) {
         self.commit_impl();
     }
@@ -343,7 +343,7 @@ pub struct BatchIter<'a> {
     position_snapshot: usize, // reader position snapshot
 }
 
-impl<'a> Iterator for BatchIter<'a> {
+impl Iterator for BatchIter<'_> {
     type Item = Result<Message>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -360,38 +360,21 @@ impl<'a> Iterator for BatchIter<'a> {
     }
 }
 
-impl<'a> BatchIter<'a> {
+impl BatchIter<'_> {
     fn receive_next(&mut self) -> Option<Result<Message>> {
         // we reached the batch limit
         if self.remaining == 0 {
             return None;
         }
-
-        // extract frame header fields
-        let producer_position_before = self.position_snapshot;
-        let frame_header = self.reader.as_frame_header();
-        let (payload_len, is_padding, user_defined) = frame_header.unpack_fields();
-        let producer_position_after = self.reader.ring.header().producer_position.load(Ordering::Acquire);
-
-        // ensure we have not been overrun
-        if producer_position_after > producer_position_before + self.reader.ring.capacity {
-            return Some(Err(error::Error::Overrun(self.reader.position)));
+        // update iterator with the number of bytes received
+        match self.reader.receive_next_impl(self.position_snapshot) {
+            None => None,
+            Some(Ok(msg)) => {
+                self.remaining -= get_aligned_size(msg.payload_len) + size_of::<FrameHeader>();
+                Some(Ok(msg))
+            }
+            Some(Err(err)) => Some(Err(err)),
         }
-
-        let message = Message {
-            header: self.reader.ring.header(),
-            position: self.reader.position + size_of::<FrameHeader>(),
-            payload_len: payload_len as usize,
-            capacity: self.reader.ring.capacity,
-            is_padding,
-            user_defined,
-        };
-
-        let aligned_payload_len = get_aligned_size(message.payload_len);
-        self.remaining -= aligned_payload_len + size_of::<FrameHeader>();
-        self.reader.position += aligned_payload_len + size_of::<FrameHeader>();
-
-        Some(Ok(message))
     }
 }
 
@@ -421,12 +404,15 @@ impl Reader {
     #[inline]
     pub fn receive_next(&mut self) -> Option<Result<Message>> {
         let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
-
         // no new messages
         if producer_position_before - self.position == 0 {
             return None;
         }
+        self.receive_next_impl(producer_position_before)
+    }
 
+    #[inline]
+    fn receive_next_impl(&mut self, producer_position_before: usize) -> Option<Result<Message>> {
         // extract frame header fields
         let frame_header = self.as_frame_header();
         let (payload_len, is_padding, user_defined) = frame_header.unpack_fields();
@@ -437,6 +423,7 @@ impl Reader {
             return Some(Err(error::Error::Overrun(self.position)));
         }
 
+        // construct the massage
         let message = Message {
             header: self.ring.header(),
             position: self.position + size_of::<FrameHeader>(),
@@ -446,8 +433,8 @@ impl Reader {
             user_defined,
         };
 
+        // update reader position
         let aligned_payload_len = get_aligned_size(message.payload_len);
-
         self.position += aligned_payload_len + size_of::<FrameHeader>();
 
         Some(Ok(message))

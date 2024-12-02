@@ -1,6 +1,6 @@
 [package]
 name = "bcast"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 license = "MIT"
 description = "Low latency broadcast (SPMC) buffer designed to work with shared memory."

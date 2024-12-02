@@ -163,7 +163,7 @@ const fn get_aligned_size(payload_length: usize) -> usize {
     (payload_length + ALIGNMENT_MASK) & !ALIGNMENT_MASK
 }
 
-/// Single producer, many consumer (SPMC) ring buffer backed by some 'shared' memory.
+/// Single producer, many consumer (SPMC) ring buffer backed by shared memory.
 #[derive(Debug, Clone)]
 pub struct RingBuffer {
     ptr: NonNull<Header>,
@@ -172,7 +172,7 @@ pub struct RingBuffer {
 }
 
 impl RingBuffer {
-    /// Create new ``RingBuffer` by wrapping provided `bytes`. It is necessary to call `into_writer()`
+    /// Create new `RingBuffer` by wrapping provided `bytes`. It is necessary to call `into_writer()`
     /// or `into_reader()` following the buffer construction to start using it.
     pub fn new(bytes: &[u8]) -> Self {
         assert!(bytes.len() > size_of::<Header>(), "insufficient size for the header");
@@ -293,7 +293,7 @@ impl Writer {
     }
 }
 
-/// Represents region of the RingBuffer` we can publish message to.
+/// Represents region of the `RingBuffer` we can publish message to.
 #[derive(Debug)]
 pub struct Claim<'a> {
     writer: &'a mut Writer, // underlying writer
@@ -339,7 +339,7 @@ impl<'a> Claim<'a> {
     }
 
     /// Commit the message thus making it visible to other consumers. If this operation is not
-    /// invoked the commit will happen when `Claim` is dropped.
+    /// invoked, the commit will happen automatically when `Claim` is dropped.
     #[inline]
     pub fn commit(self) {
         // we need to ensure the destructor will not be called in this case
@@ -373,7 +373,7 @@ impl Drop for Claim<'_> {
 }
 
 /// Wraps`RingBuffer` and allows to receive messages. Multiple readers can be present at any time,
-/// that operate independently and are not part of any congestion control flow. As a result, each reader
+/// they operate independently and are not part of any congestion control flow. As a result, each reader
 /// can be overrun by the producer if it's unable to keep up.
 pub struct Reader {
     ring: RingBuffer,
@@ -472,7 +472,7 @@ impl Message {
     }
 
     /// Read the message into specified buffer. It will return error if the provided buffer
-    /// is too small. Will also return error if at any point the producer has overrun the reader.
+    /// is too small. Will also return error if at any point the producer has overrun this consumer.
     /// On success, it will return the number of bytes written to the buffer.
     /// ## Examples
     /// ```no_run
@@ -508,7 +508,7 @@ impl Message {
 }
 
 /// Iterator that allows to process pending messages in a batch. This is more efficient than iterating
-/// over the messages than using `receive_next()` on the Reader` directly.
+/// over the messages using `receive_next()` on the `Reader` directly.
 pub struct BatchIter<'a> {
     reader: &'a mut Reader,
     remaining: usize,         // remaining bytes to consume

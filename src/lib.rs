@@ -10,12 +10,12 @@
 //! let mut writer = RingBuffer::new(&bytes).into_writer();
 //!
 //! // publish first message
-//! let mut claim = writer.claim(5)?;
+//! let mut claim = writer.claim(5).unwrap();
 //! claim.get_buffer_mut().copy_from_slice(b"hello");
 //! claim.commit();
 //!
 //! // publish second message
-//! let mut claim = writer.claim(5)?;
+//! let mut claim = writer.claim(5).unwrap();
 //! claim.get_buffer_mut().copy_from_slice(b"world");
 //! claim.commit();
 //! ```

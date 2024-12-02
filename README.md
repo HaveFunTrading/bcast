@@ -5,8 +5,7 @@
 
 ## Overview
 
-Low latency, single producer & many consumer (SPMC) ring buffer that works with in-process 
-and interprocess memory. One of the key features of `bcast` is that it natively supports variable message sizes
+Low latency, single producer & many consumer (SPMC) ring buffer that works with shared memory. One of the key features of `bcast` is that it natively supports variable message sizes
 (the payload is just `&[u8]`) which works very well in any ipc-based distributed system (such as market data
 feed handler). 
 

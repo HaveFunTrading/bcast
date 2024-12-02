@@ -1,5 +1,5 @@
-//! Low latency, single producer & many consumer (SPMC) ring buffer that works with in-process
-//! and interprocess memory. Natively supports variable message sizes.
+//! Low latency, single producer & many consumer (SPMC) ring buffer that works with shared memory.
+//! Natively supports variable message sizes.
 //! ## Examples
 //! Create `Writer` and use `claim` to publish a message.
 //! ```no_run

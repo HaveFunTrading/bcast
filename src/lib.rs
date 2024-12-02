@@ -1,3 +1,48 @@
+//! Low latency, single producer & many consumer (SPMC) ring buffer that works with in-process
+//! and interprocess memory. Natively supports variable message sizes.
+//! ## Examples
+//! Create `Writer` and use `claim` to publish a message.
+//! ```no_run
+//! use bcast::RingBuffer;
+//!
+//! // create writer
+//! let bytes = [0u8; 1024];
+//! let mut writer = RingBuffer::new(&bytes).into_writer();
+//!
+//! // publish first message
+//! let mut claim = writer.claim(5)?;
+//! claim.get_buffer_mut().copy_from_slice(b"hello");
+//! claim.commit();
+//!
+//! // publish second message
+//! let mut claim = writer.claim(5)?;
+//! claim.get_buffer_mut().copy_from_slice(b"world");
+//! claim.commit();
+//! ```
+//! Create `Reader` and use `batch_iter` tp receive messages.
+//! ```no_run
+//! use bcast::RingBuffer;
+//!
+//! // create reader
+//! let bytes = [0u8; 1024];
+//! let mut reader = RingBuffer::new(&bytes).into_reader();
+//! let mut iter = reader.batch_iter();
+//! let mut payload = [0u8; 1024];
+//!
+//! // read first message
+//! let msg = iter.next().unwrap().unwrap();
+//! let len = msg.read(&mut payload).unwrap();
+//! assert_eq!(b"hello", &payload[..len]);
+//!
+//! // read second message
+//! let msg = iter.next().unwrap().unwrap();
+//! let len = msg.read(&mut payload).unwrap();
+//! assert_eq!(b"world", &payload[..len]);
+//!
+//! // no more messages
+//! assert!(iter.next().is_none())
+//! ```
+
 pub mod error;
 
 use crossbeam_utils::CachePadded;
@@ -12,11 +57,15 @@ use std::mem::size_of;
 // re-export
 pub use error::Result;
 
+/// Ring buffer header size.
 pub const HEADER_SIZE: usize = size_of::<Header>();
+/// Null value for `user_defined` field.
 pub const USER_DEFINED_NULL_VALUE: u32 = u32::MAX;
 const FRAME_HEADER_PADDING_MASK: u32 = 0x80000000;
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x7FFFFFFF;
 
+/// Ring buffer header that contains producer position. The position is expressed in bytes and
+/// will always increment.
 #[derive(Debug)]
 #[repr(C)]
 struct Header {
@@ -24,12 +73,14 @@ struct Header {
 }
 
 impl Header {
+    /// Get pointer to the data section of the ring buffer.
     #[inline]
     const fn data_ptr(&self) -> *const u8 {
         let header_ptr: *const Header = self;
         unsafe { header_ptr.add(1) as *const u8 }
     }
 
+    /// Get mutable pointer to the data section of the ring buffer.
     #[inline]
     const fn data_ptr_mut(&self) -> *mut u8 {
         let header_ptr = self as *const Header as *mut Header;
@@ -37,6 +88,8 @@ impl Header {
     }
 }
 
+/// Message frame header that contains `fields` (packed `padding_flag` and `payload_length`)
+/// and `user_defined` field.
 #[repr(C, align(8))]
 struct FrameHeader {
     fields: u32,       // contains padding flag and payload length
@@ -69,42 +122,48 @@ impl FrameHeader {
         self.fields & FRAME_HEADER_MSG_LEN_MASK
     }
 
+    /// Extract `payload_length`, `is_padding` and `user_defined` fields from the message header.
     #[inline]
     const fn unpack_fields(&self) -> (u32, bool, u32) {
         let fields = self.fields;
         (fields & FRAME_HEADER_MSG_LEN_MASK, (fields & FRAME_HEADER_PADDING_MASK) != 0, self.user_defined)
     }
 
+    /// Get pointer to the message payload.
     #[inline]
     const fn get_payload_ptr(&self) -> *const FrameHeader {
         let message_header_ptr: *const FrameHeader = self;
         unsafe { message_header_ptr.add(1) }
     }
 
+    /// Get mutable pointer to the message payload.
     #[inline]
     const fn get_payload_ptr_mut(&self) -> *mut FrameHeader {
         let message_header_ptr = self as *const FrameHeader as *mut FrameHeader;
         unsafe { message_header_ptr.add(1) }
     }
 
+    /// Get message payload as byte slice.
     #[inline]
     const fn payload(&self, size: usize) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.get_payload_ptr() as *const u8, size) }
     }
 
+    /// Get message payload as mutable byte slice.
     #[inline]
     fn payload_mut(&mut self, size: usize) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.get_payload_ptr_mut() as *mut u8, size) }
     }
 }
 
+/// Calculate the number of bytes needed to ensure frame header alignment of the payload.
 #[inline]
 const fn get_aligned_size(payload_length: usize) -> usize {
-    // calculate the number of bytes needed to ensure frame header alignment
     const ALIGNMENT_MASK: usize = align_of::<FrameHeader>() - 1;
     (payload_length + ALIGNMENT_MASK) & !ALIGNMENT_MASK
 }
 
+/// Single producer, many consumer (SPMC) ring buffer backed by some 'shared' memory.
 #[derive(Debug, Clone)]
 pub struct RingBuffer {
     ptr: NonNull<Header>,
@@ -113,6 +172,8 @@ pub struct RingBuffer {
 }
 
 impl RingBuffer {
+    /// Create new ``RingBuffer` by wrapping provided `bytes`. It is necessary to call `into_writer()`
+    /// or `into_reader()` following the buffer construction to start using it.
     pub fn new(bytes: &[u8]) -> Self {
         assert!(bytes.len() > size_of::<Header>(), "insufficient size for the header");
         assert!((bytes.len() - size_of::<Header>()).is_power_of_two(), "buffer len must be power of two");
@@ -129,11 +190,13 @@ impl RingBuffer {
         }
     }
 
+    /// Get reference to ring buffer header.
     #[inline]
     const fn header(&self) -> &'static Header {
         unsafe { self.ptr.as_ref() }
     }
 
+    /// Get mutable reference to ring buffer header.
     #[inline]
     fn header_mut(&mut self) -> &'static mut Header {
         unsafe { self.ptr.as_mut() }
@@ -158,6 +221,7 @@ impl RingBuffer {
     }
 }
 
+/// Wraps`RingBuffer` and allows to publish messages. Only single writer should be present at any time.
 #[derive(Debug)]
 pub struct Writer {
     ring: RingBuffer,
@@ -171,11 +235,16 @@ impl From<RingBuffer> for Writer {
 }
 
 impl Writer {
+    /// Claim part of the underlying `RingBuffer` for publication. This operation will always succeed (since
+    /// producer can overrun consumers) except for the case when the message `mtu` limit has been exceeded.
     #[inline]
     pub fn claim(&mut self, len: usize) -> Result<Claim> {
         self.claim_with_user_defined(len, USER_DEFINED_NULL_VALUE)
     }
 
+    /// Claim part of the underlying `RingBuffer` for publication also passing `user_defined` value
+    /// that will be attached to the message. This operation will always succeed (since
+    /// producer can overrun consumers) except for the case when the message `mtu` limit has been exceeded.
     #[inline]
     pub fn claim_with_user_defined(&mut self, len: usize, user_defined: u32) -> Result<Claim> {
         let aligned_len = get_aligned_size(len);
@@ -185,21 +254,27 @@ impl Writer {
         Ok(Claim::new(self, aligned_len, len, user_defined))
     }
 
+    /// Get maximum permissible unaligned payload length that can be accepted by the buffer.
+    /// It is calculated as `min(capacity / 2 - size_of::<FrameHeader>(), MAX_PAYLOAD_LEN)` where
+    /// `MAX_PAYLOAD_LEN` is `(1 << 31) - 1`.
     #[inline]
     pub const fn mtu(&self) -> usize {
         self.ring.mtu
     }
 
+    /// Buffer index at which next write will happen.
     #[inline]
     const fn index(&self) -> usize {
         self.position & (self.ring.capacity - 1)
     }
 
+    /// Number of bytes remaining in the buffer before it will wrap around.
     #[inline]
     const fn remaining(&self) -> usize {
         self.ring.capacity - self.index()
     }
 
+    /// Get reference to the next (unpublished) message frame header;
     #[inline]
     const fn frame_header(&self) -> &FrameHeader {
         unsafe {
@@ -208,6 +283,7 @@ impl Writer {
         }
     }
 
+    /// Get mutable reference to the next (unpublished) message frame header;
     #[inline]
     fn frame_header_mut(&mut self) -> &mut FrameHeader {
         unsafe {
@@ -217,6 +293,7 @@ impl Writer {
     }
 }
 
+/// Represents region of the RingBuffer` we can publish message to.
 #[derive(Debug)]
 pub struct Claim<'a> {
     writer: &'a mut Writer, // underlying writer
@@ -226,6 +303,7 @@ pub struct Claim<'a> {
 }
 
 impl<'a> Claim<'a> {
+    /// Create new claim.
     fn new(writer: &'a mut Writer, len: usize, limit: usize, user_defined: u32) -> Self {
         // insert padding frame if required
         let remaining = writer.remaining();
@@ -247,16 +325,20 @@ impl<'a> Claim<'a> {
         }
     }
 
+    /// Get next message payload as byte slice.
     #[inline]
     pub const fn get_buffer(&self) -> &[u8] {
         self.writer.frame_header().payload(self.limit)
     }
 
+    /// Get next message payload as mutable byte slice.
     #[inline]
     pub fn get_buffer_mut(&mut self) -> &mut [u8] {
         self.writer.frame_header_mut().payload_mut(self.limit)
     }
 
+    /// Commit the message thus making it visible to other consumers. If this operation is not
+    /// invoked the commit will happen when `Claim` is dropped.
     #[inline]
     pub fn commit(self) {
         // we need to ensure the destructor will not be called in this case
@@ -289,11 +371,85 @@ impl Drop for Claim<'_> {
     }
 }
 
+/// Wraps`RingBuffer` and allows to receive messages. Multiple readers can be present at any time,
+/// that operate independently and are not part of any congestion control flow. As a result, each reader
+/// can be overrun by the producer if it's unable to keep up.
 pub struct Reader {
     ring: RingBuffer,
     position: usize, // local position that will always increase
 }
 
+impl Reader {
+    /// Obtain reference to the (unpublished) message frame header.
+    #[inline]
+    const fn as_frame_header(&self) -> &FrameHeader {
+        unsafe { &*(self.ring.header().data_ptr().add(self.index()) as *const FrameHeader) }
+    }
+
+    /// Buffer index at which read will happen.
+    #[inline]
+    const fn index(&self) -> usize {
+        self.position & (self.ring.capacity - 1)
+    }
+
+    /// Construct iterator object that can efficiently read multiple messages in a batch between
+    /// `Reader` current position and prevailing producer position.
+    #[inline]
+    pub fn batch_iter(&mut self) -> BatchIter {
+        let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
+        let limit = producer_position - self.position;
+        let position_snapshot = self.position;
+        BatchIter {
+            reader: self,
+            remaining: limit,
+            position_snapshot,
+        }
+    }
+
+    /// Receive next pending message from the ring buffer.
+    #[inline]
+    pub fn receive_next(&mut self) -> Option<Result<Message>> {
+        let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
+        // no new messages
+        if producer_position_before - self.position == 0 {
+            return None;
+        }
+        self.receive_next_impl(producer_position_before)
+    }
+
+    #[inline]
+    fn receive_next_impl(&mut self, producer_position_before: usize) -> Option<Result<Message>> {
+        // extract frame header fields
+        let frame_header = self.as_frame_header();
+        let (payload_len, is_padding, user_defined) = frame_header.unpack_fields();
+        let producer_position_after = self.ring.header().producer_position.load(Ordering::Acquire);
+
+        // ensure we have not been overrun
+        if producer_position_after > producer_position_before + self.ring.capacity {
+            return Some(Err(error::Error::Overrun(self.position)));
+        }
+
+        // construct the massage
+        let message = Message {
+            header: self.ring.header(),
+            position: self.position + size_of::<FrameHeader>(),
+            payload_len: payload_len as usize,
+            capacity: self.ring.capacity,
+            is_padding,
+            user_defined,
+        };
+
+        // update reader position
+        let aligned_payload_len = get_aligned_size(message.payload_len);
+        self.position += aligned_payload_len + size_of::<FrameHeader>();
+
+        Some(Ok(message))
+    }
+}
+
+/// Contains coordinates to some payload at particular point in time. Messages are consumer in a
+/// 'lazily' way that's why it's safe to `clone()` and pass them around. When message is read
+/// (consumed) it can result in overrun error if the producer has lapped around.
 #[derive(Debug, Clone)]
 pub struct Message {
     header: &'static Header, // ring buffer header
@@ -308,6 +464,7 @@ pub struct Message {
 }
 
 impl Message {
+    /// Buffer index at which read will happen.
     #[inline]
     const fn index(&self) -> usize {
         self.position & (self.capacity - 1)
@@ -316,6 +473,18 @@ impl Message {
     /// Read the message into specified buffer. It will return error if the provided buffer
     /// is too small. Will also return error if at any point the producer has overrun the reader.
     /// On success, it will return the number of bytes written to the buffer.
+    /// ## Examples
+    /// ```no_run
+    /// use bcast::Message;
+    ///
+    /// fn consume_message(msg: &Message) {
+    ///     let mut payload = [0u8; 1024];
+    ///     // read into provided buffer (error means overrun)
+    ///     let len = msg.read(&mut payload).unwrap();
+    ///     // process payload
+    ///     // ...
+    /// }
+    /// ```
     #[inline]
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
         if self.payload_len > buf.len() {
@@ -337,6 +506,8 @@ impl Message {
     }
 }
 
+/// Iterator that allows to process pending messages in a batch. This is more efficient than iterating
+/// over the messages than using `receive_next()` on the Reader` directly.
 pub struct BatchIter<'a> {
     reader: &'a mut Reader,
     remaining: usize,         // remaining bytes to consume
@@ -375,69 +546,6 @@ impl BatchIter<'_> {
             }
             Some(Err(err)) => Some(Err(err)),
         }
-    }
-}
-
-impl Reader {
-    #[inline]
-    const fn as_frame_header(&self) -> &FrameHeader {
-        unsafe { &*(self.ring.header().data_ptr().add(self.index()) as *const FrameHeader) }
-    }
-
-    #[inline]
-    const fn index(&self) -> usize {
-        self.position & (self.ring.capacity - 1)
-    }
-
-    #[inline]
-    pub fn batch_iter(&mut self) -> BatchIter {
-        let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
-        let limit = producer_position - self.position;
-        let position_snapshot = self.position;
-        BatchIter {
-            reader: self,
-            remaining: limit,
-            position_snapshot,
-        }
-    }
-
-    #[inline]
-    pub fn receive_next(&mut self) -> Option<Result<Message>> {
-        let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
-        // no new messages
-        if producer_position_before - self.position == 0 {
-            return None;
-        }
-        self.receive_next_impl(producer_position_before)
-    }
-
-    #[inline]
-    fn receive_next_impl(&mut self, producer_position_before: usize) -> Option<Result<Message>> {
-        // extract frame header fields
-        let frame_header = self.as_frame_header();
-        let (payload_len, is_padding, user_defined) = frame_header.unpack_fields();
-        let producer_position_after = self.ring.header().producer_position.load(Ordering::Acquire);
-
-        // ensure we have not been overrun
-        if producer_position_after > producer_position_before + self.ring.capacity {
-            return Some(Err(error::Error::Overrun(self.position)));
-        }
-
-        // construct the massage
-        let message = Message {
-            header: self.ring.header(),
-            position: self.position + size_of::<FrameHeader>(),
-            payload_len: payload_len as usize,
-            capacity: self.ring.capacity,
-            is_padding,
-            user_defined,
-        };
-
-        // update reader position
-        let aligned_payload_len = get_aligned_size(message.payload_len);
-        self.position += aligned_payload_len + size_of::<FrameHeader>();
-
-        Some(Ok(message))
     }
 }
 

@@ -19,3 +19,8 @@ crossbeam-utils = "0.8.20"
 anyhow = "1.0.93"
 rand = "0.8.5"
 memmap2 = "0.9.5"
+
+[profile.release]
+codegen-units = 1
+lto = true
+debug = true

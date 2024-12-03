@@ -1,5 +1,6 @@
 use bcast::RingBuffer;
 use rand::{thread_rng, Rng};
+use std::mem::MaybeUninit;
 
 /// Generate random message every 1 millisecond.
 #[allow(dead_code)]
@@ -23,20 +24,27 @@ pub fn writer(bytes: &[u8]) -> anyhow::Result<()> {
 pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
     let mut reader = RingBuffer::new(bytes).into_reader();
     loop {
+        #[cfg(debug_assertions)]
         let mut count = 0;
         for msg in reader.batch_iter() {
-            count += 1;
             let msg = msg?;
-            let mut payload = [0u8; 1024];
+            let mut payload = unsafe { MaybeUninit::new([0u8; 1024]).assume_init() };
             msg.read(&mut payload)?;
-            let payload = &payload[..msg.payload_len];
-            assert!(payload.iter().all(|b| *b == msg.user_defined as u8));
-            println!("{}", std::str::from_utf8(payload)?);
+            #[cfg(debug_assertions)]
+            {
+                count += 1;
+                let payload = &payload[..msg.payload_len];
+                assert!(payload.iter().all(|b| *b == msg.user_defined as u8));
+                println!("{}", std::str::from_utf8(payload)?);
+            }
         }
-        if count > 0 {
-            println!("batch_size: {}", count);
+        #[cfg(debug_assertions)]
+        {
+            if count > 0 {
+                println!("batch_size: {}", count);
+            }
+            // adding delay here to simulate impact of batching
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        // adding delay here to simulate impact of batching
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }

@@ -302,10 +302,11 @@ impl Writer {
 /// Represents region of the `RingBuffer` we can publish message to.
 #[derive(Debug)]
 pub struct Claim<'a> {
-    writer: &'a mut Writer, // underlying writer
-    len: usize,             // frame header aligned payload length
-    limit: usize,           // actual payload length
-    user_defined: u32,      // user defined field
+    writer: &'a mut Writer,   // underlying writer
+    position_snapshot: usize, // writer initial position
+    len: usize,               // frame header aligned payload length
+    limit: usize,             // actual payload length
+    user_defined: u32,        // user defined field
 }
 
 impl<'a> Claim<'a> {
@@ -323,6 +324,8 @@ impl<'a> Claim<'a> {
             writer.position += padding_len + size_of::<FrameHeader>();
         }
 
+        let position_snapshot = writer.position;
+
         // insert padding frame if required
         let remaining = writer.remaining();
         if len + size_of::<FrameHeader>() > remaining {
@@ -331,6 +334,7 @@ impl<'a> Claim<'a> {
 
         Self {
             writer,
+            position_snapshot,
             len,
             limit,
             user_defined,
@@ -347,6 +351,14 @@ impl<'a> Claim<'a> {
     #[inline]
     pub const fn get_buffer_mut(&mut self) -> &mut [u8] {
         self.writer.frame_header_mut().payload_mut(self.limit)
+    }
+
+    /// Abort the publication.
+    #[inline]
+    pub const fn abort(self) {
+        // rollback to the initial position (in case padding frame was inserted)
+        self.writer.position = self.position_snapshot;
+        let _ = ManuallyDrop::new(self);
     }
 
     /// Commit the message thus making it visible to other consumers. If this operation is not
@@ -916,5 +928,28 @@ mod tests {
 
         let msg = reader.receive_next().unwrap().unwrap();
         assert_eq!(0, msg.payload_len);
+    }
+
+    #[test]
+    fn should_abort_publication() {
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        assert_eq!(0, writer.position);
+
+        let claim = writer.claim(16).unwrap();
+        claim.abort();
+        assert_eq!(0, writer.position);
+
+        let claim = writer.claim(24).unwrap();
+        claim.commit();
+        assert_eq!(32, writer.position);
+
+        let claim = writer.claim(8).unwrap();
+        claim.commit();
+        assert_eq!(48, writer.position);
+
+        let claim = writer.claim(16).unwrap();
+        claim.abort();
+        assert_eq!(48, writer.position); // wll rollback padding frame
     }
 }

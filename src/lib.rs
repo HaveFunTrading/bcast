@@ -221,7 +221,7 @@ impl RingBuffer {
     }
 }
 
-/// Wraps`RingBuffer` and allows to publish messages. Only single writer should be present at any time.
+/// Wraps `RingBuffer` and allows to publish messages. Only single writer should be present at any time.
 #[derive(Debug)]
 pub struct Writer {
     ring: RingBuffer,

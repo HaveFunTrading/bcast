@@ -249,7 +249,7 @@ impl Writer {
     pub fn claim_with_user_defined(&mut self, len: usize, user_defined: u32) -> Result<Claim> {
         #[cold]
         #[inline(never)]
-        fn mtu_limit_exceeded(requested: usize, mtu: usize) -> error::Error {
+        const fn mtu_limit_exceeded(requested: usize, mtu: usize) -> error::Error {
             error::Error::MtuLimitExceeded(requested, mtu)
         }
 
@@ -438,6 +438,12 @@ impl Reader {
 
     #[inline]
     fn receive_next_impl(&mut self, producer_position_before: usize) -> Option<Result<Message>> {
+        #[cold]
+        #[inline(never)]
+        const fn overrun(position: usize) -> error::Error {
+            error::Error::Overrun(position)
+        }
+
         // extract frame header fields
         let frame_header = self.as_frame_header();
         let (payload_len, is_padding, user_defined) = frame_header.unpack_fields();
@@ -445,7 +451,7 @@ impl Reader {
 
         // ensure we have not been overrun
         if producer_position_after > producer_position_before + self.ring.capacity {
-            return Some(Err(error::Error::Overrun(self.position)));
+            return Some(Err(overrun(self.position)));
         }
 
         // construct the massage
@@ -508,8 +514,14 @@ impl Message {
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
         #[cold]
         #[inline(never)]
-        fn insufficient_buffer_size(provided: usize, required: usize) -> error::Error {
+        const fn insufficient_buffer_size(provided: usize, required: usize) -> error::Error {
             error::Error::InsufficientBufferSize(provided, required)
+        }
+
+        #[cold]
+        #[inline(never)]
+        const fn overrun(position: usize) -> error::Error {
+            error::Error::Overrun(position)
         }
 
         // ensure destination buffer is of sufficient size
@@ -525,10 +537,11 @@ impl Message {
         let producer_position_after = self.header.producer_position.load(Ordering::Acquire);
 
         // ensure we have not been overrun by the producer
-        match producer_position_after > producer_position_before + self.capacity {
-            true => Err(error::Error::Overrun(self.position)),
-            false => Ok(self.payload_len),
+        if producer_position_after > producer_position_before + self.capacity {
+            return Err(overrun(self.position));
         }
+
+        Ok(self.payload_len)
     }
 }
 

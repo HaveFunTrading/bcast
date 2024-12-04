@@ -30,9 +30,7 @@ fn main() -> anyhow::Result<()> {
 
                     #[cold]
                     #[inline(never)]
-                    fn poison() {
-                        println!("poisson");
-                    }
+                    fn poison() {}
 
                     if time == 0 {
                         poison();

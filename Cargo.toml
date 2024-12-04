@@ -1,6 +1,6 @@
 [package]
 name = "bcast"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2021"
 license = "MIT"
 description = "Low latency broadcast (SPMC) buffer designed to work with shared memory."
@@ -19,8 +19,24 @@ crossbeam-utils = "0.8.20"
 anyhow = "1.0.93"
 rand = "0.8.5"
 memmap2 = "0.9.5"
+hdrhistogram = "7.5.4"
 
 [profile.release]
 codegen-units = 1
 lto = true
 debug = true
+
+[profile.bench]
+codegen-units = 1
+lto = true
+debug = false
+
+[[bench]]
+name = "rtt"
+harness = false
+path = "benches/rtt.rs"
+
+[[bench]]
+name = "rx"
+harness = false
+path = "benches/rx.rs"

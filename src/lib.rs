@@ -247,9 +247,15 @@ impl Writer {
     /// producer can overrun consumers) except for the case when the message `mtu` limit has been exceeded.
     #[inline]
     pub fn claim_with_user_defined(&mut self, len: usize, user_defined: u32) -> Result<Claim> {
+        #[cold]
+        #[inline(never)]
+        fn mtu_limit_exceeded(requested: usize, mtu: usize) -> error::Error {
+            error::Error::MtuLimitExceeded(requested, mtu)
+        }
+
         let aligned_len = get_aligned_size(len);
         if aligned_len > self.ring.mtu {
-            return Err(error::Error::MtuLimitExceeded(len, self.ring.mtu));
+            return Err(mtu_limit_exceeded(len, self.ring.mtu));
         }
         Ok(Claim::new(self, aligned_len, len, user_defined))
     }
@@ -306,9 +312,8 @@ impl<'a> Claim<'a> {
     /// Create new claim.
     #[inline]
     const fn new(writer: &'a mut Writer, len: usize, limit: usize, user_defined: u32) -> Self {
-        // insert padding frame if required
-        let remaining = writer.remaining();
-        if len + size_of::<FrameHeader>() > remaining {
+        #[cold]
+        const fn insert_padding_frame(writer: &mut Writer, remaining: usize) {
             let padding_len = remaining - size_of::<FrameHeader>();
             let fields = (padding_len as u32 & FRAME_HEADER_MSG_LEN_MASK) | ((true as u32) << 31);
 
@@ -316,6 +321,12 @@ impl<'a> Claim<'a> {
             header.fields = fields;
             header.user_defined = USER_DEFINED_NULL_VALUE;
             writer.position += padding_len + size_of::<FrameHeader>();
+        }
+
+        // insert padding frame if required
+        let remaining = writer.remaining();
+        if len + size_of::<FrameHeader>() > remaining {
+            insert_padding_frame(writer, remaining);
         };
 
         Self {
@@ -381,6 +392,13 @@ pub struct Reader {
 }
 
 impl Reader {
+    pub fn with_initial_position(self, position: usize) -> Self {
+        Self {
+            ring: self.ring,
+            position,
+        }
+    }
+
     /// Obtain reference to the (unpublished) message frame header.
     #[inline]
     const fn as_frame_header(&self) -> &FrameHeader {
@@ -488,8 +506,15 @@ impl Message {
     /// ```
     #[inline]
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        #[cold]
+        #[inline(never)]
+        fn insufficient_buffer_size(provided: usize, required: usize) -> error::Error {
+            error::Error::InsufficientBufferSize(provided, required)
+        }
+
+        // ensure destination buffer is of sufficient size
         if self.payload_len > buf.len() {
-            return Err(error::Error::InsufficientBufferSize(buf.len(), self.payload_len));
+            return Err(insufficient_buffer_size(buf.len(), self.payload_len));
         }
 
         // attempt to copy message data into provided buffer
@@ -865,5 +890,18 @@ mod tests {
         msg.read(&mut payload).unwrap();
 
         assert_eq!(payload, b"hello world");
+    }
+
+    #[test]
+    fn should_send_zero_size_message() {
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let mut reader = RingBuffer::new(&bytes).into_reader();
+
+        let claim = writer.claim(0).unwrap();
+        claim.commit();
+
+        let msg = reader.receive_next().unwrap().unwrap();
+        assert_eq!(0, msg.payload_len);
     }
 }

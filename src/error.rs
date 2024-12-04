@@ -13,6 +13,4 @@ pub enum Error {
     InsufficientBufferSize(usize, usize),
     #[error("mtu limit exceeded, requested: {0}, mtu: {1}")]
     MtuLimitExceeded(usize, usize),
-    #[error("arithmetic overflow")]
-    ArithmeticOverflow,
 }

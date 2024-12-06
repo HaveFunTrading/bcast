@@ -483,7 +483,16 @@ impl Reader {
         if producer_position_before - self.position == 0 {
             return None;
         }
-        self.receive_next_impl(producer_position_before)
+        // attempt to receive next frame
+        // if the frame is padding will skip it and attempt to return next frame
+        match self.receive_next_impl(producer_position_before) {
+            Some(msg) => match msg {
+                Ok(msg) if !msg.is_padding => Some(Ok(msg)),
+                Ok(_) => self.receive_next_impl(producer_position_before),
+                Err(err) => Some(Err(err)),
+            },
+            None => None,
+        }
     }
 
     #[inline]
@@ -992,5 +1001,28 @@ mod tests {
         });
         let reader = RingBuffer::new(&bytes).into_reader();
         assert_eq!(b"hello world", &reader.metadata()[..11]);
+    }
+
+    #[test]
+    fn should_skip_padding_frame() {
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let mut reader = RingBuffer::new(&bytes).into_reader();
+
+        let claim = writer.claim(24).unwrap();
+        claim.commit();
+        let claim = writer.claim(8).unwrap();
+        claim.commit();
+        let claim = writer.claim(24).unwrap();
+        claim.commit();
+
+        let msg = reader.receive_next().unwrap().unwrap();
+        assert!(!msg.is_padding);
+        let msg = reader.receive_next().unwrap().unwrap();
+        assert!(!msg.is_padding);
+        let msg = reader.receive_next().unwrap().unwrap();
+        assert!(!msg.is_padding);
+        let msg = reader.receive_next();
+        assert!(msg.is_none())
     }
 }

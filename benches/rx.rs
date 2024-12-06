@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // time in nanoseconds to outgoing messages. When consumer reads those it will compute receive
 // delay as current time in nanoseconds minus timestamp from the message.
 
-const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024 * 1024 * 64;
+const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024 * 1024 * 32;
 const NUM_MESSAGES: usize = 1_000_000;
 
 fn main() -> anyhow::Result<()> {

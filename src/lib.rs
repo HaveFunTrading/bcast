@@ -614,11 +614,11 @@ impl Iterator for BatchIter<'_> {
 impl BatchIter<'_> {
     #[inline]
     fn receive_next(&mut self) -> Option<Result<Message>> {
-        // we reached the batch limit
+        // we reached end of batch
         if self.remaining == 0 {
             return None;
         }
-        // update iterator with the number of bytes received
+        // update iterator with the number of bytes consumed
         match self.reader.receive_next_impl(self.position_snapshot) {
             None => None,
             Some(Ok(msg)) => {

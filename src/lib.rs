@@ -52,6 +52,7 @@ use std::mem::ManuallyDrop;
 use std::ptr::{copy_nonoverlapping, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::error::{insufficient_buffer_size, mtu_limit_exceeded, overrun};
 // re-export
 pub use error::Result;
 use std::mem::align_of;
@@ -284,12 +285,6 @@ impl Writer {
     /// producer can overrun consumers) except for the case when the message `mtu` limit has been exceeded.
     #[inline]
     pub fn claim_with_user_defined(&mut self, len: usize, user_defined: u32) -> Result<Claim> {
-        #[cold]
-        #[inline(never)]
-        const fn mtu_limit_exceeded(requested: usize, mtu: usize) -> error::Error {
-            error::Error::MtuLimitExceeded(requested, mtu)
-        }
-
         let aligned_len = get_aligned_size(len);
         if aligned_len > self.ring.mtu {
             return Err(mtu_limit_exceeded(len, self.ring.mtu));
@@ -493,12 +488,6 @@ impl Reader {
 
     #[inline]
     fn receive_next_impl(&mut self, producer_position_before: usize) -> Option<Result<Message>> {
-        #[cold]
-        #[inline(never)]
-        const fn overrun(position: usize) -> error::Error {
-            error::Error::Overrun(position)
-        }
-
         // extract frame header fields
         let frame_header = self.as_frame_header();
         let (payload_len, is_padding, user_defined) = frame_header.unpack_fields();
@@ -567,18 +556,6 @@ impl Message {
     /// ```
     #[inline]
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        #[cold]
-        #[inline(never)]
-        const fn insufficient_buffer_size(provided: usize, required: usize) -> error::Error {
-            error::Error::InsufficientBufferSize(provided, required)
-        }
-
-        #[cold]
-        #[inline(never)]
-        const fn overrun(position: usize) -> error::Error {
-            error::Error::Overrun(position)
-        }
-
         // ensure destination buffer is of sufficient size
         if self.payload_len > buf.len() {
             return Err(insufficient_buffer_size(buf.len(), self.payload_len));

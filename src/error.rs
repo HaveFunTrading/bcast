@@ -17,3 +17,21 @@ pub enum Error {
     #[error("mtu limit exceeded, requested: {0}, mtu: {1}")]
     MtuLimitExceeded(usize, usize),
 }
+
+#[cold]
+#[inline(never)]
+pub(crate) const fn overrun(position: usize) -> Error {
+    Error::Overrun(position)
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) const fn insufficient_buffer_size(provided: usize, required: usize) -> Error {
+    Error::InsufficientBufferSize(provided, required)
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) const fn mtu_limit_exceeded(requested: usize, mtu: usize) -> Error {
+    Error::MtuLimitExceeded(requested, mtu)
+}

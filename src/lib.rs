@@ -47,20 +47,23 @@ pub mod error;
 
 use crossbeam_utils::CachePadded;
 use std::cmp::min;
+use std::hint;
 use std::mem::ManuallyDrop;
 use std::ptr::{copy_nonoverlapping, NonNull};
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use std::mem::align_of;
-use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // re-export
 pub use error::Result;
+use std::mem::align_of;
+use std::mem::size_of;
 
-/// Ring buffer header size.
+/// Ring buffer header size in bytes.
 pub const HEADER_SIZE: usize = size_of::<Header>();
+/// Metadata buffer size in bytes.
+pub const METADATA_BUFFER_SIZE: usize = 1024;
 /// Null value for `user_defined` field.
 pub const USER_DEFINED_NULL_VALUE: u32 = u32::MAX;
+
 const FRAME_HEADER_PADDING_MASK: u32 = 0x80000000;
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x7FFFFFFF;
 
@@ -70,6 +73,8 @@ const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x7FFFFFFF;
 #[repr(C)]
 struct Header {
     producer_position: CachePadded<AtomicUsize>, // will always increase
+    ready: CachePadded<AtomicBool>,              // indicates channel readiness
+    metadata: CachePadded<[u8; 1024]>,           // metadata buffer
 }
 
 impl Header {
@@ -85,6 +90,24 @@ impl Header {
     const fn data_ptr_mut(&self) -> *mut u8 {
         let header_ptr = self as *const Header as *mut Header;
         unsafe { header_ptr.add(1) as *mut u8 }
+    }
+
+    /// Check readiness status.
+    #[inline]
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+
+    /// Get metadata buffer as slice.
+    #[inline]
+    fn metadata(&self) -> &[u8] {
+        &*self.metadata
+    }
+
+    /// Get metadata buffer as mutable slice.
+    #[inline]
+    fn metadata_mut(&mut self) -> &mut [u8] {
+        &mut *self.metadata
     }
 }
 
@@ -204,15 +227,29 @@ impl RingBuffer {
 
     /// Will consume `self` and return instance of writer backed by this ring buffer.
     pub fn into_writer(self) -> Writer {
+        // mark as initialised
+        self.header().ready.store(true, Ordering::SeqCst);
         Writer {
             ring: self,
             position: 0,
         }
     }
 
+    /// Will consume `self` and return instance of writer backed by this ring buffer. This
+    /// method also accepts closure to populate `metadata` buffer.
+    pub fn into_writer_with_metadata<F: FnOnce(&mut [u8])>(mut self, metadata: F) -> Writer {
+        // populate metadata
+        metadata(self.header_mut().metadata_mut());
+        self.into_writer()
+    }
+
     /// Will consume `self` and return instance of reader backed by this ring buffer. The reader
     /// position will be set to producer most up-to-date position.
     pub fn into_reader(self) -> Reader {
+        // wait until buffer has been initialised
+        while !self.header().is_ready() {
+            hint::spin_loop();
+        }
         let producer_position = self.header().producer_position.load(Ordering::SeqCst);
         Reader {
             ring: self,
@@ -404,6 +441,12 @@ pub struct Reader {
 }
 
 impl Reader {
+    /// Get metadata buffer associated with the underlying ring buffer.
+    pub fn metadata(&self) -> &'static [u8] {
+        self.ring.header().metadata()
+    }
+
+    /// Set reader initial position (the default is producer current position).
     pub fn with_initial_position(self, position: usize) -> Self {
         Self {
             ring: self.ring,
@@ -605,6 +648,7 @@ impl BatchIter<'_> {
 mod tests {
     use super::*;
     use crate::error::Error;
+    use std::ptr::addr_of;
     use std::sync::atomic::Ordering::SeqCst;
 
     #[test]
@@ -853,6 +897,15 @@ mod tests {
         let bytes = [0u8; HEADER_SIZE + 1024];
         let mut writer = RingBuffer::new(&bytes).into_writer();
 
+        let producer_position_addr = addr_of!(writer.ring.header().producer_position) as usize;
+        let ready_addr = addr_of!(writer.ring.header().ready) as usize;
+        let metadata_addr = addr_of!(writer.ring.header().metadata) as usize;
+        let data_addr = writer.ring.header().data_ptr() as usize;
+
+        assert_eq!(METADATA_BUFFER_SIZE, data_addr - metadata_addr);
+        assert_eq!(128, metadata_addr - ready_addr);
+        assert_eq!(128, ready_addr - producer_position_addr);
+
         let header_ptr = writer.ring.header() as *const Header;
         let data_ptr = writer.ring.header().data_ptr();
 
@@ -863,7 +916,7 @@ mod tests {
         assert_eq!(size_of::<Header>() + size_of::<FrameHeader>(), buf_ptr_0 as usize - header_ptr as usize);
         assert_eq!(size_of::<FrameHeader>(), buf_ptr_0 as usize - data_ptr as usize);
         assert_eq!(16, claim.get_buffer().len());
-        assert_eq!(128, size_of::<Header>());
+        assert_eq!(1280, size_of::<Header>());
         assert_eq!(8, size_of::<FrameHeader>());
         assert_eq!(8, align_of::<FrameHeader>());
         assert_eq!(size_of::<Header>(), frame_ptr_0 as usize - bytes.as_ptr() as usize);
@@ -951,5 +1004,16 @@ mod tests {
         let claim = writer.claim(16).unwrap();
         claim.abort();
         assert_eq!(48, writer.position); // wll rollback padding frame
+    }
+
+    #[test]
+    fn should_attach_metadata() {
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let _ = RingBuffer::new(&bytes).into_writer_with_metadata(|metadata| {
+            assert_eq!(METADATA_BUFFER_SIZE, metadata.len());
+            metadata[0..11].copy_from_slice(b"hello world");
+        });
+        let reader = RingBuffer::new(&bytes).into_reader();
+        assert_eq!(b"hello world", &reader.metadata()[..11]);
     }
 }

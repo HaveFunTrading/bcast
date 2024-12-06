@@ -432,7 +432,7 @@ impl Drop for Claim<'_> {
     }
 }
 
-/// Wraps`RingBuffer` and allows to receive messages. Multiple readers can be present at any time,
+/// Wraps `RingBuffer` and allows to receive messages. Multiple readers can be present at any time,
 /// they operate independently and are not part of any congestion control flow. As a result, each reader
 /// can be overrun by the producer if it's unable to keep up.
 pub struct Reader {

@@ -1063,6 +1063,22 @@ mod tests {
     }
 
     #[test]
+    fn should_send_heartbeat() {
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let mut reader = RingBuffer::new(&bytes).into_reader();
+
+        let claim = writer.heartbeat();
+        claim.commit();
+
+        let msg = reader.receive_next().unwrap().unwrap();
+        assert_eq!(0, msg.payload_len);
+        assert!(msg.is_fin);
+        assert!(!msg.is_continuation);
+        assert!(!msg.is_padding);
+    }
+
+    #[test]
     fn should_abort_publication() {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut writer = RingBuffer::new(&bytes).into_writer();

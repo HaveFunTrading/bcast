@@ -1,5 +1,6 @@
 //! Low latency, single producer & many consumer (SPMC) ring buffer that works with shared memory.
 //! Natively supports variable message sizes.
+//!
 //! ## Examples
 //! Create `Writer` and use `claim` to publish a message.
 //! ```no_run
@@ -10,12 +11,12 @@
 //! let mut writer = RingBuffer::new(&bytes).into_writer();
 //!
 //! // publish first message
-//! let mut claim = writer.claim(5).unwrap();
+//! let mut claim = writer.claim(5, true);
 //! claim.get_buffer_mut().copy_from_slice(b"hello");
 //! claim.commit();
 //!
 //! // publish second message
-//! let mut claim = writer.claim(5).unwrap();
+//! let mut claim = writer.claim(5, true);
 //! claim.get_buffer_mut().copy_from_slice(b"world");
 //! claim.commit();
 //! ```
@@ -52,7 +53,7 @@ use std::mem::ManuallyDrop;
 use std::ptr::{copy_nonoverlapping, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::error::{insufficient_buffer_size, mtu_limit_exceeded, overrun};
+use crate::error::Error;
 // re-export
 pub use error::Result;
 use std::mem::align_of;
@@ -63,10 +64,8 @@ pub const HEADER_SIZE: usize = size_of::<Header>();
 /// Metadata buffer size in bytes.
 pub const METADATA_BUFFER_SIZE: usize = 1024;
 /// Null value for `user_defined` field.
-pub const USER_DEFINED_NULL_VALUE: u32 = u32::MAX;
-
-const FRAME_HEADER_PADDING_MASK: u32 = 0x80000000;
-const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x7FFFFFFF;
+pub const USER_DEFINED_NULL_VALUE: u32 = 0;
+const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x0FFFFFFF;
 
 /// Ring buffer header that contains producer position. The position is expressed in bytes and
 /// will always increment.
@@ -112,8 +111,8 @@ impl Header {
     }
 }
 
-/// Message frame header that contains `fields` (packed `padding_flag` and `payload_length`)
-/// and `user_defined` field.
+/// Message frame header that contains packed `fields` (fin, continuation, padding, length)
+/// as well as `user_defined` field.
 #[repr(C, align(8))]
 struct FrameHeader {
     fields: u32,       // contains padding flag and payload length
@@ -123,21 +122,33 @@ struct FrameHeader {
 impl FrameHeader {
     #[inline]
     #[cfg(test)]
-    const fn new(payload_len: u32, user_defined: u32, is_padding: bool) -> Self {
-        let fields = (payload_len & FRAME_HEADER_MSG_LEN_MASK) | ((is_padding as u32) << 31);
+    const fn new(payload_len: u32, user_defined: u32, fin: bool, continuation: bool, padding: bool) -> Self {
+        let fields = pack_fields(fin, continuation, padding, payload_len);
         FrameHeader { fields, user_defined }
     }
 
     #[inline]
     #[cfg(test)]
     const fn new_padding() -> Self {
-        Self::new(0, 0, true)
+        Self::new(0, 0, true, false, true)
     }
 
     #[inline]
     #[cfg(test)]
     const fn is_padding(&self) -> bool {
-        (self.fields & FRAME_HEADER_PADDING_MASK) != 0
+        ((self.fields >> 29) & 1) == 1
+    }
+
+    #[inline]
+    #[cfg(test)]
+    const fn is_continuation(&self) -> bool {
+        ((self.fields >> 30) & 1) == 1
+    }
+
+    #[inline]
+    #[cfg(test)]
+    const fn is_fin(&self) -> bool {
+        ((self.fields >> 31) & 1) == 1
     }
 
     #[inline]
@@ -146,11 +157,10 @@ impl FrameHeader {
         self.fields & FRAME_HEADER_MSG_LEN_MASK
     }
 
-    /// Extract `payload_length`, `is_padding` and `user_defined` fields from the message header.
+    /// Extract `(fin, continuation, padding, length)` fields from the message header.
     #[inline]
-    const fn unpack_fields(&self) -> (u32, bool, u32) {
-        let fields = self.fields;
-        (fields & FRAME_HEADER_MSG_LEN_MASK, (fields & FRAME_HEADER_PADDING_MASK) != 0, self.user_defined)
+    const fn unpack_fields(&self) -> (bool, bool, bool, u32) {
+        unpack_fields(self.fields)
     }
 
     /// Get pointer to the message payload.
@@ -178,6 +188,29 @@ impl FrameHeader {
     const fn payload_mut(&mut self, size: usize) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.get_payload_ptr_mut() as *mut u8, size) }
     }
+}
+
+/// Packs the `FrameHeader` fields into a single u32 according to the following encoding:
+/// - Bit 31: fin flag
+/// - Bit 30: continuation flag
+/// - Bit 29: padding flag
+/// - Bit 28: reserved (always 0)
+/// - Bits 0-27: message length
+const fn pack_fields(fin: bool, continuation: bool, padding: bool, length: u32) -> u32 {
+    unsafe { pack_fields_unchecked(fin, continuation, padding, length & FRAME_HEADER_MSG_LEN_MASK) }
+}
+
+const unsafe fn pack_fields_unchecked(fin: bool, continuation: bool, padding: bool, length: u32) -> u32 {
+    length | ((padding as u32) << 29) | ((continuation as u32) << 30) | ((fin as u32) << 31)
+}
+
+/// Unpacks `u32` field into a tuple: (fin, continuation, padding, length).
+const fn unpack_fields(fields: u32) -> (bool, bool, bool, u32) {
+    let fin = (fields >> 31) & 1 == 1;
+    let continuation = (fields >> 30) & 1 == 1;
+    let padding = (fields >> 29) & 1 == 1;
+    let length = fields & FRAME_HEADER_MSG_LEN_MASK;
+    (fin, continuation, padding, length)
 }
 
 /// Calculate the number of bytes needed to ensure frame header alignment of the payload.
@@ -273,23 +306,46 @@ impl From<RingBuffer> for Writer {
 }
 
 impl Writer {
-    /// Claim part of the underlying `RingBuffer` for publication. This operation will always succeed (since
-    /// producer can overrun consumers) except for the case when the message `mtu` limit has been exceeded.
+    /// Claim part of the underlying `RingBuffer` for publication. The `fin` flag is used to indicate
+    /// final message fragment.
+    ///
+    /// ## Panics
+    /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn claim(&mut self, len: usize) -> Result<Claim> {
-        self.claim_with_user_defined(len, USER_DEFINED_NULL_VALUE)
+    pub const fn claim(&mut self, len: usize, fin: bool) -> Claim {
+        self.claim_with_user_defined(len, fin, USER_DEFINED_NULL_VALUE)
     }
 
-    /// Claim part of the underlying `RingBuffer` for publication also passing `user_defined` value
-    /// that will be attached to the message. This operation will always succeed (since
-    /// producer can overrun consumers) except for the case when the message `mtu` limit has been exceeded.
+    /// Claim part of the underlying `RingBuffer` for publication. The `fin` flag is used to indicate
+    /// final message fragment. This method also accepts `user_defined` value
+    /// that will be attached to the message frame header.
+    ///
+    /// ## Panics
+    /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn claim_with_user_defined(&mut self, len: usize, user_defined: u32) -> Result<Claim> {
+    pub const fn claim_with_user_defined(&mut self, len: usize, fin: bool, user_defined: u32) -> Claim {
         let aligned_len = get_aligned_size(len);
-        if aligned_len > self.ring.mtu {
-            return Err(mtu_limit_exceeded(len, self.ring.mtu));
-        }
-        Ok(Claim::new(self, aligned_len, len, user_defined))
+        assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        Claim::new(self, aligned_len, len, user_defined, fin, false)
+    }
+
+    /// Claim part of the underlying `RingBuffer` for continuation frame publication also passing `fin` value to indicate
+    /// final message fragment.
+    ///
+    /// ## Panics
+    /// When aligned message length is greater than the `MTU`.
+    #[inline]
+    pub const fn continuation(&mut self, len: usize, fin: bool) -> Claim {
+        let aligned_len = get_aligned_size(len);
+        assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, fin, true)
+    }
+
+    /// Claim part of the underlying `RingBuffer` for heartbeat frame publication (zero payload,
+    /// no user defined field and no fragmentation) This operation will always succeed.
+    #[inline]
+    pub const fn heartbeat(&mut self) -> Claim {
+        Claim::new(self, 0, 0, USER_DEFINED_NULL_VALUE, true, false)
     }
 
     /// Get maximum permissible unaligned payload length that can be accepted by the buffer.
@@ -339,17 +395,25 @@ pub struct Claim<'a> {
     len: usize,               // frame header aligned payload length
     limit: usize,             // actual payload length
     user_defined: u32,        // user defined field
+    fin: bool,                // final message fragment
+    continuation: bool,       // continuation frame
 }
 
 impl<'a> Claim<'a> {
     /// Create new claim.
     #[inline]
-    const fn new(writer: &'a mut Writer, len: usize, limit: usize, user_defined: u32) -> Self {
+    const fn new(
+        writer: &'a mut Writer,
+        len: usize,
+        limit: usize,
+        user_defined: u32,
+        fin: bool,
+        continuation: bool,
+    ) -> Self {
         #[cold]
         const fn insert_padding_frame(writer: &mut Writer, remaining: usize) {
             let padding_len = remaining - size_of::<FrameHeader>();
-            let fields = (padding_len as u32 & FRAME_HEADER_MSG_LEN_MASK) | ((true as u32) << 31);
-
+            let fields = pack_fields(true, false, true, padding_len as u32);
             let header = writer.frame_header_mut();
             header.fields = fields;
             header.user_defined = USER_DEFINED_NULL_VALUE;
@@ -370,6 +434,8 @@ impl<'a> Claim<'a> {
             len,
             limit,
             user_defined,
+            fin,
+            continuation,
         }
     }
 
@@ -405,7 +471,7 @@ impl<'a> Claim<'a> {
     fn commit_impl(&mut self) {
         // update frame header
         let header = self.writer.frame_header_mut();
-        let fields = (self.limit as u32 & FRAME_HEADER_MSG_LEN_MASK) | ((false as u32) << 31);
+        let fields = pack_fields(self.fin, self.continuation, false, self.limit as u32);
         header.fields = fields;
         header.user_defined = self.user_defined;
 
@@ -499,20 +565,23 @@ impl Reader {
     fn receive_next_impl(&mut self, producer_position_before: usize) -> Option<Result<Message>> {
         // extract frame header fields
         let frame_header = self.as_frame_header();
-        let (payload_len, is_padding, user_defined) = frame_header.unpack_fields();
+        let (is_fin, is_continuation, is_padding, length) = frame_header.unpack_fields();
+        let user_defined = frame_header.user_defined;
         let producer_position_after = self.ring.header().producer_position.load(Ordering::Acquire);
 
         // ensure we have not been overrun
         if producer_position_after > producer_position_before + self.ring.capacity {
-            return Some(Err(overrun(self.position)));
+            return Some(Err(Error::overrun(self.position)));
         }
 
         // construct the massage
         let message = Message {
             header: self.ring.header(),
             position: self.position + size_of::<FrameHeader>(),
-            payload_len: payload_len as usize,
+            payload_len: length as usize,
             capacity: self.ring.capacity,
+            is_fin,
+            is_continuation,
             is_padding,
             user_defined,
         };
@@ -535,6 +604,10 @@ pub struct Message {
     capacity: usize,         // ring buffer capacity
     /// Message length.
     pub payload_len: usize,
+    /// Indicates final message fragment.
+    pub is_fin: bool,
+    /// Indicates continuation frame
+    pub is_continuation: bool,
     /// Indicates padding frame.
     pub is_padding: bool,
     /// User defined field.
@@ -567,7 +640,7 @@ impl Message {
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
         // ensure destination buffer is of sufficient size
         if self.payload_len > buf.len() {
-            return Err(insufficient_buffer_size(buf.len(), self.payload_len));
+            return Err(Error::insufficient_buffer_size(buf.len(), self.payload_len));
         }
 
         // attempt to copy message data into provided buffer
@@ -579,7 +652,7 @@ impl Message {
 
         // ensure we have not been overrun by the producer
         if producer_position_after > producer_position_before + self.capacity {
-            return Err(overrun(self.position));
+            return Err(Error::overrun(self.position));
         }
 
         Ok(self.payload_len)
@@ -643,11 +716,11 @@ mod tests {
         let mut writer = RingBuffer::new(&bytes).into_writer();
         let mut reader = RingBuffer::new(&bytes).into_reader();
 
-        let mut claim = writer.claim(5).unwrap();
+        let mut claim = writer.claim(5, true);
         claim.get_buffer_mut().copy_from_slice(b"hello");
         claim.commit();
 
-        let mut claim = writer.claim(5).unwrap();
+        let mut claim = writer.claim(5, true);
         claim.get_buffer_mut().copy_from_slice(b"world");
         claim.commit();
 
@@ -676,13 +749,13 @@ mod tests {
         assert_eq!(32, writer.position);
         assert_eq!(32, writer.remaining());
 
-        let claim = writer.claim(15).unwrap();
+        let claim = writer.claim(15, true);
         claim.commit();
 
         assert_eq!(56, writer.index());
         assert_eq!(56, writer.position);
 
-        let mut claim = writer.claim(4).unwrap();
+        let mut claim = writer.claim(4, true);
         claim.get_buffer_mut().copy_from_slice(b"test");
         claim.commit();
 
@@ -709,15 +782,15 @@ mod tests {
         let mut writer = RingBuffer::new(&bytes).into_writer();
         let mut reader = RingBuffer::new(&bytes).into_reader();
 
-        let mut claim = writer.claim(1).unwrap();
+        let mut claim = writer.claim(1, true);
         claim.get_buffer_mut().copy_from_slice(b"a");
         claim.commit();
 
-        let mut claim = writer.claim(1).unwrap();
+        let mut claim = writer.claim(1, true);
         claim.get_buffer_mut().copy_from_slice(b"b");
         claim.commit();
 
-        let mut claim = writer.claim(1).unwrap();
+        let mut claim = writer.claim(1, true);
         claim.get_buffer_mut().copy_from_slice(b"c");
         claim.commit();
 
@@ -751,15 +824,15 @@ mod tests {
         let mut writer = RingBuffer::new(&bytes).into_writer();
         let mut reader = RingBuffer::new(&bytes).into_reader();
 
-        let mut claim = writer.claim(1).unwrap();
+        let mut claim = writer.claim(1, true);
         claim.get_buffer_mut().copy_from_slice(b"a");
         claim.commit();
 
-        let mut claim = writer.claim(1).unwrap();
+        let mut claim = writer.claim(1, true);
         claim.get_buffer_mut().copy_from_slice(b"b");
         claim.commit();
 
-        let mut claim = writer.claim(1).unwrap();
+        let mut claim = writer.claim(1, true);
         claim.get_buffer_mut().copy_from_slice(b"c");
         claim.commit();
 
@@ -787,10 +860,10 @@ mod tests {
         let mut writer = RingBuffer::new(&bytes).into_writer();
         let mut reader = RingBuffer::new(&bytes).into_reader();
 
-        writer.claim(16).unwrap().commit();
-        writer.claim(16).unwrap().commit();
-        writer.claim(16).unwrap().commit();
-        writer.claim(16).unwrap().commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
 
         let mut iter = reader.batch_iter();
         let msg = iter.next().unwrap();
@@ -798,13 +871,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "mtu exceeded")]
     fn should_error_if_mtu_exceeded() {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut writer = RingBuffer::new(&bytes).into_writer();
         assert_eq!(24, writer.mtu());
-        let claim = writer.claim(32);
-        assert!(claim.is_err());
-        assert_eq!(Error::MtuLimitExceeded(32, 24), claim.unwrap_err());
+        let _ = writer.claim(32, true);
     }
 
     #[test]
@@ -812,7 +884,7 @@ mod tests {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut writer = RingBuffer::new(&bytes).into_writer();
 
-        writer.claim(16).unwrap().commit();
+        writer.claim(16, true).commit();
 
         assert_eq!(24, writer.position);
         assert_eq!(24, writer.index());
@@ -824,27 +896,48 @@ mod tests {
     }
 
     #[test]
+    fn should_pack_and_unpack_fields() {
+        assert_eq!((true, true, true, 123), unpack_fields(pack_fields(true, true, true, 123)));
+        assert_eq!((true, true, false, 123), unpack_fields(pack_fields(true, true, false, 123)));
+        assert_eq!((true, false, true, 123), unpack_fields(pack_fields(true, false, true, 123)));
+        assert_eq!((true, false, false, 123), unpack_fields(pack_fields(true, false, false, 123)));
+        assert_eq!((false, false, false, 123), unpack_fields(pack_fields(false, false, false, 123)));
+        assert_eq!((false, false, true, 123), unpack_fields(pack_fields(false, false, true, 123)));
+        assert_eq!((false, true, false, 123), unpack_fields(pack_fields(false, true, false, 123)));
+    }
+
+    #[test]
     fn should_align_frame_header() {
         assert_eq!(8, align_of::<FrameHeader>());
         assert_eq!(8, size_of::<FrameHeader>());
 
-        let frame = FrameHeader::new(10, 0, false);
+        let frame = FrameHeader::new(10, 0, true, false, false);
+        assert!(frame.is_fin());
+        assert!(!frame.is_continuation());
         assert!(!frame.is_padding());
         assert_eq!(10, frame.payload_len());
 
-        let frame = FrameHeader::new(10, 0, true);
+        let frame = FrameHeader::new(10, 0, true, false, true);
+        assert!(frame.is_fin());
+        assert!(!frame.is_continuation());
         assert!(frame.is_padding());
         assert_eq!(10, frame.payload_len());
 
-        let frame = FrameHeader::new(0, 0, false);
+        let frame = FrameHeader::new(0, 0, true, false, false);
+        assert!(frame.is_fin());
+        assert!(!frame.is_continuation());
         assert!(!frame.is_padding());
         assert_eq!(0, frame.payload_len());
 
-        let frame = FrameHeader::new(0, 0, true);
+        let frame = FrameHeader::new(0, 0, true, false, true);
+        assert!(frame.is_fin());
+        assert!(!frame.is_continuation());
         assert!(frame.is_padding());
         assert_eq!(0, frame.payload_len());
 
         let frame = FrameHeader::new_padding();
+        assert!(frame.is_fin());
+        assert!(!frame.is_continuation());
         assert!(frame.is_padding());
         assert_eq!(0, frame.payload_len());
     }
@@ -856,21 +949,21 @@ mod tests {
 
         assert_eq!(0, writer.index());
 
-        let claim = writer.claim(10).unwrap();
+        let claim = writer.claim(10, true);
         assert_eq!(10, claim.get_buffer().len());
         claim.commit();
 
         assert_eq!(24, writer.index());
         assert_eq!(40, writer.remaining());
 
-        let claim = writer.claim(5).unwrap();
+        let claim = writer.claim(5, true);
         assert_eq!(5, claim.get_buffer().len());
         claim.commit();
 
         assert_eq!(40, writer.index());
         assert_eq!(24, writer.remaining());
 
-        let claim = writer.claim(17).unwrap();
+        let claim = writer.claim(17, true);
         assert_eq!(17, claim.get_buffer().len());
         claim.commit();
 
@@ -895,7 +988,7 @@ mod tests {
         let header_ptr = writer.ring.header() as *const Header;
         let data_ptr = writer.ring.header().data_ptr();
 
-        let claim = writer.claim(16).unwrap();
+        let claim = writer.claim(16, true);
         let buf_ptr_0 = claim.get_buffer().as_ptr();
         let frame_ptr_0 = claim.writer.frame_header() as *const FrameHeader;
 
@@ -909,7 +1002,7 @@ mod tests {
 
         claim.commit();
 
-        let claim = writer.claim(13).unwrap();
+        let claim = writer.claim(13, true);
         let buf_ptr_1 = claim.get_buffer().as_ptr();
         let frame_ptr_1 = claim.writer.frame_header() as *const FrameHeader;
 
@@ -942,7 +1035,7 @@ mod tests {
         let mut writer = RingBuffer::new(&bytes).into_writer();
         let mut reader = RingBuffer::new(&bytes).into_reader();
 
-        let mut claim = writer.claim(11).unwrap();
+        let mut claim = writer.claim(11, true);
         claim.get_buffer_mut().copy_from_slice(b"hello world");
         claim.commit();
 
@@ -962,7 +1055,7 @@ mod tests {
         let mut writer = RingBuffer::new(&bytes).into_writer();
         let mut reader = RingBuffer::new(&bytes).into_reader();
 
-        let claim = writer.claim(0).unwrap();
+        let claim = writer.claim(0, true);
         claim.commit();
 
         let msg = reader.receive_next().unwrap().unwrap();
@@ -975,19 +1068,19 @@ mod tests {
         let mut writer = RingBuffer::new(&bytes).into_writer();
         assert_eq!(0, writer.position);
 
-        let claim = writer.claim(16).unwrap();
+        let claim = writer.claim(16, true);
         claim.abort();
         assert_eq!(0, writer.position);
 
-        let claim = writer.claim(24).unwrap();
+        let claim = writer.claim(24, true);
         claim.commit();
         assert_eq!(32, writer.position);
 
-        let claim = writer.claim(8).unwrap();
+        let claim = writer.claim(8, true);
         claim.commit();
         assert_eq!(48, writer.position);
 
-        let claim = writer.claim(16).unwrap();
+        let claim = writer.claim(16, true);
         claim.abort();
         assert_eq!(48, writer.position); // wll rollback padding frame
     }
@@ -1006,22 +1099,62 @@ mod tests {
     #[test]
     fn should_skip_padding_frame() {
         let bytes = [0u8; HEADER_SIZE + 64];
+        let mut buffer = [0u8; 1024];
         let mut writer = RingBuffer::new(&bytes).into_writer();
         let mut reader = RingBuffer::new(&bytes).into_reader();
 
-        let claim = writer.claim(24).unwrap();
+        let claim = writer.claim_with_user_defined(24, true, 123);
         claim.commit();
-        let claim = writer.claim(8).unwrap();
-        claim.commit();
-        let claim = writer.claim(24).unwrap();
-        claim.commit();
+        let msg = reader.receive_next().unwrap().unwrap();
+        msg.read(&mut buffer).unwrap();
+        assert!(!msg.is_padding);
 
+        let claim = writer.claim(8, true);
+        claim.commit();
         let msg = reader.receive_next().unwrap().unwrap();
+        msg.read(&mut buffer).unwrap();
         assert!(!msg.is_padding);
+
+        let claim = writer.claim(24, true);
+        claim.commit();
         let msg = reader.receive_next().unwrap().unwrap();
+        msg.read(&mut buffer).unwrap();
         assert!(!msg.is_padding);
+
+        let msg = reader.receive_next();
+        assert!(msg.is_none())
+    }
+
+    #[test]
+    fn should_fragment_message() {
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let mut reader = RingBuffer::new(&bytes).into_reader();
+
+        let claim = writer.claim_with_user_defined(24, false, 123);
+        claim.commit();
         let msg = reader.receive_next().unwrap().unwrap();
+        assert!(!msg.is_fin);
+        assert!(!msg.is_continuation);
         assert!(!msg.is_padding);
+        assert_eq!(123, msg.user_defined); // only attached to the first frame
+
+        let claim = writer.continuation(8, false);
+        claim.commit();
+        let msg = reader.receive_next().unwrap().unwrap();
+        assert!(!msg.is_fin);
+        assert!(msg.is_continuation);
+        assert!(!msg.is_padding);
+        assert_eq!(USER_DEFINED_NULL_VALUE, msg.user_defined);
+
+        let claim = writer.continuation(24, true);
+        claim.commit();
+        let msg = reader.receive_next().unwrap().unwrap();
+        assert!(msg.is_fin);
+        assert!(msg.is_continuation);
+        assert!(!msg.is_padding);
+        assert_eq!(USER_DEFINED_NULL_VALUE, msg.user_defined);
+
         let msg = reader.receive_next();
         assert!(msg.is_none())
     }

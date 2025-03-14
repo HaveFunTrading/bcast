@@ -28,7 +28,7 @@ Writing takes place via `claim` operation that returns `Claim` object. We then h
 we can write our variable length message.
 
 ```rust
-let mut claim = writer.claim(5)?;
+let mut claim = writer.claim(5, true);
 claim.get_buffer_mut().copy_from_slice(b"hello");
 claim.commit();
 ```
@@ -48,7 +48,7 @@ messages in form of an iterator.
 for msg in reader.batch_iter() {
     let mut payload = [0u8; 1024];
     let len = msg?.read(&mut payload)?;
-    assert_eq!(b"hello", &payload[..len]);
+    println!!("{}", String::from_utf8_lossy(&payload[..len]));
 }
 ```
 

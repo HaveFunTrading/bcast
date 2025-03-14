@@ -4,13 +4,13 @@ use std::mem::MaybeUninit;
 
 /// Generate random message every 1 millisecond.
 #[allow(dead_code)]
-pub fn writer(bytes: &[u8]) -> anyhow::Result<()> {
+pub fn writer(bytes: &[u8]) {
     let mut writer = RingBuffer::new(bytes).into_writer();
     loop {
         let symbol = thread_rng().gen_range(b'A'..=b'Z');
         let msg_len = thread_rng().gen_range(1..20);
         let random_bytes: Vec<u8> = (0..msg_len).map(|_| symbol).collect();
-        let mut claim = writer.claim_with_user_defined(msg_len, symbol as u32)?;
+        let mut claim = writer.claim_with_user_defined(msg_len, true, symbol as u32);
         claim.get_buffer_mut().copy_from_slice(&random_bytes);
         claim.commit();
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -35,7 +35,7 @@ pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
                 count += 1;
                 let payload = &payload[..msg.payload_len];
                 assert!(payload.iter().all(|b| *b == msg.user_defined as u8));
-                println!("{}", std::str::from_utf8(payload)?);
+                println!("{}", String::from_utf8_lossy(payload));
             }
         }
         #[cfg(debug_assertions)]

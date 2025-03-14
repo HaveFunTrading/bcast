@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
 
     let writer_task = std::thread::spawn(move || {
         let bytes = unsafe { from_raw_parts(addr as *const u8, RING_BUFFER_SIZE) };
-        writer(bytes).unwrap();
+        writer(bytes);
     });
 
     let reader_task = std::thread::spawn(move || {

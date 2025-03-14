@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         let mut msg_count: usize = 0;
 
         loop {
-            let mut claim = tx.claim(8).unwrap();
+            let mut claim = tx.claim(8, true);
             let bytes = u64::to_le_bytes(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64);
             claim.get_buffer_mut().copy_from_slice(&bytes);
             claim.commit();
@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
             #[inline(never)]
             fn send_poison(tx: &mut Writer) {
                 // send POISON pill
-                let mut claim = tx.claim(8).unwrap();
+                let mut claim = tx.claim(8, true);
                 let bytes = u64::to_le_bytes(0);
                 claim.get_buffer_mut().copy_from_slice(&bytes);
                 claim.commit();

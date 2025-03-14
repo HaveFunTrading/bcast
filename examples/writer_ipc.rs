@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
     let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
     let bytes = mmap.as_ref();
 
-    writer(bytes)?;
+    writer(bytes);
 
     Ok(())
 }

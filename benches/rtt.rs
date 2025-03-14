@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
 
         'outer: loop {
             for msg in rx.batch_iter().flatten() {
-                let mut claim = tx.claim(8).unwrap();
+                let mut claim = tx.claim(8, true);
                 if msg.read(claim.get_buffer_mut()).is_ok() {
                     let time = u64::from_le_bytes(claim.get_buffer().try_into().unwrap());
 
@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         let mut latencies = hdrhistogram::Histogram::<u64>::new(3).unwrap();
 
         loop {
-            let mut claim = tx.claim(8).unwrap();
+            let mut claim = tx.claim(8, true);
             let bytes = u64::to_le_bytes(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64);
             claim.get_buffer_mut().copy_from_slice(&bytes);
             claim.commit();
@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
             #[inline(never)]
             fn send_poison(tx: &mut Writer) {
                 // send POISON pill
-                let mut claim = tx.claim(8).unwrap();
+                let mut claim = tx.claim(8, true);
                 let bytes = u64::to_le_bytes(0);
                 claim.get_buffer_mut().copy_from_slice(&bytes);
                 claim.commit();

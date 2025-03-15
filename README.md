@@ -45,7 +45,7 @@ The `Reader` is batch aware (it knows how far behind a producer it is) and provi
 messages in form of an iterator.
 
 ```rust
-for msg in reader.batch_iter() {
+for msg in reader.read_batch() {
     let mut payload = [0u8; 1024];
     let len = msg?.read(&mut payload)?;
     println!!("{}", String::from_utf8_lossy(&payload[..len]));

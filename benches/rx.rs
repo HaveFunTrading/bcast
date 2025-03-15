@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
 
         'outer: loop {
             let mut msg_count = 0;
-            for msg in rx.batch_iter().flatten() {
+            for msg in rx.read_batch().into_iter().flatten() {
                 if msg.read(&mut payload).is_ok() {
                     let time = u64::from_le_bytes(payload);
 

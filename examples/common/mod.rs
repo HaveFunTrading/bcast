@@ -26,7 +26,7 @@ pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
     loop {
         #[cfg(debug_assertions)]
         let mut count = 0;
-        for msg in reader.batch_iter() {
+        for msg in reader.read_batch() {
             let msg = msg?;
             let mut payload = unsafe { MaybeUninit::new([0u8; 1024]).assume_init() };
             msg.read(&mut payload)?;

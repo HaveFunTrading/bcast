@@ -27,7 +27,7 @@
 //! // create reader
 //! let bytes = [0u8; 1024];
 //! let mut reader = RingBuffer::new(&bytes).into_reader();
-//! let mut iter = reader.batch_iter();
+//! let mut iter = reader.read_batch().into_iter();
 //! let mut payload = [0u8; 1024];
 //!
 //! // read first message
@@ -527,14 +527,14 @@ impl Reader {
         self.position & (self.ring.capacity - 1)
     }
 
-    /// Construct iterator object that can efficiently read multiple messages in a batch between
+    /// Construct `Batch` object that can efficiently read multiple messages in a batch between
     /// `Reader` current position and prevailing producer position.
     #[inline]
-    pub fn batch_iter(&mut self) -> BatchIter {
+    pub fn read_batch(&mut self) -> Batch {
         let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
         let limit = producer_position - self.position;
         let position_snapshot = self.position;
-        BatchIter {
+        Batch {
             reader: self,
             remaining: limit,
             position_snapshot,
@@ -604,14 +604,14 @@ pub struct Message {
     capacity: usize,         // ring buffer capacity
     /// Message length.
     pub payload_len: usize,
+    /// User defined field.
+    pub user_defined: u32,
     /// Indicates final message fragment.
     pub is_fin: bool,
     /// Indicates continuation frame
     pub is_continuation: bool,
     /// Indicates padding frame.
     pub is_padding: bool,
-    /// User defined field.
-    pub user_defined: u32,
 }
 
 impl Message {
@@ -659,34 +659,27 @@ impl Message {
     }
 }
 
-/// Iterator that allows to process pending messages in a batch. This is more efficient than iterating
-/// over the messages using `receive_next()` on the `Reader` directly.
-pub struct BatchIter<'a> {
+/// Represents pending batch of messages between last observed producer position and the reader current position.
+/// Should be used in conjunction with `BatchIter` to allow iteration.
+pub struct Batch<'a> {
     reader: &'a mut Reader,
     remaining: usize,         // remaining bytes to consume
     position_snapshot: usize, // reader position snapshot
 }
 
-impl Iterator for BatchIter<'_> {
-    type Item = Result<Message>;
+impl<'a> IntoIterator for Batch<'a> {
+    type Item = <BatchIter<'a> as Iterator>::Item;
+    type IntoIter = BatchIter<'a>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        // attempt to receive next frame
-        // if the frame is padding will skip it and attempt to return next frame
-        match self.receive_next() {
-            None => None,
-            Some(msg) => match msg {
-                Ok(msg) if !msg.is_padding => Some(Ok(msg)),
-                Ok(_) => self.receive_next(),
-                Err(err) => Some(Err(err)),
-            },
-        }
+    fn into_iter(self) -> Self::IntoIter {
+        BatchIter { batch: self }
     }
 }
 
-impl BatchIter<'_> {
+impl Batch<'_> {
+    /// Receive next message from the current batch or `None` if end of batch.
     #[inline]
-    fn receive_next(&mut self) -> Option<Result<Message>> {
+    pub fn receive_next(&mut self) -> Option<Result<Message>> {
         // we reached end of batch
         if self.remaining == 0 {
             return None;
@@ -699,6 +692,29 @@ impl BatchIter<'_> {
                 Some(Ok(msg))
             }
             Some(Err(err)) => Some(Err(err)),
+        }
+    }
+}
+
+/// Iterator that allows to process pending messages in a batch. This is more efficient than iterating
+/// over the messages using `receive_next()` on the `Reader` directly.
+pub struct BatchIter<'a> {
+    batch: Batch<'a>,
+}
+
+impl Iterator for BatchIter<'_> {
+    type Item = Result<Message>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // attempt to receive next frame
+        // if the frame is padding will skip it and attempt to return next frame
+        match self.batch.receive_next() {
+            None => None,
+            Some(msg) => match msg {
+                Ok(msg) if !msg.is_padding => Some(Ok(msg)),
+                Ok(_) => self.batch.receive_next(),
+                Err(err) => Some(Err(err)),
+            },
         }
     }
 }
@@ -724,7 +740,7 @@ mod tests {
         claim.get_buffer_mut().copy_from_slice(b"world");
         claim.commit();
 
-        let mut iter = reader.batch_iter();
+        let mut iter = reader.read_batch().into_iter();
 
         let msg = iter.next().unwrap().unwrap();
         let mut payload = [0u8; 1024];
@@ -740,12 +756,12 @@ mod tests {
 
         assert_eq!(32, writer.index());
         assert_eq!(32, writer.remaining());
-        assert_eq!(32, iter.reader.index());
+        assert_eq!(32, iter.batch.reader.index());
 
         assert!(iter.next().is_none());
 
-        assert_eq!(32, iter.reader.index());
-        assert_eq!(32, iter.reader.position);
+        assert_eq!(32, iter.batch.reader.index());
+        assert_eq!(32, iter.batch.reader.position);
         assert_eq!(32, writer.position);
         assert_eq!(32, writer.remaining());
 
@@ -759,7 +775,7 @@ mod tests {
         claim.get_buffer_mut().copy_from_slice(b"test");
         claim.commit();
 
-        let mut iter = reader.batch_iter();
+        let mut iter = reader.read_batch().into_iter();
 
         // skip big message
         let _ = iter.next().unwrap().unwrap();
@@ -794,7 +810,7 @@ mod tests {
         claim.get_buffer_mut().copy_from_slice(b"c");
         claim.commit();
 
-        let mut iter = reader.batch_iter().take(2);
+        let mut iter = reader.read_batch().into_iter().take(2);
 
         let msg = iter.next().unwrap().unwrap();
         let mut payload = [0u8; 1];
@@ -808,7 +824,7 @@ mod tests {
 
         assert!(iter.next().is_none());
 
-        let mut iter = reader.batch_iter();
+        let mut iter = reader.read_batch().into_iter();
 
         let msg = iter.next().unwrap().unwrap();
         let mut payload = [0u8; 1];
@@ -865,7 +881,7 @@ mod tests {
         writer.claim(16, true).commit();
         writer.claim(16, true).commit();
 
-        let mut iter = reader.batch_iter();
+        let mut iter = reader.read_batch().into_iter();
         let msg = iter.next().unwrap();
         assert!(matches!(msg.unwrap_err(), Error::Overrun(_)));
     }
@@ -1039,7 +1055,7 @@ mod tests {
         claim.get_buffer_mut().copy_from_slice(b"hello world");
         claim.commit();
 
-        let mut iter = reader.batch_iter();
+        let mut iter = reader.read_batch().into_iter();
         let msg = iter.next().unwrap().unwrap();
 
         let mut payload = vec![0u8; 1024];

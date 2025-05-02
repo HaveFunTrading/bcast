@@ -677,13 +677,15 @@ impl<'a> IntoIterator for Batch<'a> {
 }
 
 impl Batch<'_> {
-    /// Return the number remaining bytes to be consumed by this instance of `Batch`.
+    /// Return the number of remaining bytes to be consumed by this instance of batch.
     #[inline]
     pub const fn remaining(&self) -> usize {
         self.remaining
     }
 
-    /// Receive next message from the current batch or `None` if end of batch.
+    /// Receive next message from the current batch or `None` if end of batch. This is a low level
+    /// method that will also return padding frames. Use `into_iter()` to work with more user-friendly
+    /// `BatchIter`.
     #[inline]
     pub fn receive_next(&mut self) -> Option<Result<Message>> {
         // we reached end of batch

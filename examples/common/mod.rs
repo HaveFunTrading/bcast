@@ -22,7 +22,7 @@ pub fn writer(bytes: &[u8]) {
 /// in a batch.
 #[allow(dead_code)]
 pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
-    let mut reader = RingBuffer::new(bytes).into_reader();
+    let reader = RingBuffer::new(bytes).into_reader();
     loop {
         #[cfg(debug_assertions)]
         let mut count = 0;

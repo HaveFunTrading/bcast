@@ -47,6 +47,7 @@
 pub mod error;
 
 use crossbeam_utils::CachePadded;
+use std::cell::Cell;
 use std::cmp::min;
 use std::hint;
 use std::mem::ManuallyDrop;
@@ -287,7 +288,7 @@ impl RingBuffer {
         let producer_position = self.header().producer_position.load(Ordering::SeqCst);
         Reader {
             ring: self,
-            position: producer_position,
+            position: Cell::new(producer_position),
         }
     }
 }
@@ -498,7 +499,7 @@ impl Drop for Claim<'_> {
 /// can be overrun by the producer if it's unable to keep up.
 pub struct Reader {
     ring: RingBuffer,
-    position: usize, // local position that will always increase
+    position: Cell<usize>, // local position that will always increase
 }
 
 impl Reader {
@@ -511,33 +512,33 @@ impl Reader {
     pub const fn with_initial_position(self, position: usize) -> Self {
         Self {
             ring: self.ring,
-            position,
+            position: Cell::new(position),
         }
     }
 
     /// Obtain reference to the (unpublished) message frame header.
     #[inline]
-    const fn as_frame_header(&self) -> &FrameHeader {
+    fn as_frame_header(&self) -> &FrameHeader {
         unsafe { &*(self.ring.header().data_ptr().add(self.index()) as *const FrameHeader) }
     }
 
     /// Buffer index at which read will happen.
     #[inline]
-    const fn index(&self) -> usize {
-        self.position & (self.ring.capacity - 1)
+    fn index(&self) -> usize {
+        self.position.get() & (self.ring.capacity - 1)
     }
 
     /// Construct `Batch` object that can efficiently read multiple messages in a batch between
     /// `Reader` current position and prevailing producer position. Returns `None` if there is
     /// no new data to read.
     #[inline]
-    pub fn read_batch(&mut self) -> Option<Batch> {
+    pub fn read_batch(&self) -> Option<Batch> {
         let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
-        let limit = producer_position - self.position;
+        let limit = producer_position - self.position.get();
         if limit == 0 {
             return None;
         }
-        let position_snapshot = self.position;
+        let position_snapshot = self.position.get();
         Some(Batch {
             reader: self,
             remaining: limit,
@@ -547,10 +548,10 @@ impl Reader {
 
     /// Receive next pending message from the ring buffer.
     #[inline]
-    pub fn receive_next(&mut self) -> Option<Result<Message>> {
+    pub fn receive_next(&self) -> Option<Result<Message>> {
         let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
         // no new messages
-        if producer_position_before - self.position == 0 {
+        if producer_position_before - self.position.get() == 0 {
             return None;
         }
         // attempt to receive next frame
@@ -566,7 +567,7 @@ impl Reader {
     }
 
     #[inline]
-    fn receive_next_impl(&mut self, producer_position_before: usize) -> Option<Result<Message>> {
+    fn receive_next_impl(&self, producer_position_before: usize) -> Option<Result<Message>> {
         // extract frame header fields
         let frame_header = self.as_frame_header();
         let (is_fin, is_continuation, is_padding, length) = frame_header.unpack_fields();
@@ -575,13 +576,13 @@ impl Reader {
 
         // ensure we have not been overrun
         if producer_position_after > producer_position_before + self.ring.capacity {
-            return Some(Err(Error::overrun(self.position)));
+            return Some(Err(Error::overrun(self.position.get())));
         }
 
         // construct the massage
         let message = Message {
             header: self.ring.header(),
-            position: self.position + size_of::<FrameHeader>(),
+            position: self.position.get() + size_of::<FrameHeader>(),
             payload_len: length as usize,
             capacity: self.ring.capacity,
             is_fin,
@@ -592,7 +593,9 @@ impl Reader {
 
         // update reader position
         let aligned_payload_len = get_aligned_size(message.payload_len);
-        self.position += aligned_payload_len + size_of::<FrameHeader>();
+        let position = self.position.get();
+        self.position
+            .set(position + aligned_payload_len + size_of::<FrameHeader>());
 
         Some(Ok(message))
     }
@@ -666,7 +669,7 @@ impl Message {
 /// Represents pending batch of messages between last observed producer position and the reader current position.
 /// Should be used in conjunction with `BatchIter` to allow iteration.
 pub struct Batch<'a> {
-    reader: &'a mut Reader,
+    reader: &'a Reader,
     remaining: usize,         // remaining bytes to consume
     position_snapshot: usize, // reader position snapshot
 }
@@ -742,7 +745,7 @@ mod tests {
     fn should_read_messages_in_batch() {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut writer = RingBuffer::new(&bytes).into_writer();
-        let mut reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim(5, true);
         claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -773,7 +776,7 @@ mod tests {
         assert!(iter.next().is_none());
 
         assert_eq!(32, iter.batch.reader.index());
-        assert_eq!(32, iter.batch.reader.position);
+        assert_eq!(32, iter.batch.reader.position.get());
         assert_eq!(32, writer.position);
         assert_eq!(32, writer.remaining());
 
@@ -801,14 +804,14 @@ mod tests {
         assert!(iter.next().is_none());
 
         assert_eq!(reader.index(), writer.index());
-        assert_eq!(reader.position, writer.position);
+        assert_eq!(reader.position.get(), writer.position);
     }
 
     #[test]
     fn should_read_in_batch_with_limit() {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut writer = RingBuffer::new(&bytes).into_writer();
-        let mut reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim(1, true);
         claim.get_buffer_mut().copy_from_slice(b"a");
@@ -850,7 +853,7 @@ mod tests {
     fn should_read_next_message() {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut writer = RingBuffer::new(&bytes).into_writer();
-        let mut reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim(1, true);
         claim.get_buffer_mut().copy_from_slice(b"a");
@@ -886,7 +889,7 @@ mod tests {
     fn should_overrun_reader() {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut writer = RingBuffer::new(&bytes).into_writer();
-        let mut reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim(16, true).commit();
         writer.claim(16, true).commit();
@@ -919,7 +922,7 @@ mod tests {
 
         let reader = RingBuffer::new(&bytes).into_reader();
 
-        assert_eq!(reader.position, writer.position);
+        assert_eq!(reader.position.get(), writer.position);
         assert_eq!(reader.index(), writer.index());
     }
 
@@ -1061,7 +1064,7 @@ mod tests {
     fn should_read_message_into_vec() {
         let bytes = vec![0u8; HEADER_SIZE + 1024];
         let mut writer = RingBuffer::new(&bytes).into_writer();
-        let mut reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim(11, true);
         claim.get_buffer_mut().copy_from_slice(b"hello world");
@@ -1081,7 +1084,7 @@ mod tests {
     fn should_send_zero_size_message() {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut writer = RingBuffer::new(&bytes).into_writer();
-        let mut reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes).into_reader();
 
         let claim = writer.claim(0, true);
         claim.commit();
@@ -1094,7 +1097,7 @@ mod tests {
     fn should_send_heartbeat() {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut writer = RingBuffer::new(&bytes).into_writer();
-        let mut reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes).into_reader();
 
         let claim = writer.heartbeat();
         claim.commit();
@@ -1145,7 +1148,7 @@ mod tests {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut buffer = [0u8; 1024];
         let mut writer = RingBuffer::new(&bytes).into_writer();
-        let mut reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes).into_reader();
 
         let claim = writer.claim_with_user_defined(24, true, 123);
         claim.commit();
@@ -1173,7 +1176,7 @@ mod tests {
     fn should_fragment_message() {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut writer = RingBuffer::new(&bytes).into_writer();
-        let mut reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes).into_reader();
 
         let claim = writer.claim_with_user_defined(24, false, 123);
         claim.commit();

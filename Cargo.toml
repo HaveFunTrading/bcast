@@ -20,6 +20,7 @@ anyhow = "1.0.93"
 rand = "0.8.5"
 memmap2 = "0.9.5"
 hdrhistogram = "7.5.4"
+num-format = "0.4.4"
 
 [profile.release]
 codegen-units = 1
@@ -40,3 +41,8 @@ path = "benches/rtt.rs"
 name = "rx"
 harness = false
 path = "benches/rx.rs"
+
+[[bench]]
+name = "throughput"
+harness = false
+path = "benches/throughput.rs"

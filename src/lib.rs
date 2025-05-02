@@ -571,6 +571,7 @@ impl Reader {
 
         // ensure we have not been overrun
         if producer_position_after > producer_position_before + self.ring.capacity {
+            self.position = producer_position_after;
             return Some(Err(Error::overrun(self.position)));
         }
 
@@ -644,7 +645,13 @@ impl Message {
         }
 
         // attempt to copy message data into provided buffer
-        let producer_position_before = self.position;
+        // let producer_position_before = self.position;
+        let producer_position_before = self.header.producer_position.load(Ordering::Acquire);
+
+        if producer_position_before > self.position + self.capacity {
+            return Err(Error::overrun(self.position));
+        }
+
         unsafe {
             copy_nonoverlapping(self.header.data_ptr().add(self.index()), buf.as_mut_ptr(), self.payload_len);
         }
@@ -658,6 +665,19 @@ impl Message {
         Ok(self.payload_len)
     }
 }
+
+// I have a message at pos 100
+// current producer is at 2000
+// buffer capacity is 50
+// if current_producer > pos + 50 -> overrun
+
+// say current producer is at 110
+// ok to copy the message
+// now the producer is at 170 -> we started copying at 110 0
+
+
+
+
 
 /// Represents pending batch of messages between last observed producer position and the reader current position.
 /// Should be used in conjunction with `BatchIter` to allow iteration.

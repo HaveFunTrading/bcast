@@ -23,21 +23,23 @@ fn main() -> anyhow::Result<()> {
         let mut rx = RingBuffer::new(bytes_rx).into_reader().with_initial_position(0);
 
         'outer: loop {
-            for msg in rx.read_batch().into_iter().flatten() {
-                let mut claim = tx.claim(8, true);
-                if msg.read(claim.get_buffer_mut()).is_ok() {
-                    let time = u64::from_le_bytes(claim.get_buffer().try_into().unwrap());
+            if let Some(batch) = rx.read_batch() {
+                for msg in batch.into_iter().flatten() {
+                    let mut claim = tx.claim(8, true);
+                    if msg.read(claim.get_buffer_mut()).is_ok() {
+                        let time = u64::from_le_bytes(claim.get_buffer().try_into().unwrap());
 
-                    #[cold]
-                    #[inline(never)]
-                    fn poison() {}
+                        #[cold]
+                        #[inline(never)]
+                        fn poison() {}
 
-                    if time == 0 {
-                        poison();
-                        break 'outer;
+                        if time == 0 {
+                            poison();
+                            break 'outer;
+                        }
+
+                        claim.commit();
                     }
-
-                    claim.commit();
                 }
             }
         }
@@ -61,11 +63,13 @@ fn main() -> anyhow::Result<()> {
             claim.commit();
             msg_count += 1;
 
-            for msg in rx.read_batch().into_iter().flatten() {
-                if let Ok(len) = msg.read(&mut payload) {
-                    let time = u64::from_le_bytes(payload[..len].try_into().unwrap());
-                    let rtt = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64 - time;
-                    latencies.record(rtt).unwrap();
+            if let Some(batch) = rx.read_batch() {
+                for msg in batch.into_iter().flatten() {
+                    if let Ok(len) = msg.read(&mut payload) {
+                        let time = u64::from_le_bytes(payload[..len].try_into().unwrap());
+                        let rtt = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64 - time;
+                        latencies.record(rtt).unwrap();
+                    }
                 }
             }
 

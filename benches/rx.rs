@@ -24,27 +24,30 @@ fn main() -> anyhow::Result<()> {
 
         'outer: loop {
             let mut msg_count = 0;
-            for msg in rx.read_batch().into_iter().flatten() {
-                if msg.read(&mut payload).is_ok() {
-                    let time = u64::from_le_bytes(payload);
+            if let Some(batch) = rx.read_batch() {
+                for msg in batch.into_iter().flatten() {
+                    if msg.read(&mut payload).is_ok() {
+                        let time = u64::from_le_bytes(payload);
 
-                    #[cold]
-                    #[inline(never)]
-                    fn poison() {
-                        println!("poisson");
+                        #[cold]
+                        #[inline(never)]
+                        fn poison() {
+                            println!("poisson");
+                        }
+
+                        if time == 0 {
+                            poison();
+                            break 'outer;
+                        }
+
+                        latencies
+                            .record(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64 - time)
+                            .unwrap();
+                        msg_count += 1;
                     }
-
-                    if time == 0 {
-                        poison();
-                        break 'outer;
-                    }
-
-                    latencies
-                        .record(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64 - time)
-                        .unwrap();
-                    msg_count += 1;
                 }
             }
+
             if msg_count > 0 {
                 batch_size.record(msg_count).unwrap();
             }

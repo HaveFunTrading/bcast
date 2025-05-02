@@ -26,16 +26,18 @@ pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
     loop {
         #[cfg(debug_assertions)]
         let mut count = 0;
-        for msg in reader.read_batch() {
-            let msg = msg?;
-            let mut payload = unsafe { MaybeUninit::new([0u8; 1024]).assume_init() };
-            msg.read(&mut payload)?;
-            #[cfg(debug_assertions)]
-            {
-                count += 1;
-                let payload = &payload[..msg.payload_len];
-                assert!(payload.iter().all(|b| *b == msg.user_defined as u8));
-                println!("{}", String::from_utf8_lossy(payload));
+        if let Some(batch) = reader.read_batch() {
+            for msg in batch {
+                let msg = msg?;
+                let mut payload = unsafe { MaybeUninit::new([0u8; 1024]).assume_init() };
+                msg.read(&mut payload)?;
+                #[cfg(debug_assertions)]
+                {
+                    count += 1;
+                    let payload = &payload[..msg.payload_len];
+                    assert!(payload.iter().all(|b| *b == msg.user_defined as u8));
+                    println!("{}", String::from_utf8_lossy(payload));
+                }
             }
         }
         #[cfg(debug_assertions)]

@@ -260,14 +260,27 @@ impl RingBuffer {
         unsafe { self.ptr.as_mut() }
     }
 
-    /// Will consume `self` and return instance of writer backed by this ring buffer.
+    /// Will consume `self` and return instance of writer backed by this ring buffer. The writer
+    /// will write from the beginning of the ring buffer. If you need to continue writing to the
+    /// previous buffer use `RingBuffer::join_writer` instead.
     pub fn into_writer(self) -> Writer {
+        // will write from the start of the buffer
+        self.header().producer_position.store(0, Ordering::SeqCst);
         // mark as initialised
         self.header().ready.store(true, Ordering::SeqCst);
         Writer {
             ring: self,
             position: 0,
         }
+    }
+
+    /// Will consume `self` and return instance of writer backed by this ring buffer. The writer
+    /// will not reset current `producer_position` and will continue writing from that point.
+    pub fn join_writer(self) -> Writer {
+        assert!(self.header().ready.load(Ordering::SeqCst), "unable to join buffer not marked as ready");
+        // read current position
+        let position = self.header().producer_position.load(Ordering::SeqCst);
+        Writer { ring: self, position }
     }
 
     /// Will consume `self` and return instance of writer backed by this ring buffer. This
@@ -326,7 +339,7 @@ impl Writer {
     #[inline]
     pub const fn claim_with_user_defined(&mut self, len: usize, fin: bool, user_defined: u32) -> Claim {
         let aligned_len = get_aligned_size(len);
-        assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, user_defined, fin, false)
     }
 
@@ -338,7 +351,7 @@ impl Writer {
     #[inline]
     pub const fn continuation(&mut self, len: usize, fin: bool) -> Claim {
         let aligned_len = get_aligned_size(len);
-        assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, fin, true)
     }
 
@@ -1054,10 +1067,11 @@ mod tests {
 
     #[test]
     fn should_construct_ring_buffer_from_vec() {
-        let bytes = vec![0u8; HEADER_SIZE + 64];
+        let bytes = vec![0u8; HEADER_SIZE + (1024 * 1024 * 2)];
         let rb = RingBuffer::new(&bytes);
         assert_eq!(0, rb.header().producer_position.load(SeqCst));
-        assert_eq!(64, rb.capacity);
+        assert_eq!(2097152, rb.capacity);
+        assert_eq!(1048568, rb.mtu);
     }
 
     #[test]
@@ -1204,5 +1218,35 @@ mod tests {
 
         let msg = reader.receive_next();
         assert!(msg.is_none())
+    }
+
+    #[test]
+    fn should_join_writer() {
+        let bytes = [0u8; HEADER_SIZE + 1024];
+
+        // first writer will write from the beginning
+        {
+            let mut writer = RingBuffer::new(&bytes).into_writer();
+            writer.claim_with_user_defined(16, true, 100).commit();
+            writer.claim_with_user_defined(16, true, 101).commit();
+            writer.claim_with_user_defined(16, true, 102).commit();
+        }
+
+        // second writer will pick up from the current position
+        {
+            let mut writer = RingBuffer::new(&bytes).join_writer();
+            writer.claim_with_user_defined(16, true, 103).commit();
+            writer.claim_with_user_defined(16, true, 104).commit();
+            writer.claim_with_user_defined(16, true, 105).commit();
+        }
+
+        // verify we got all the messages
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+        assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(101, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(102, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(103, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(104, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(105, reader.receive_next().unwrap().unwrap().user_defined);
     }
 }

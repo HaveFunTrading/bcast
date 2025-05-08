@@ -1,11 +1,12 @@
-use bcast::RingBuffer;
+use anyhow::anyhow;
+use bcast::{error::Error, RingBuffer};
 use rand::{thread_rng, Rng};
 use std::mem::MaybeUninit;
 
 /// Generate random message every 1 millisecond.
 #[allow(dead_code)]
 pub fn writer(bytes: &[u8]) {
-    let mut writer = RingBuffer::new(bytes).into_writer();
+    let mut writer = RingBuffer::new(bytes).into_writer_at(usize::MAX - bytes.len());
     loop {
         let symbol = thread_rng().gen_range(b'A'..=b'Z');
         let msg_len = thread_rng().gen_range(1..20);
@@ -28,7 +29,17 @@ pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
         let mut count = 0;
         if let Some(batch) = reader.read_batch() {
             for msg in batch {
-                let msg = msg?;
+                let msg = match msg {
+                    Ok(msg) => msg,
+                    Err(Error::Overrun(position)) => {
+                        println!("overrun for {} bytes, resetting reader", position);
+                        reader.reset();
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(e));
+                    }
+                };
                 let mut payload = unsafe { MaybeUninit::new([0u8; 1024]).assume_init() };
                 msg.read(&mut payload)?;
                 #[cfg(debug_assertions)]

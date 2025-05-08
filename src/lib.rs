@@ -283,6 +283,15 @@ impl RingBuffer {
         Writer { ring: self, position }
     }
 
+    /// Will consume `self` and return instance of writer backed by this ring buffer, with the
+    /// initial position set to the provided value.
+    pub fn into_writer_at(self, position: usize) -> Writer {
+        self.header().producer_position.store(position, Ordering::SeqCst);
+        // mark as initialised after setting the position
+        self.header().ready.store(true, Ordering::SeqCst);
+        Writer { ring: self, position }
+    }
+
     /// Will consume `self` and return instance of writer backed by this ring buffer. This
     /// method also accepts closure to populate `metadata` buffer.
     pub fn into_writer_with_metadata<F: FnOnce(&mut [u8])>(mut self, metadata: F) -> Writer {
@@ -431,14 +440,16 @@ impl<'a> Claim<'a> {
             let header = writer.frame_header_mut();
             header.fields = fields;
             header.user_defined = USER_DEFINED_NULL_VALUE;
-            writer.position += padding_len + size_of::<FrameHeader>();
+            writer.position = writer.position.wrapping_add(padding_len + size_of::<FrameHeader>());
         }
 
         let position_snapshot = writer.position;
 
         // insert padding frame if required
+        // we need to ensure that we have at least 1 frame header worth of space after
+        // insetting current claim, so we need 2*size_of::<FrameHeader>() plus the payload
         let remaining = writer.remaining();
-        if len + size_of::<FrameHeader>() > remaining {
+        if len + 2 * size_of::<FrameHeader>() > remaining {
             insert_padding_frame(writer, remaining);
         };
 
@@ -490,7 +501,7 @@ impl<'a> Claim<'a> {
         header.user_defined = self.user_defined;
 
         // advance writer position
-        self.writer.position += self.len + size_of::<FrameHeader>();
+        self.writer.position = self.writer.position.wrapping_add(self.len + size_of::<FrameHeader>());
 
         // signal updated producer position
         self.writer
@@ -541,13 +552,20 @@ impl Reader {
         self.position.get() & (self.ring.capacity - 1)
     }
 
+    /// Reset reader position to current producer position, for recovering from overrun.
+    #[cold]
+    pub fn reset(&self) {
+        self.position
+            .set(self.ring.header().producer_position.load(Ordering::Acquire));
+    }
+
     /// Construct `Batch` object that can efficiently read multiple messages in a batch between
     /// `Reader` current position and prevailing producer position. Returns `None` if there is
     /// no new data to read.
     #[inline]
     pub fn read_batch(&self) -> Option<Batch> {
         let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
-        let limit = producer_position - self.position.get();
+        let limit = producer_position.wrapping_sub(self.position.get());
         if limit == 0 {
             return None;
         }
@@ -564,7 +582,7 @@ impl Reader {
     pub fn receive_next(&self) -> Option<Result<Message>> {
         let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
         // no new messages
-        if producer_position_before - self.position.get() == 0 {
+        if producer_position_before.wrapping_sub(self.position.get()) == 0 {
             return None;
         }
         // attempt to receive next frame
@@ -588,14 +606,14 @@ impl Reader {
         let producer_position_after = self.ring.header().producer_position.load(Ordering::Acquire);
 
         // ensure we have not been overrun
-        if producer_position_after > producer_position_before + self.ring.capacity {
+        if producer_position_after.wrapping_sub(producer_position_before) > self.ring.capacity {
             return Some(Err(Error::overrun(self.position.get())));
         }
 
         // construct the massage
         let message = Message {
             header: self.ring.header(),
-            position: self.position.get() + size_of::<FrameHeader>(),
+            position: self.position.get().wrapping_add(size_of::<FrameHeader>()),
             payload_len: length as usize,
             capacity: self.ring.capacity,
             is_fin,
@@ -608,8 +626,7 @@ impl Reader {
         let aligned_payload_len = get_aligned_size(message.payload_len);
         let position = self.position.get();
         self.position
-            .set(position + aligned_payload_len + size_of::<FrameHeader>());
-
+            .set(position.wrapping_add(aligned_payload_len + size_of::<FrameHeader>()));
         Some(Ok(message))
     }
 }
@@ -671,7 +688,7 @@ impl Message {
         let producer_position_after = self.header.producer_position.load(Ordering::Acquire);
 
         // ensure we have not been overrun by the producer
-        if producer_position_after > producer_position_before + self.capacity {
+        if producer_position_after.wrapping_sub(producer_position_before) > self.capacity {
             return Err(Error::overrun(self.position));
         }
 

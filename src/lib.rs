@@ -1066,8 +1066,9 @@ mod tests {
         let data_addr = writer.ring.header().data_ptr() as usize;
 
         assert_eq!(METADATA_BUFFER_SIZE, data_addr - metadata_addr);
-        assert_eq!(128, metadata_addr - ready_addr);
-        assert_eq!(128, ready_addr - producer_position_addr);
+        // 128 for x86_64, 64 for x86
+        assert_eq!(align_of::<CachePadded<()>>(), metadata_addr - ready_addr);
+        assert_eq!(align_of::<CachePadded<()>>(), ready_addr - producer_position_addr);
 
         let header_ptr = writer.ring.header() as *const Header;
         let data_ptr = writer.ring.header().data_ptr();
@@ -1079,7 +1080,10 @@ mod tests {
         assert_eq!(size_of::<Header>() + size_of::<FrameHeader>(), buf_ptr_0 as usize - header_ptr as usize);
         assert_eq!(size_of::<FrameHeader>(), buf_ptr_0 as usize - data_ptr as usize);
         assert_eq!(16, claim.get_buffer().len());
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(1280, size_of::<Header>());
+        #[cfg(target_arch = "x86")]
+        assert_eq!(1152, size_of::<Header>());
         assert_eq!(8, size_of::<FrameHeader>());
         assert_eq!(8, align_of::<FrameHeader>());
         assert_eq!(size_of::<Header>(), frame_ptr_0 as usize - bytes.as_ptr() as usize);

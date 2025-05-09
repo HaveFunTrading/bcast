@@ -68,6 +68,9 @@ pub const METADATA_BUFFER_SIZE: usize = 1024;
 pub const USER_DEFINED_NULL_VALUE: u32 = 0;
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x0FFFFFFF;
 
+// represents the max value we can encode on the frame header for the payload length
+const MAX_PAYLOAD_LEN: usize = (1 << 31) - 1;
+
 /// Ring buffer header that contains producer position. The position is expressed in bytes and
 /// will always increment.
 #[derive(Debug)]
@@ -236,9 +239,6 @@ impl RingBuffer {
         assert!(bytes.len() > size_of::<Header>(), "insufficient size for the header");
         assert!((bytes.len() - size_of::<Header>()).is_power_of_two(), "buffer len must be power of two");
 
-        // represents the max value we can encode on the frame header for the payload length
-        const MAX_PAYLOAD_LEN: usize = (1 << 31) - 1;
-
         let header = bytes.as_ptr() as *mut Header;
         let capacity = bytes.len() - size_of::<Header>();
         Self {
@@ -285,7 +285,9 @@ impl RingBuffer {
 
     /// Will consume `self` and return instance of writer backed by this ring buffer, with the
     /// initial position set to the provided value.
+    #[cfg(test)]
     pub fn into_writer_at(self, position: usize) -> Writer {
+        assert!(get_aligned_size(position) == position, "position must be aligned");
         self.header().producer_position.store(position, Ordering::SeqCst);
         // mark as initialised after setting the position
         self.header().ready.store(true, Ordering::SeqCst);
@@ -446,10 +448,8 @@ impl<'a> Claim<'a> {
         let position_snapshot = writer.position;
 
         // insert padding frame if required
-        // we need to ensure that we have at least 1 frame header worth of space after
-        // insetting current claim, so we need 2*size_of::<FrameHeader>() plus the payload
         let remaining = writer.remaining();
-        if len + 2 * size_of::<FrameHeader>() > remaining {
+        if len + size_of::<FrameHeader>() > remaining {
             insert_padding_frame(writer, remaining);
         };
 
@@ -534,6 +534,7 @@ impl Reader {
 
     /// Set reader initial position (the default is producer current position).
     pub const fn with_initial_position(self, position: usize) -> Self {
+        assert!(get_aligned_size(position) == position, "position must be aligned");
         Self {
             ring: self.ring,
             position: Cell::new(position),
@@ -587,10 +588,10 @@ impl Reader {
         }
         // attempt to receive next frame
         // if the frame is padding will skip it and attempt to return next frame
-        match self.receive_next_impl(producer_position_before) {
+        match self.receive_next_impl(self.position.get()) {
             Some(msg) => match msg {
                 Ok(msg) if !msg.is_padding => Some(Ok(msg)),
-                Ok(_) => self.receive_next_impl(producer_position_before),
+                Ok(_) => self.receive_next_impl(self.position.get()),
                 Err(err) => Some(Err(err)),
             },
             None => None,
@@ -598,17 +599,12 @@ impl Reader {
     }
 
     #[inline]
-    fn receive_next_impl(&self, producer_position_before: usize) -> Option<Result<Message>> {
+    fn receive_next_impl(&self, reader_position: usize) -> Option<Result<Message>> {
         // extract frame header fields
         let frame_header = self.as_frame_header();
         let (is_fin, is_continuation, is_padding, length) = frame_header.unpack_fields();
         let user_defined = frame_header.user_defined;
         let producer_position_after = self.ring.header().producer_position.load(Ordering::Acquire);
-
-        // ensure we have not been overrun
-        if producer_position_after.wrapping_sub(producer_position_before) > self.ring.capacity {
-            return Some(Err(Error::overrun(self.position.get())));
-        }
 
         // construct the massage
         let message = Message {
@@ -621,6 +617,12 @@ impl Reader {
             is_padding,
             user_defined,
         };
+
+        // ensure we have not been overrun by the writer
+        // so the frame header is not overwritten and can be trusted
+        if producer_position_after.wrapping_sub(reader_position) > self.ring.capacity {
+            return Some(Err(Error::overrun(reader_position)));
+        }
 
         // update reader position
         let aligned_payload_len = get_aligned_size(message.payload_len);
@@ -675,6 +677,11 @@ impl Message {
     /// ```
     #[inline]
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        assert!(
+            self.payload_len <= min(self.capacity / 2 - size_of::<FrameHeader>(), MAX_PAYLOAD_LEN),
+            "payload size is greater than mtu"
+        );
+        assert!(self.index() + self.payload_len <= self.capacity, "payload overshots ring buffer");
         // ensure destination buffer is of sufficient size
         if self.payload_len > buf.len() {
             return Err(Error::insufficient_buffer_size(buf.len(), self.payload_len));
@@ -768,6 +775,7 @@ impl Iterator for BatchIter<'_> {
 mod tests {
     use super::*;
     use crate::error::Error;
+    use rand::{thread_rng, Rng};
     use std::ptr::addr_of;
     use std::sync::atomic::Ordering::SeqCst;
 
@@ -917,6 +925,21 @@ mod tests {
 
     #[test]
     fn should_overrun_reader() {
+        let bytes = [0u8; HEADER_SIZE + 64];
+        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+
+        let msg = reader.receive_next().unwrap();
+        assert!(matches!(msg.unwrap_err(), Error::Overrun(_)));
+    }
+
+    #[test]
+    fn should_overrun_read_batch() {
         let bytes = [0u8; HEADER_SIZE + 64];
         let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
@@ -1265,5 +1288,63 @@ mod tests {
         assert_eq!(103, reader.receive_next().unwrap().unwrap().user_defined);
         assert_eq!(104, reader.receive_next().unwrap().unwrap().user_defined);
         assert_eq!(105, reader.receive_next().unwrap().unwrap().user_defined);
+    }
+
+    #[test]
+    fn should_position_wrap_around() {
+        let bytes = [0u8; HEADER_SIZE + 2048];
+        let mut writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 1023);
+        // last claim before wrap around
+        writer.claim_with_user_defined(1000, true, 100).commit();
+        assert_eq!(usize::MAX - 15, writer.position);
+        // first claim after wrap around, will insert padding frame and
+        // continue from position zero
+        writer.claim_with_user_defined(128, true, 101).commit();
+        assert_eq!(136, writer.position);
+        // a normal claim after wrap around
+        writer.claim_with_user_defined(16, true, 102).commit();
+        assert_eq!(160, writer.position);
+        // verify we got all the messages
+        let reader = RingBuffer::new(&bytes)
+            .into_reader()
+            .with_initial_position(usize::MAX - 1023);
+        assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(101, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(102, reader.receive_next().unwrap().unwrap().user_defined);
+        // and are still in sync
+        assert_eq!(160, reader.position.get());
+    }
+
+    #[test]
+    fn should_position_wrap_around_and_overrun_reader() {
+        let bytes = [0u8; HEADER_SIZE + 2048];
+        let mut writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        // First claim and read
+        writer.claim_with_user_defined(1000, true, 100).commit();
+        assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
+
+        // Last claim before wrap around
+        writer.claim_with_user_defined(1000, true, 101).commit();
+
+        // First claim after wrap around
+        writer.claim_with_user_defined(512, true, 102).commit();
+
+        // Overrun the reader and overwrite the header frame the reader will read
+        let mut claim = writer.claim_with_user_defined(1000, true, 103);
+        thread_rng().fill(claim.get_buffer_mut());
+        claim.commit();
+
+        assert!(matches!(reader.receive_next().unwrap().unwrap_err(), Error::Overrun(_)));
+        // Reset the reader and start over
+        reader.reset();
+        assert!(reader.receive_next().is_none());
+        // Continue writing and reading
+        assert_eq!(reader.position.get(), writer.position);
+
+        writer.claim_with_user_defined(1000, true, 104).commit();
+
+        assert_eq!(104, reader.receive_next().unwrap().unwrap().user_defined);
     }
 }

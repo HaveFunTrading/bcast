@@ -11,15 +11,21 @@ keywords = ["ipc", "spmc", "shared-memory", "low-latency", "ring-buffer"]
 categories = ["data-structures", "concurrency", "asynchronous"]
 rust-version = "1.83.0"
 
+[features]
+default = []
+mmap = ["dep:memmap2"]
+
 [dependencies]
 thiserror = "2.0.3"
 crossbeam-utils = "0.8.20"
+memmap2 = { version = "0.9.5", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0.93"
 rand = "0.8.5"
 memmap2 = "0.9.5"
 hdrhistogram = "7.5.4"
+tempfile = "3.20.0"
 
 [profile.release]
 codegen-units = 1

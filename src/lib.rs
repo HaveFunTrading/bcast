@@ -46,6 +46,9 @@
 
 pub mod error;
 
+#[cfg(feature = "mmap")]
+pub mod mmap;
+
 use crossbeam_utils::CachePadded;
 use std::cell::Cell;
 use std::cmp::min;

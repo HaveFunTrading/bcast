@@ -200,15 +200,18 @@ impl FrameHeader {
 /// - Bit 29: padding flag
 /// - Bit 28: reserved (always 0)
 /// - Bits 0-27: message length
+#[inline]
 const fn pack_fields(fin: bool, continuation: bool, padding: bool, length: u32) -> u32 {
     unsafe { pack_fields_unchecked(fin, continuation, padding, length & FRAME_HEADER_MSG_LEN_MASK) }
 }
 
+#[inline]
 const unsafe fn pack_fields_unchecked(fin: bool, continuation: bool, padding: bool, length: u32) -> u32 {
     length | ((padding as u32) << 29) | ((continuation as u32) << 30) | ((fin as u32) << 31)
 }
 
 /// Unpacks `u32` field into a tuple: (fin, continuation, padding, length).
+#[inline]
 const fn unpack_fields(fields: u32) -> (bool, bool, bool, u32) {
     let fin = (fields >> 31) & 1 == 1;
     let continuation = (fields >> 30) & 1 == 1;
@@ -287,7 +290,7 @@ impl RingBuffer {
     /// initial position set to the provided value.
     #[cfg(test)]
     pub fn into_writer_at(self, position: usize) -> Writer {
-        assert!(get_aligned_size(position) == position, "position must be aligned");
+        assert_eq!(get_aligned_size(position), position, "position must be aligned");
         self.header().producer_position.store(position, Ordering::SeqCst);
         // mark as initialised after setting the position
         self.header().ready.store(true, Ordering::SeqCst);
@@ -350,7 +353,7 @@ impl Writer {
     #[inline]
     pub const fn claim_with_user_defined(&mut self, len: usize, fin: bool, user_defined: u32) -> Claim {
         let aligned_len = get_aligned_size(len);
-        debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, user_defined, fin, false)
     }
 
@@ -533,8 +536,8 @@ impl Reader {
     }
 
     /// Set reader initial position (the default is producer current position).
-    pub const fn with_initial_position(self, position: usize) -> Self {
-        assert!(get_aligned_size(position) == position, "position must be aligned");
+    pub fn with_initial_position(self, position: usize) -> Self {
+        assert_eq!(get_aligned_size(position), position, "position must be aligned");
         Self {
             ring: self.ring,
             position: Cell::new(position),
@@ -677,11 +680,11 @@ impl Message {
     /// ```
     #[inline]
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        assert!(
+        debug_assert!(
             self.payload_len <= min(self.capacity / 2 - size_of::<FrameHeader>(), MAX_PAYLOAD_LEN),
             "payload size is greater than mtu"
         );
-        assert!(self.index() + self.payload_len <= self.capacity, "payload overshots ring buffer");
+        debug_assert!(self.index() + self.payload_len <= self.capacity, "payload over shots ring buffer");
         // ensure destination buffer is of sufficient size
         if self.payload_len > buf.len() {
             return Err(Error::insufficient_buffer_size(buf.len(), self.payload_len));
@@ -1295,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn should_position_wrap_around() {
+    fn should_handle_position_wrap_around_if_no_overrun() {
         let bytes = [0u8; HEADER_SIZE + 2048];
         let mut writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 1023);
         // last claim before wrap around
@@ -1320,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn should_position_wrap_around_and_overrun_reader() {
+    fn should_allow_reader_to_recover_from_overrun_when_position_wrapped_around() {
         let bytes = [0u8; HEADER_SIZE + 2048];
         let mut writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
         let reader = RingBuffer::new(&bytes).into_reader();

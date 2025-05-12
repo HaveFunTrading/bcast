@@ -1,4 +1,5 @@
-use bcast::RingBuffer;
+use anyhow::anyhow;
+use bcast::{error::Error, RingBuffer};
 use rand::{thread_rng, Rng};
 use std::mem::MaybeUninit;
 
@@ -28,7 +29,17 @@ pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
         let mut count = 0;
         if let Some(batch) = reader.read_batch() {
             for msg in batch {
-                let msg = msg?;
+                let msg = match msg {
+                    Ok(msg) => msg,
+                    Err(Error::Overrun(position)) => {
+                        println!("overrun for {} bytes, resetting reader", position);
+                        reader.reset();
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(e));
+                    }
+                };
                 let mut payload = unsafe { MaybeUninit::new([0u8; 1024]).assume_init() };
                 msg.read(&mut payload)?;
                 #[cfg(debug_assertions)]

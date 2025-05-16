@@ -2,6 +2,7 @@
 
 use crate::{Reader, RingBuffer, Writer};
 use memmap2::{Mmap, MmapMut, MmapOptions};
+use std::hint;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
@@ -95,6 +96,14 @@ impl MappedReader {
     /// most recent position.
     pub fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        // wait until file has been initialised
+        loop {
+            let len = file.metadata()?.len() as usize;
+            if len > 0 {
+                break;
+            }
+            hint::spin_loop()
+        }
         let mmap = unsafe { MmapOptions::new().map(&file)? };
         let bytes = mmap.as_ref();
         Ok(Self {

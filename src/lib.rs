@@ -351,7 +351,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn continuation(&mut self, len: usize, fin: bool) -> Claim {
+    pub fn continuation(&self, len: usize, fin: bool) -> Claim {
         let aligned_len = get_aligned_size(len);
         assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, fin, true)
@@ -360,14 +360,14 @@ impl Writer {
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication (zero payload,
     /// no user defined field and no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat(&mut self) -> Claim {
+    pub fn heartbeat(&self) -> Claim {
         Claim::new(self, 0, 0, USER_DEFINED_NULL_VALUE, true, false)
     }
 
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with user defined
     /// field (zero payload and no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat_with_user_defined(&mut self, user_defined: u32) -> Claim {
+    pub fn heartbeat_with_user_defined(&self, user_defined: u32) -> Claim {
         Claim::new(self, 0, 0, user_defined, true, false)
     }
 
@@ -1191,7 +1191,7 @@ mod tests {
     #[test]
     fn should_send_heartbeat() {
         let bytes = [0u8; HEADER_SIZE + 64];
-        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let claim = writer.heartbeat();
@@ -1270,7 +1270,7 @@ mod tests {
     #[test]
     fn should_fragment_message() {
         let bytes = [0u8; HEADER_SIZE + 64];
-        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let claim = writer.claim_with_user_defined(24, false, 123);

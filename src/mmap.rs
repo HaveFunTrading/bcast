@@ -136,7 +136,7 @@ mod tests {
 
         let file = NamedTempFile::new().unwrap();
 
-        let mut writer = MappedWriter::new(&file, RING_BUFFER_SIZE).unwrap();
+        let writer = MappedWriter::new(&file, RING_BUFFER_SIZE).unwrap();
         let reader = MappedReader::new(&file).unwrap();
 
         writer.claim_with_user_defined(32, true, 100).commit();
@@ -160,12 +160,12 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
 
         {
-            let mut writer = MappedWriter::new(&file, RING_BUFFER_SIZE).unwrap();
+            let writer = MappedWriter::new(&file, RING_BUFFER_SIZE).unwrap();
             writer.claim_with_user_defined(32, true, 100).commit();
             writer.claim_with_user_defined(32, true, 101).commit();
         }
 
-        let mut writer = MappedWriter::join(&file).unwrap();
+        let writer = MappedWriter::join(&file).unwrap();
         writer.claim_with_user_defined(32, true, 102).commit();
 
         let reader = MappedReader::new_with_position(&file, 0).unwrap();

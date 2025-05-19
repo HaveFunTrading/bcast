@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
     let receiver = std::thread::spawn(move || {
         let bytes_tx = unsafe { from_raw_parts(addr_rx as *const u8, RING_BUFFER_SIZE) };
         let bytes_rx = unsafe { from_raw_parts(addr_tx as *const u8, RING_BUFFER_SIZE) };
-        let mut tx = RingBuffer::new(bytes_tx).into_writer();
+        let tx = RingBuffer::new(bytes_tx).into_writer();
         let rx = RingBuffer::new(bytes_rx).into_reader().with_initial_position(0);
 
         'outer: loop {

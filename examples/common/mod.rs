@@ -6,7 +6,7 @@ use std::mem::MaybeUninit;
 /// Generate random message every 1 millisecond.
 #[allow(dead_code)]
 pub fn writer(bytes: &[u8]) {
-    let mut writer = RingBuffer::new(bytes).into_writer();
+    let writer = RingBuffer::new(bytes).into_writer();
     loop {
         let symbol = thread_rng().gen_range(b'A'..=b'Z');
         let msg_len = thread_rng().gen_range(1..20);

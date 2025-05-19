@@ -21,7 +21,7 @@ could be on the heap, stack as well as a result of memory mapping of a file by t
 
 ```rust
 let bytes: &[u8] = ...;
-let mut writer = RingBuffer::new(bytes).into_writer();
+let writer = RingBuffer::new(bytes).into_writer();
 ```
 
 Writing takes place via `claim` operation that returns `Claim` object. We then have access to the underlying buffer to which
@@ -38,7 +38,7 @@ visible to other processes (threads) the moment the `Claim` is dropped. The `Rea
 
 ```rust
 let bytes: &[u8] = ...;
-let mut reader = RingBuffer::new(bytes).into_reader();
+let reader = RingBuffer::new(bytes).into_reader();
 ```
 
 The `Reader` is batch aware (it knows how far behind a producer it is) and provides elegant way to process pending

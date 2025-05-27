@@ -40,6 +40,7 @@ pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
                         return Err(anyhow!(e));
                     }
                 };
+                debug_assert!(!msg.is_padding, "padding frames should be skipped");
                 let mut payload = unsafe { MaybeUninit::new([0u8; 1024]).assume_init() };
                 msg.read(&mut payload)?;
                 #[cfg(debug_assertions)]

@@ -1,4 +1,4 @@
-use bcast::{RingBuffer, Writer, HEADER_SIZE};
+use bcast::{HEADER_SIZE, RingBuffer, Writer};
 use std::slice::from_raw_parts;
 use std::time::{SystemTime, UNIX_EPOCH};
 

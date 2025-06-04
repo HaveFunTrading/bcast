@@ -1,7 +1,7 @@
 use crate::common::writer;
 use bcast::HEADER_SIZE;
 use memmap2::MmapOptions;
-use std::fs::{remove_file, OpenOptions};
+use std::fs::{OpenOptions, remove_file};
 use std::path::Path;
 
 mod common;

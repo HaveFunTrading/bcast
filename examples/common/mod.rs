@@ -1,6 +1,6 @@
 use anyhow::anyhow;
-use bcast::{error::Error, RingBuffer};
-use rand::{thread_rng, Rng};
+use bcast::{RingBuffer, error::Error};
+use rand::{Rng, thread_rng};
 use std::mem::MaybeUninit;
 
 /// Generate random message every 1 millisecond.

@@ -126,8 +126,8 @@ impl MappedReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::mmap::{MappedReader, MappedWriter};
     use crate::HEADER_SIZE;
+    use crate::mmap::{MappedReader, MappedWriter};
     use tempfile::NamedTempFile;
 
     #[test]

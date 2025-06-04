@@ -54,7 +54,7 @@ use std::cell::Cell;
 use std::cmp::min;
 use std::hint;
 use std::mem::ManuallyDrop;
-use std::ptr::{copy_nonoverlapping, NonNull};
+use std::ptr::{NonNull, copy_nonoverlapping};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::error::Error;
@@ -769,7 +769,7 @@ impl Iterator for BatchIter<'_> {
 mod tests {
     use super::*;
     use crate::error::Error;
-    use rand::{thread_rng, Rng};
+    use rand::{Rng, thread_rng};
     use std::ptr::addr_of;
     use std::sync::atomic::Ordering::SeqCst;
 

@@ -298,7 +298,6 @@ impl RingBuffer {
 
     /// Will consume `self` and return instance of writer backed by this ring buffer, with the
     /// initial position set to the provided value.
-    #[cfg(test)]
     pub fn into_writer_at(self, position: usize) -> Writer {
         assert_eq!(get_aligned_size(position), position, "position must be aligned");
         self.header().producer_position.store(position, Ordering::SeqCst);
@@ -353,7 +352,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn claim(&self, len: usize, fin: bool) -> Claim<'_> {
+    pub const fn claim(&self, len: usize, fin: bool) -> Claim<'_> {
         self.claim_with_user_defined(len, fin, USER_DEFINED_NULL_VALUE)
     }
 
@@ -364,7 +363,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn claim_with_user_defined(&self, len: usize, fin: bool, user_defined: u32) -> Claim<'_> {
+    pub const fn claim_with_user_defined(&self, len: usize, fin: bool, user_defined: u32) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, user_defined, fin, false, false)
@@ -376,7 +375,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn continuation(&self, len: usize, fin: bool) -> Claim<'_> {
+    pub const fn continuation(&self, len: usize, fin: bool) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, fin, true, false)
@@ -385,21 +384,21 @@ impl Writer {
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication (zero payload,
     /// no user defined field and no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat(&self) -> Claim<'_> {
+    pub const fn heartbeat(&self) -> Claim<'_> {
         Claim::new(self, 0, 0, USER_DEFINED_NULL_VALUE, true, false, true)
     }
 
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with user defined
     /// field (zero payload and no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat_with_user_defined(&self, user_defined: u32) -> Claim<'_> {
+    pub const fn heartbeat_with_user_defined(&self, user_defined: u32) -> Claim<'_> {
         Claim::new(self, 0, 0, user_defined, true, false, true)
     }
 
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with payload (no
     /// user defined field and no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat_with_payload(&self, len: usize) -> Claim<'_> {
+    pub const fn heartbeat_with_payload(&self, len: usize) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, true, false, true)
@@ -408,7 +407,7 @@ impl Writer {
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with payload and
     /// user defined field (no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat_with_payload_and_user_defined(&self, len: usize, user_defined: u32) -> Claim<'_> {
+    pub const fn heartbeat_with_payload_and_user_defined(&self, len: usize, user_defined: u32) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, user_defined, true, false, true)
@@ -430,7 +429,7 @@ impl Writer {
 
     /// Number of bytes remaining in the buffer before it will wrap around.
     #[inline]
-    fn remaining(&self) -> usize {
+    const fn remaining(&self) -> usize {
         self.ring.capacity - self.index()
     }
 
@@ -460,7 +459,7 @@ pub struct Claim<'a> {
 impl<'a> Claim<'a> {
     /// Create new claim.
     #[inline]
-    fn new(
+    const fn new(
         writer: &'a Writer,
         len: usize,
         limit: usize,
@@ -470,13 +469,13 @@ impl<'a> Claim<'a> {
         heartbeat: bool,
     ) -> Self {
         #[cold]
-        fn insert_padding_frame(writer: &Writer, remaining: usize) {
+        const fn insert_padding_frame(writer: &Writer, remaining: usize) {
             let padding_len = remaining - size_of::<FrameHeader>();
             let fields = pack_fields(true, false, true, false, padding_len as u32);
             let header = writer.frame_header();
-            header.fields.set(fields);
-            header.user_defined.set(USER_DEFINED_NULL_VALUE);
-            writer.position.set(
+            let _ = header.fields.replace(fields);
+            let _ = header.user_defined.replace(USER_DEFINED_NULL_VALUE);
+            let _ = writer.position.replace(
                 writer
                     .position
                     .get()
@@ -506,23 +505,23 @@ impl<'a> Claim<'a> {
 
     /// Get next message payload as byte slice.
     #[inline]
-    pub fn get_buffer(&self) -> &[u8] {
+    pub const fn get_buffer(&self) -> &[u8] {
         let ptr = self.writer.frame_header().get_payload_ptr();
         unsafe { std::slice::from_raw_parts(ptr as *const u8, self.limit) }
     }
 
     /// Get next message payload as mutable byte slice.
     #[inline]
-    pub fn get_buffer_mut(&mut self) -> &mut [u8] {
+    pub const fn get_buffer_mut(&mut self) -> &mut [u8] {
         let ptr = self.writer.frame_header().get_payload_ptr_mut();
         unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, self.limit) }
     }
 
     /// Abort the publication.
     #[inline]
-    pub fn abort(self) {
+    pub const fn abort(self) {
         // rollback to the initial position (in case padding frame was inserted)
-        self.writer.position.set(self.position_snapshot);
+        let _ = self.writer.position.replace(self.position_snapshot);
         let _ = ManuallyDrop::new(self);
     }
 
@@ -539,11 +538,11 @@ impl<'a> Claim<'a> {
         // update frame header
         let header = self.writer.frame_header();
         let fields = pack_fields(self.fin, self.continuation, false, self.heartbeat, self.limit as u32);
-        header.fields.set(fields);
-        header.user_defined.set(self.user_defined);
+        let _ = header.fields.replace(fields);
+        let _ = header.user_defined.replace(self.user_defined);
 
         // advance writer position
-        self.writer.position.set(
+        let _ = self.writer.position.replace(
             self.writer
                 .position
                 .get()
@@ -590,21 +589,22 @@ impl Reader {
 
     /// Obtain reference to the (unpublished) message frame header.
     #[inline]
-    fn as_frame_header(&self) -> &FrameHeader {
+    const fn as_frame_header(&self) -> &FrameHeader {
         unsafe { &*(self.ring.header().data_ptr().add(self.index()) as *const FrameHeader) }
     }
 
     /// Buffer index at which read will happen.
     #[inline]
-    fn index(&self) -> usize {
+    const fn index(&self) -> usize {
         self.position.get() & (self.ring.capacity - 1)
     }
 
     /// Reset reader position to current producer position, for recovering from overrun.
     #[cold]
     pub fn reset(&self) {
-        self.position
-            .set(self.ring.header().producer_position.load(Ordering::Acquire));
+        let _ = self
+            .position
+            .replace(self.ring.header().producer_position.load(Ordering::Acquire));
     }
 
     /// Construct `Batch` object that can efficiently read multiple messages in a batch between

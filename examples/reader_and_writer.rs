@@ -1,5 +1,6 @@
 use crate::common::{reader, writer};
 use bcast::HEADER_SIZE;
+use bcast::util::AlignedBytes;
 use std::slice::from_raw_parts;
 
 mod common;
@@ -10,7 +11,7 @@ mod common;
 const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024;
 
 fn main() -> anyhow::Result<()> {
-    let bytes = [0u8; RING_BUFFER_SIZE];
+    let bytes = AlignedBytes::<RING_BUFFER_SIZE>::new();
     let ptr = bytes.as_ptr();
     let addr = ptr as usize;
 

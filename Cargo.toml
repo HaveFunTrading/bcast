@@ -26,6 +26,7 @@ rand = "0.8.5"
 memmap2 = "0.9.5"
 hdrhistogram = "7.5.4"
 tempfile = "3.20.0"
+aligned-vec = "0.6.4"
 
 [profile.release]
 codegen-units = 1

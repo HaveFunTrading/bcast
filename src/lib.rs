@@ -48,6 +48,7 @@ pub mod error;
 
 #[cfg(feature = "mmap")]
 pub mod mmap;
+pub mod util;
 
 use crossbeam_utils::CachePadded;
 use std::cell::Cell;
@@ -73,7 +74,7 @@ pub const USER_DEFINED_NULL_VALUE: u32 = 0;
 // mask to obtain message length from frame header
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x0FFFFFFF;
 // represents the max value we can encode on the frame header for the payload length
-const MAX_PAYLOAD_LEN: usize = (1 << 31) - 1;
+const MAX_PAYLOAD_LEN: usize = (1 << 28) - 1;
 
 /// Ring buffer header that contains producer position. The position is expressed in bytes and
 /// will always increment.
@@ -123,8 +124,15 @@ struct FrameHeader {
 impl FrameHeader {
     #[inline]
     #[cfg(test)]
-    const fn new(payload_len: u32, user_defined: u32, fin: bool, continuation: bool, padding: bool) -> Self {
-        let fields = pack_fields(fin, continuation, padding, payload_len);
+    const fn new(
+        payload_len: u32,
+        user_defined: u32,
+        fin: bool,
+        continuation: bool,
+        padding: bool,
+        heartbeat: bool,
+    ) -> Self {
+        let fields = pack_fields(fin, continuation, padding, heartbeat, payload_len);
         FrameHeader {
             fields: Cell::new(fields),
             user_defined: Cell::new(user_defined),
@@ -134,7 +142,13 @@ impl FrameHeader {
     #[inline]
     #[cfg(test)]
     const fn new_padding() -> Self {
-        Self::new(0, 0, true, false, true)
+        Self::new(0, 0, true, false, true, false)
+    }
+
+    #[inline]
+    #[cfg(test)]
+    fn is_heartbeat(&self) -> bool {
+        ((self.fields.get() >> 28) & 1) == 1
     }
 
     #[inline]
@@ -161,9 +175,9 @@ impl FrameHeader {
         self.fields.get() & FRAME_HEADER_MSG_LEN_MASK
     }
 
-    /// Extract `(fin, continuation, padding, length)` fields from the message header.
+    /// Extract `(fin, continuation, padding, heartbeat, length)` fields from the message header.
     #[inline]
-    fn unpack_fields(&self) -> (bool, bool, bool, u32) {
+    fn unpack_fields(&self) -> (bool, bool, bool, bool, u32) {
         unpack_fields(self.fields.get())
     }
 
@@ -189,23 +203,34 @@ impl FrameHeader {
 /// - Bit 28: reserved (always 0)
 /// - Bits 0-27: message length
 #[inline]
-const fn pack_fields(fin: bool, continuation: bool, padding: bool, length: u32) -> u32 {
-    unsafe { pack_fields_unchecked(fin, continuation, padding, length & FRAME_HEADER_MSG_LEN_MASK) }
+const fn pack_fields(fin: bool, continuation: bool, padding: bool, heartheat: bool, length: u32) -> u32 {
+    unsafe { pack_fields_unchecked(fin, continuation, padding, heartheat, length & FRAME_HEADER_MSG_LEN_MASK) }
 }
 
 #[inline]
-const unsafe fn pack_fields_unchecked(fin: bool, continuation: bool, padding: bool, length: u32) -> u32 {
-    length | ((padding as u32) << 29) | ((continuation as u32) << 30) | ((fin as u32) << 31)
+const unsafe fn pack_fields_unchecked(
+    fin: bool,
+    continuation: bool,
+    padding: bool,
+    heartbeat: bool,
+    length: u32,
+) -> u32 {
+    length
+        | ((heartbeat as u32) << 28)
+        | ((padding as u32) << 29)
+        | ((continuation as u32) << 30)
+        | ((fin as u32) << 31)
 }
 
-/// Unpacks `u32` field into a tuple: (fin, continuation, padding, length).
+/// Unpacks `u32` field into a tuple: (fin, continuation, padding, heartbeat, length).
 #[inline]
-const fn unpack_fields(fields: u32) -> (bool, bool, bool, u32) {
+const fn unpack_fields(fields: u32) -> (bool, bool, bool, bool, u32) {
     let fin = (fields >> 31) & 1 == 1;
     let continuation = (fields >> 30) & 1 == 1;
     let padding = (fields >> 29) & 1 == 1;
+    let heartbeat = (fields >> 28) & 1 == 1;
     let length = fields & FRAME_HEADER_MSG_LEN_MASK;
-    (fin, continuation, padding, length)
+    (fin, continuation, padding, heartbeat, length)
 }
 
 /// Calculate the number of bytes needed to ensure frame header alignment of the payload.
@@ -328,7 +353,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn claim(&self, len: usize, fin: bool) -> Claim {
+    pub fn claim(&self, len: usize, fin: bool) -> Claim<'_> {
         self.claim_with_user_defined(len, fin, USER_DEFINED_NULL_VALUE)
     }
 
@@ -339,10 +364,10 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn claim_with_user_defined(&self, len: usize, fin: bool, user_defined: u32) -> Claim {
+    pub fn claim_with_user_defined(&self, len: usize, fin: bool, user_defined: u32) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
-        assert!(aligned_len <= self.mtu(), "mtu exceeded");
-        Claim::new(self, aligned_len, len, user_defined, fin, false)
+        debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        Claim::new(self, aligned_len, len, user_defined, fin, false, false)
     }
 
     /// Claim part of the underlying `RingBuffer` for continuation frame publication also passing
@@ -351,24 +376,42 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn continuation(&self, len: usize, fin: bool) -> Claim {
+    pub fn continuation(&self, len: usize, fin: bool) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
-        assert!(aligned_len <= self.mtu(), "mtu exceeded");
-        Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, fin, true)
+        debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, fin, true, false)
     }
 
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication (zero payload,
     /// no user defined field and no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat(&self) -> Claim {
-        Claim::new(self, 0, 0, USER_DEFINED_NULL_VALUE, true, false)
+    pub fn heartbeat(&self) -> Claim<'_> {
+        Claim::new(self, 0, 0, USER_DEFINED_NULL_VALUE, true, false, true)
     }
 
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with user defined
     /// field (zero payload and no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat_with_user_defined(&self, user_defined: u32) -> Claim {
-        Claim::new(self, 0, 0, user_defined, true, false)
+    pub fn heartbeat_with_user_defined(&self, user_defined: u32) -> Claim<'_> {
+        Claim::new(self, 0, 0, user_defined, true, false, true)
+    }
+
+    /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with payload (no
+    /// user defined field and no fragmentation). This operation will always succeed.
+    #[inline]
+    pub fn heartbeat_with_payload(&self, len: usize) -> Claim<'_> {
+        let aligned_len = get_aligned_size(len);
+        debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, true, false, true)
+    }
+
+    /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with payload and
+    /// user defined field (no fragmentation). This operation will always succeed.
+    #[inline]
+    pub fn heartbeat_with_payload_and_user_defined(&self, len: usize, user_defined: u32) -> Claim<'_> {
+        let aligned_len = get_aligned_size(len);
+        debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        Claim::new(self, aligned_len, len, user_defined, true, false, true)
     }
 
     /// Get maximum permissible unaligned payload length that can be accepted by the buffer.
@@ -411,16 +454,25 @@ pub struct Claim<'a> {
     user_defined: u32,        // user defined field
     fin: bool,                // final message fragment
     continuation: bool,       // continuation frame
+    heartbeat: bool,          // heartbeat frame
 }
 
 impl<'a> Claim<'a> {
     /// Create new claim.
     #[inline]
-    fn new(writer: &'a Writer, len: usize, limit: usize, user_defined: u32, fin: bool, continuation: bool) -> Self {
+    fn new(
+        writer: &'a Writer,
+        len: usize,
+        limit: usize,
+        user_defined: u32,
+        fin: bool,
+        continuation: bool,
+        heartbeat: bool,
+    ) -> Self {
         #[cold]
         fn insert_padding_frame(writer: &Writer, remaining: usize) {
             let padding_len = remaining - size_of::<FrameHeader>();
-            let fields = pack_fields(true, false, true, padding_len as u32);
+            let fields = pack_fields(true, false, true, false, padding_len as u32);
             let header = writer.frame_header();
             header.fields.set(fields);
             header.user_defined.set(USER_DEFINED_NULL_VALUE);
@@ -448,6 +500,7 @@ impl<'a> Claim<'a> {
             user_defined,
             fin,
             continuation,
+            heartbeat,
         }
     }
 
@@ -485,7 +538,7 @@ impl<'a> Claim<'a> {
     fn commit_impl(&self) {
         // update frame header
         let header = self.writer.frame_header();
-        let fields = pack_fields(self.fin, self.continuation, false, self.limit as u32);
+        let fields = pack_fields(self.fin, self.continuation, false, self.heartbeat, self.limit as u32);
         header.fields.set(fields);
         header.user_defined.set(self.user_defined);
 
@@ -558,7 +611,7 @@ impl Reader {
     /// `Reader` current position and prevailing producer position. Returns `None` if there is
     /// no new data to read.
     #[inline]
-    pub fn read_batch(&self) -> Option<Batch> {
+    pub fn read_batch(&self) -> Option<Batch<'_>> {
         let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
         let limit = producer_position.wrapping_sub(self.position.get());
         if limit == 0 {
@@ -596,7 +649,7 @@ impl Reader {
     fn receive_next_impl(&self, reader_position: usize) -> Option<Result<Message>> {
         // extract frame header fields
         let frame_header = self.as_frame_header();
-        let (is_fin, is_continuation, is_padding, length) = frame_header.unpack_fields();
+        let (is_fin, is_continuation, is_padding, is_heartbeat, length) = frame_header.unpack_fields();
         let user_defined = frame_header.user_defined.get();
         let producer_position_after = self.ring.header().producer_position.load(Ordering::Acquire);
 
@@ -609,6 +662,7 @@ impl Reader {
             is_fin,
             is_continuation,
             is_padding,
+            is_heartbeat,
             user_defined,
         };
 
@@ -645,6 +699,8 @@ pub struct Message {
     pub is_continuation: bool,
     /// Indicates padding frame.
     pub is_padding: bool,
+    /// Indicates heartbeat frame.
+    pub is_heartbeat: bool,
 }
 
 impl Message {
@@ -769,13 +825,15 @@ impl Iterator for BatchIter<'_> {
 mod tests {
     use super::*;
     use crate::error::Error;
+    use crate::util::AlignedBytes;
+    use aligned_vec::avec;
     use rand::{Rng, thread_rng};
     use std::ptr::addr_of;
     use std::sync::atomic::Ordering::SeqCst;
 
     #[test]
     fn should_read_messages_in_batch() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
@@ -841,7 +899,7 @@ mod tests {
 
     #[test]
     fn should_read_in_batch_with_limit() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
@@ -883,7 +941,7 @@ mod tests {
 
     #[test]
     fn should_resume_batch_if_previous_not_consumed() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
@@ -905,7 +963,7 @@ mod tests {
 
     #[test]
     fn should_read_next_message_if_batch_not_consumed() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
@@ -926,7 +984,7 @@ mod tests {
 
     #[test]
     fn should_read_next_message() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
@@ -962,7 +1020,7 @@ mod tests {
 
     #[test]
     fn should_overrun_reader() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
@@ -977,7 +1035,7 @@ mod tests {
 
     #[test]
     fn should_overrun_read_batch() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
@@ -994,7 +1052,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "mtu exceeded")]
     fn should_error_if_mtu_exceeded() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         assert_eq!(24, writer.mtu());
         let _ = writer.claim(32, true);
@@ -1002,7 +1060,7 @@ mod tests {
 
     #[test]
     fn should_start_read_from_last_producer_position() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
 
         writer.claim(16, true).commit();
@@ -1018,13 +1076,28 @@ mod tests {
 
     #[test]
     fn should_pack_and_unpack_fields() {
-        assert_eq!((true, true, true, 123), unpack_fields(pack_fields(true, true, true, 123)));
-        assert_eq!((true, true, false, 123), unpack_fields(pack_fields(true, true, false, 123)));
-        assert_eq!((true, false, true, 123), unpack_fields(pack_fields(true, false, true, 123)));
-        assert_eq!((true, false, false, 123), unpack_fields(pack_fields(true, false, false, 123)));
-        assert_eq!((false, false, false, 123), unpack_fields(pack_fields(false, false, false, 123)));
-        assert_eq!((false, false, true, 123), unpack_fields(pack_fields(false, false, true, 123)));
-        assert_eq!((false, true, false, 123), unpack_fields(pack_fields(false, true, false, 123)));
+        assert_eq!((true, true, true, true, 123), unpack_fields(pack_fields(true, true, true, true, 123)));
+        assert_eq!((true, true, true, false, 123), unpack_fields(pack_fields(true, true, true, false, 123)));
+        assert_eq!((true, true, false, false, 123), unpack_fields(pack_fields(true, true, false, false, 123)));
+        assert_eq!((true, false, false, false, 123), unpack_fields(pack_fields(true, false, false, false, 123)));
+        assert_eq!((false, false, false, false, 123), unpack_fields(pack_fields(false, false, false, false, 123)));
+        assert_eq!((false, false, true, false, 123), unpack_fields(pack_fields(false, false, true, false, 123)));
+        assert_eq!((false, true, false, true, 123), unpack_fields(pack_fields(false, true, false, true, 123)));
+    }
+
+    #[test]
+    fn should_encode_and_decode_max_payload_len() {
+        let frame = FrameHeader::new(MAX_PAYLOAD_LEN as u32, 0, true, false, false, false);
+        assert!(frame.is_fin());
+        assert!(!frame.is_continuation());
+        assert!(!frame.is_padding());
+        assert!(!frame.is_heartbeat());
+        assert_eq!(MAX_PAYLOAD_LEN as u32, frame.payload_len());
+        assert_eq!(268435455, MAX_PAYLOAD_LEN);
+        assert_eq!(
+            (true, true, true, true, MAX_PAYLOAD_LEN as u32),
+            unpack_fields(pack_fields(true, true, true, true, MAX_PAYLOAD_LEN as u32))
+        );
     }
 
     #[test]
@@ -1032,40 +1105,45 @@ mod tests {
         assert_eq!(8, align_of::<FrameHeader>());
         assert_eq!(8, size_of::<FrameHeader>());
 
-        let frame = FrameHeader::new(10, 0, true, false, false);
+        let frame = FrameHeader::new(10, 0, true, false, false, true);
         assert!(frame.is_fin());
         assert!(!frame.is_continuation());
         assert!(!frame.is_padding());
+        assert!(frame.is_heartbeat());
         assert_eq!(10, frame.payload_len());
 
-        let frame = FrameHeader::new(10, 0, true, false, true);
+        let frame = FrameHeader::new(10, 0, true, false, true, false);
         assert!(frame.is_fin());
         assert!(!frame.is_continuation());
         assert!(frame.is_padding());
+        assert!(!frame.is_heartbeat());
         assert_eq!(10, frame.payload_len());
 
-        let frame = FrameHeader::new(0, 0, true, false, false);
+        let frame = FrameHeader::new(0, 0, true, false, false, true);
         assert!(frame.is_fin());
         assert!(!frame.is_continuation());
         assert!(!frame.is_padding());
+        assert!(frame.is_heartbeat());
         assert_eq!(0, frame.payload_len());
 
-        let frame = FrameHeader::new(0, 0, true, false, true);
+        let frame = FrameHeader::new(0, 0, true, false, true, false);
         assert!(frame.is_fin());
         assert!(!frame.is_continuation());
         assert!(frame.is_padding());
+        assert!(!frame.is_heartbeat());
         assert_eq!(0, frame.payload_len());
 
         let frame = FrameHeader::new_padding();
         assert!(frame.is_fin());
         assert!(!frame.is_continuation());
         assert!(frame.is_padding());
+        assert!(!frame.is_heartbeat());
         assert_eq!(0, frame.payload_len());
     }
 
     #[test]
     fn should_insert_padding() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
 
         assert_eq!(0, writer.index());
@@ -1094,7 +1172,7 @@ mod tests {
 
     #[test]
     fn should_ensure_frame_alignment() {
-        let bytes = [0u8; HEADER_SIZE + 1024];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 1024 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
 
         let producer_position_addr = addr_of!(writer.ring.header().producer_position) as usize;
@@ -1140,7 +1218,7 @@ mod tests {
 
     #[test]
     fn should_construct_ring_buffer() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let rb = RingBuffer::new(&bytes);
         assert_eq!(0, rb.header().producer_position.load(SeqCst));
         assert_eq!(64, rb.capacity);
@@ -1148,7 +1226,7 @@ mod tests {
 
     #[test]
     fn should_construct_ring_buffer_from_vec() {
-        let bytes = vec![0u8; HEADER_SIZE + (1024 * 1024 * 2)];
+        let bytes = avec![[128] | 0u8; HEADER_SIZE + (1024 * 1024 * 2)];
         let rb = RingBuffer::new(&bytes);
         assert_eq!(0, rb.header().producer_position.load(SeqCst));
         assert_eq!(2097152, rb.capacity);
@@ -1157,7 +1235,7 @@ mod tests {
 
     #[test]
     fn should_read_message_into_vec() {
-        let bytes = vec![0u8; HEADER_SIZE + 1024];
+        let bytes = avec![[128] | 0u8; HEADER_SIZE + 1024];
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
@@ -1177,7 +1255,7 @@ mod tests {
 
     #[test]
     fn should_send_zero_size_message() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
@@ -1190,7 +1268,7 @@ mod tests {
 
     #[test]
     fn should_send_heartbeat() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
@@ -1206,7 +1284,7 @@ mod tests {
 
     #[test]
     fn should_abort_publication() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         assert_eq!(0, writer.position.get());
 
@@ -1229,7 +1307,7 @@ mod tests {
 
     #[test]
     fn should_attach_metadata() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let _ = RingBuffer::new(&bytes).into_writer_with_metadata(|metadata| {
             assert_eq!(METADATA_BUFFER_SIZE, metadata.len());
             metadata[0..11].copy_from_slice(b"hello world");
@@ -1240,7 +1318,7 @@ mod tests {
 
     #[test]
     fn should_skip_padding_frame() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let mut buffer = [0u8; 1024];
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
@@ -1269,7 +1347,7 @@ mod tests {
 
     #[test]
     fn should_fragment_message() {
-        let bytes = [0u8; HEADER_SIZE + 64];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
@@ -1303,7 +1381,7 @@ mod tests {
 
     #[test]
     fn should_join_writer() {
-        let bytes = [0u8; HEADER_SIZE + 1024];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 1024 }>::new();
 
         // first writer will write from the beginning
         {
@@ -1333,7 +1411,7 @@ mod tests {
 
     #[test]
     fn should_handle_position_wrap_around_if_no_overrun() {
-        let bytes = [0u8; HEADER_SIZE + 2048];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 1023);
         // last claim before wrap around
         writer.claim_with_user_defined(1000, true, 100).commit();
@@ -1358,7 +1436,7 @@ mod tests {
 
     #[test]
     fn should_allow_reader_to_recover_from_overrun_when_position_wrapped_around() {
-        let bytes = [0u8; HEADER_SIZE + 2048];
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
         let reader = RingBuffer::new(&bytes).into_reader();
 

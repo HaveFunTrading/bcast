@@ -424,7 +424,7 @@ impl Writer {
 
     /// Buffer index at which next write will happen.
     #[inline]
-    fn index(&self) -> usize {
+    const fn index(&self) -> usize {
         self.position.get() & (self.ring.capacity - 1)
     }
 
@@ -436,7 +436,7 @@ impl Writer {
 
     /// Get reference to the next (unpublished) message frame header;
     #[inline]
-    fn frame_header(&self) -> &FrameHeader {
+    const fn frame_header(&self) -> &FrameHeader {
         unsafe {
             let ptr = self.ring.header().data_ptr();
             &*(ptr.add(self.index()) as *const FrameHeader)

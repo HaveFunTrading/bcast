@@ -656,6 +656,7 @@ impl Reader {
         // construct the massage
         let message = Message {
             header: self.ring.header(),
+            stream_position: self.position.get(),
             position: self.position.get().wrapping_add(size_of::<FrameHeader>()),
             payload_len: length as usize,
             capacity: self.ring.capacity,
@@ -687,8 +688,10 @@ impl Reader {
 #[derive(Debug, Clone)]
 pub struct Message {
     header: &'static Header, // ring buffer header
-    position: usize,         // marks beginning of message payload
     capacity: usize,         // ring buffer capacity
+    position: usize,         // marks beginning of message payload
+    /// Absolute position within stream. Marks beginning of message header.
+    pub stream_position: usize,
     /// Message length.
     pub payload_len: usize,
     /// User defined field.

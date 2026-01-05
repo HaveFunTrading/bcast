@@ -47,7 +47,7 @@
 pub mod error;
 
 #[cfg(feature = "mmap")]
-pub mod mmap;
+mod mmap;
 pub mod util;
 
 use crossbeam_utils::CachePadded;
@@ -59,10 +59,14 @@ use std::ptr::{NonNull, copy_nonoverlapping};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::error::Error;
-// re-export
+
+// re-exports
 pub use error::Result;
 use std::mem::align_of;
 use std::mem::size_of;
+
+#[cfg(feature = "mmap")]
+pub use mmap::{MappedReader, MappedWriter};
 
 /// Ring buffer header size in bytes.
 pub const HEADER_SIZE: usize = size_of::<Header>();

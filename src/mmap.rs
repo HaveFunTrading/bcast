@@ -30,7 +30,7 @@ impl DerefMut for MappedWriter {
 impl MappedWriter {
     /// Construct writer backed by memory mapped file of certain size. If the file already
     /// exists it will be removed. If you need to continue writing to existing file use
-    /// `MappedWriter::join` instead.
+    /// [`MappedWriter::join`] instead.
     pub fn new(path: impl AsRef<Path>, size: usize) -> std::io::Result<Self> {
         if path.as_ref().exists() {
             std::fs::remove_file(path.as_ref())?;
@@ -67,6 +67,22 @@ impl MappedWriter {
             writer: RingBuffer::new(bytes).join_writer(),
             mmap,
         })
+    }
+
+    /// Construct writer backed by memory mapped file and continue writing from the most
+    /// recent position if the file exists and is of the required size. Otherwise, it will delegate
+    /// writer creation to [`MappedWriter::new`].
+    pub fn join_or_create(path: impl AsRef<Path>, size: usize) -> std::io::Result<Self> {
+        match path.as_ref().exists() {
+            true => {
+                let file_len = path.as_ref().metadata()?.len() as usize;
+                match file_len == size {
+                    true => Self::join(path),
+                    false => Self::new(path, size),
+                }
+            },
+            false => Self::new(path, size),
+        }
     }
 }
 

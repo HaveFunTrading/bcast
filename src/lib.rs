@@ -204,11 +204,11 @@ impl FrameHeader {
 /// - Bit 31: fin flag
 /// - Bit 30: continuation flag
 /// - Bit 29: padding flag
-/// - Bit 28: reserved (always 0)
+/// - Bit 28: heartbeat flag
 /// - Bits 0-27: message length
 #[inline]
-const fn pack_fields(fin: bool, continuation: bool, padding: bool, heartheat: bool, length: u32) -> u32 {
-    unsafe { pack_fields_unchecked(fin, continuation, padding, heartheat, length & FRAME_HEADER_MSG_LEN_MASK) }
+const fn pack_fields(fin: bool, continuation: bool, padding: bool, heartbeat: bool, length: u32) -> u32 {
+    unsafe { pack_fields_unchecked(fin, continuation, padding, heartbeat, length & FRAME_HEADER_MSG_LEN_MASK) }
 }
 
 #[inline]

@@ -80,7 +80,7 @@ impl MappedWriter {
                     true => Self::join(path),
                     false => Self::new(path, size),
                 }
-            },
+            }
             false => Self::new(path, size),
         }
     }

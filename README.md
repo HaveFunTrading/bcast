@@ -5,9 +5,10 @@
 
 ## Overview
 
-Low latency, single producer & many consumer (SPMC) ring buffer that works with shared memory. One of the key features of `bcast` is that it natively supports variable message sizes
-(the payload is just `&[u8]`) which works very well in any ipc-based distributed system (such as market data
-feed handler). 
+Low latency, single producer & many consumer (SPMC) ring buffer that works with shared memory. `bcast` natively supports variable message sizes (`&[u8]`) and offers two read styles:
+
+- lazy message access via `read_batch()` / `receive_next()`
+- raw bulk copy via `read_bulk()` for lower reader-side overhead
 
 ## Supported Platforms
 The crate has been developed and tested exclusively on `x86_64-linux`. It should also work (but it's by 
@@ -41,16 +42,31 @@ let bytes: &[u8] = ...;
 let reader = RingBuffer::new(bytes).into_reader();
 ```
 
-The `Reader` is batch aware (it knows how far behind a producer it is) and provides elegant way to process pending
-messages in form of an iterator.
+The `Reader` is batch aware (it knows how far behind a producer it is) and provides an iterator over pending messages.
 
 ```rust
-for msg in reader.read_batch() {
-    let mut payload = [0u8; 1024];
-    let len = msg?.read(&mut payload)?;
-    println!!("{}", String::from_utf8_lossy(&payload[..len]));
+if let Some(batch) = reader.read_batch() {
+    for msg in batch {
+        let mut payload = [0u8; 1024];
+        let len = msg?.read(&mut payload)?;
+        println!("{}", String::from_utf8_lossy(&payload[..len]));
+    }
 }
 ```
+
+If you want to copy a bounded raw window out of the ring first and parse it off-ring, use the bulk API:
+
+```rust
+if let Some(bulk) = reader.read_bulk() {
+    let bulk = bulk?;
+    let mut bytes = vec![0u8; bulk.len()];
+    for msg in bulk.into_iter(&mut bytes)? {
+        println!("{}", String::from_utf8_lossy(msg.payload));
+    }
+}
+```
+
+When the `mmap` feature is enabled, `MappedWriter` and `MappedReader` provide file-backed wrappers over the same API for IPC-style usage.
 
 ## Backpressure (and the lack of it)
 `bcast` design is to allow producer to process and publish messages at full line rate and deliver the same latency irrespective
@@ -65,7 +81,6 @@ match msg.read(&mut payload) {
 }
 ```
 
-This also means that messages are consumed in a 'lazy' way with the `read` operation delayed until it is required. As a
-result, it is possible to `clone` each `Message`. This approach is particularly useful if it's desired to delay
-actual consumption of messages (e.g. when we want to combine and expose data from various sources to the application in
-a single step).
+The message API is intentionally lazy: payload bytes are only copied when `Message::read(...)` is called, and `Message`
+can be cloned if you need to defer consumption. If you prefer eager copying with a single overrun check at the end of
+the copy, use `read_bulk()` instead.

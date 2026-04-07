@@ -54,8 +54,9 @@ use crossbeam_utils::CachePadded;
 use std::cell::Cell;
 use std::cmp::min;
 use std::hint;
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::ptr::{NonNull, copy_nonoverlapping};
+use std::ptr::{NonNull, copy_nonoverlapping, read_unaligned};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::error::Error;
@@ -628,6 +629,28 @@ impl Reader {
         })
     }
 
+    /// Construct `Bulk` object representing raw bytes between `Reader` current position and the
+    /// prevailing producer position. Returned bulk includes message frame headers and payload bytes
+    /// exactly as they appear in the ring buffer data section.
+    #[inline]
+    pub fn read_bulk(&self) -> Option<Result<Bulk<'_>>> {
+        let start_position = self.position.get();
+        let end_position = self.ring.header().producer_position.load(Ordering::Acquire);
+        let len = end_position.wrapping_sub(start_position);
+        if len == 0 {
+            return None;
+        }
+        if len > self.ring.capacity {
+            return Some(Err(Error::overrun(start_position)));
+        }
+        Some(Ok(Bulk {
+            reader: self,
+            start_position,
+            end_position,
+            len,
+        }))
+    }
+
     /// Receive next pending message from the ring buffer.
     #[inline]
     pub fn receive_next(&self) -> Option<Result<Message>> {
@@ -826,6 +849,209 @@ impl Iterator for BatchIter<'_> {
     }
 }
 
+/// Represents a bounded contiguous stream window copied out of the ring as raw bytes. Unlike
+/// `Batch`, this API does not parse individual messages and instead operates on the underlying
+/// frame bytes directly.
+pub struct Bulk<'a> {
+    reader: &'a Reader,
+    start_position: usize,
+    end_position: usize,
+    len: usize,
+}
+
+#[allow(clippy::len_without_is_empty)]
+impl Bulk<'_> {
+    /// Return the number of raw bytes available in this bulk window.
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Absolute stream position at which this bulk window starts.
+    #[inline]
+    pub const fn start_position(&self) -> usize {
+        self.start_position
+    }
+
+    /// Absolute stream position immediately after this bulk window.
+    #[inline]
+    pub const fn end_position(&self) -> usize {
+        self.end_position
+    }
+
+    /// Copy this bulk window into caller-provided destination buffer. This operation will perform
+    /// at most two raw copies if the window wraps around the ring buffer.
+    ///
+    /// On success reader position advances to `end_position`. On error reader position is left
+    /// unchanged so the caller can decide how to recover.
+    #[inline]
+    pub fn copy_into(self, dst: &mut [u8]) -> Result<usize> {
+        if dst.len() < self.len {
+            return Err(Error::insufficient_buffer_size(dst.len(), self.len));
+        }
+
+        let start_index = self.start_position & (self.reader.ring.capacity - 1);
+        let first_len = min(self.len, self.reader.ring.capacity - start_index);
+        let data_ptr = self.reader.ring.header().data_ptr();
+
+        unsafe {
+            copy_nonoverlapping(data_ptr.add(start_index), dst.as_mut_ptr(), first_len);
+            if self.len > first_len {
+                copy_nonoverlapping(data_ptr, dst.as_mut_ptr().add(first_len), self.len - first_len);
+            }
+        }
+
+        let producer_position_after = self.reader.ring.header().producer_position.load(Ordering::Acquire);
+        if producer_position_after.wrapping_sub(self.start_position) > self.reader.ring.capacity {
+            return Err(Error::overrun(self.start_position));
+        }
+
+        self.reader.position.set(self.end_position);
+        Ok(self.len)
+    }
+
+    /// Copy this bulk window into caller-provided destination buffer and return an iterator over
+    /// the copied data using the default unaligned parsing policy.
+    #[inline]
+    pub fn into_iter(self, dst: &mut [u8]) -> Result<BulkIter<'_, Unaligned>> {
+        let start_position = self.start_position;
+        let len = self.copy_into(dst)?;
+        Ok(BulkIter::<Unaligned>::new(&dst[..len], start_position))
+    }
+
+    /// Copy this bulk window into caller-provided destination buffer and return an iterator over
+    /// the copied data using the aligned parsing policy.
+    #[inline]
+    pub fn into_iter_aligned(self, dst: &mut [u8]) -> Result<BulkIter<'_, Aligned>> {
+        debug_assert_eq!(
+            dst.as_ptr().align_offset(align_of::<FrameHeader>()),
+            0,
+            "bulk buffer is not aligned to FrameHeader",
+        );
+        let start_position = self.start_position;
+        let len = self.copy_into(dst)?;
+        Ok(BulkIter::<Aligned>::new(&dst[..len], start_position))
+    }
+}
+
+/// Parsed message view produced from a raw bulk buffer.
+pub struct BulkMessage<'a> {
+    /// Absolute stream position within the original stream. Marks beginning of message header.
+    pub stream_position: usize,
+    /// Message length.
+    pub payload_len: usize,
+    /// User defined field.
+    pub user_defined: u32,
+    /// Indicates final message fragment.
+    pub is_fin: bool,
+    /// Indicates continuation frame.
+    pub is_continuation: bool,
+    /// Indicates heartbeat frame.
+    pub is_heartbeat: bool,
+    /// Message payload copied out of the ring buffer.
+    pub payload: &'a [u8],
+}
+
+/// Marker indicating raw bulk bytes may be unaligned and must be parsed with unaligned loads.
+pub struct Unaligned;
+
+/// Marker indicating raw bulk bytes are aligned to `FrameHeader` alignment.
+pub struct Aligned;
+
+/// Iterator over messages contained in a raw bulk buffer produced by `Bulk::copy_into()`.
+/// Padding frames are skipped automatically.
+pub struct BulkIter<'a, Policy = Unaligned> {
+    bytes: &'a [u8],
+    start_position: usize,
+    index: usize,
+    policy: PhantomData<Policy>,
+}
+
+impl<'a, Policy> BulkIter<'a, Policy> {
+    /// Construct iterator over raw bulk bytes. `start_position` must match the bulk window start.
+    #[inline]
+    pub const fn new(bytes: &'a [u8], start_position: usize) -> Self {
+        Self {
+            bytes,
+            start_position,
+            index: 0,
+            policy: PhantomData,
+        }
+    }
+}
+
+impl<'a, Policy> BulkIter<'a, Policy> {
+    fn next_impl(&mut self, read_header: unsafe fn(*const u8) -> (u32, u32)) -> Option<BulkMessage<'a>> {
+        while self.index < self.bytes.len() {
+            let header_end = self.index + size_of::<FrameHeader>();
+            if header_end > self.bytes.len() {
+                return None;
+            }
+
+            let header_ptr = unsafe { self.bytes.as_ptr().add(self.index) };
+            let (fields, user_defined) = unsafe { read_header(header_ptr) };
+            let (is_fin, is_continuation, is_padding, is_heartbeat, payload_len) = unpack_fields(fields);
+            let payload_len = payload_len as usize;
+            let aligned_payload_len = get_aligned_size(payload_len);
+            let frame_len = size_of::<FrameHeader>() + aligned_payload_len;
+            let payload_start = self.index + size_of::<FrameHeader>();
+            let payload_end = payload_start + payload_len;
+            let stream_position = self.start_position + self.index;
+
+            if payload_end > self.bytes.len() || self.index + frame_len > self.bytes.len() {
+                return None;
+            }
+
+            self.index += frame_len;
+
+            if is_padding {
+                continue;
+            }
+
+            return Some(BulkMessage {
+                stream_position,
+                payload_len,
+                user_defined,
+                is_fin,
+                is_continuation,
+                is_heartbeat,
+                payload: &self.bytes[payload_start..payload_end],
+            });
+        }
+
+        None
+    }
+}
+
+#[inline]
+const unsafe fn read_bulk_header_unaligned(ptr: *const u8) -> (u32, u32) {
+    let fields = unsafe { read_unaligned(ptr as *const u32) };
+    let user_defined = unsafe { read_unaligned(ptr.add(size_of::<u32>()) as *const u32) };
+    (fields, user_defined)
+}
+
+#[inline]
+const unsafe fn read_bulk_header_aligned(ptr: *const u8) -> (u32, u32) {
+    let header = unsafe { &*(ptr as *const FrameHeader) };
+    (header.fields.get(), header.user_defined.get())
+}
+
+impl<'a> Iterator for BulkIter<'a, Unaligned> {
+    type Item = BulkMessage<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_impl(read_bulk_header_unaligned)
+    }
+}
+
+impl<'a> Iterator for BulkIter<'a, Aligned> {
+    type Item = BulkMessage<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_impl(read_bulk_header_aligned)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,6 +1126,326 @@ mod tests {
 
         assert_eq!(reader.index(), writer.index());
         assert_eq!(reader.position.get(), writer.position.get());
+    }
+
+    #[test]
+    fn should_read_bulk() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        let mut claim = writer.claim(5, true);
+        claim.get_buffer_mut().copy_from_slice(b"hello");
+        claim.commit();
+
+        let mut claim = writer.claim(5, true);
+        claim.get_buffer_mut().copy_from_slice(b"world");
+        claim.commit();
+
+        let bulk = reader.read_bulk().unwrap().unwrap();
+        assert_eq!(32, bulk.len());
+        assert_eq!(0, bulk.start_position());
+        assert_eq!(32, bulk.end_position());
+
+        let mut dst = vec![0_u8; bulk.len()];
+        assert_eq!(32, bulk.copy_into(&mut dst).unwrap());
+        assert_eq!(&bytes[HEADER_SIZE..HEADER_SIZE + 32], dst.as_slice());
+        assert_eq!(32, reader.position.get());
+    }
+
+    #[test]
+    fn should_iterate_bulk_messages() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        let mut claim = writer.claim_with_user_defined(5, true, 100);
+        claim.get_buffer_mut().copy_from_slice(b"hello");
+        claim.commit();
+
+        let mut claim = writer.heartbeat_with_payload_and_user_defined(5, 200);
+        claim.get_buffer_mut().copy_from_slice(b"world");
+        claim.commit();
+
+        let bulk = reader.read_bulk().unwrap().unwrap();
+        let start_position = bulk.start_position();
+        let mut dst = vec![0_u8; bulk.len()];
+        let len = bulk.copy_into(&mut dst).unwrap();
+
+        let mut iter = BulkIter::<Unaligned>::new(&dst[..len], start_position);
+
+        let first = iter.next().unwrap();
+        assert_eq!(0, first.stream_position);
+        assert_eq!(100, first.user_defined);
+        assert!(first.is_fin);
+        assert!(!first.is_continuation);
+        assert!(!first.is_heartbeat);
+        assert_eq!(b"hello", first.payload);
+
+        let second = iter.next().unwrap();
+        assert_eq!(16, second.stream_position);
+        assert_eq!(200, second.user_defined);
+        assert!(second.is_fin);
+        assert!(!second.is_continuation);
+        assert!(second.is_heartbeat);
+        assert_eq!(b"world", second.payload);
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn should_iterate_bulk_messages_with_aligned_policy() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        let mut claim = writer.claim_with_user_defined(5, true, 100);
+        claim.get_buffer_mut().copy_from_slice(b"hello");
+        claim.commit();
+
+        let mut claim = writer.heartbeat_with_payload_and_user_defined(5, 200);
+        claim.get_buffer_mut().copy_from_slice(b"world");
+        claim.commit();
+
+        let bulk = reader.read_bulk().unwrap().unwrap();
+        let start_position = bulk.start_position();
+        let mut dst = AlignedBytes::<32>::new();
+        let len = bulk.copy_into(&mut dst).unwrap();
+
+        let mut iter = BulkIter::<Aligned>::new(&dst[..len], start_position);
+
+        let first = iter.next().unwrap();
+        assert_eq!(0, first.stream_position);
+        assert_eq!(100, first.user_defined);
+        assert_eq!(b"hello", first.payload);
+
+        let second = iter.next().unwrap();
+        assert_eq!(16, second.stream_position);
+        assert_eq!(200, second.user_defined);
+        assert_eq!(b"world", second.payload);
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn should_iterate_bulk_messages_via_bulk() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        let mut claim = writer.claim_with_user_defined(5, true, 100);
+        claim.get_buffer_mut().copy_from_slice(b"hello");
+        claim.commit();
+
+        let mut claim = writer.heartbeat_with_payload_and_user_defined(5, 200);
+        claim.get_buffer_mut().copy_from_slice(b"world");
+        claim.commit();
+
+        let bulk = reader.read_bulk().unwrap().unwrap();
+        let mut dst = vec![0_u8; bulk.len()];
+        let mut iter = bulk.into_iter(&mut dst).unwrap();
+
+        let first = iter.next().unwrap();
+        assert_eq!(0, first.stream_position);
+        assert_eq!(100, first.user_defined);
+        assert_eq!(b"hello", first.payload);
+
+        let second = iter.next().unwrap();
+        assert_eq!(16, second.stream_position);
+        assert_eq!(200, second.user_defined);
+        assert_eq!(b"world", second.payload);
+
+        assert!(iter.next().is_none());
+        assert_eq!(32, reader.position.get());
+    }
+
+    #[test]
+    fn should_iterate_bulk_messages_via_bulk_with_aligned_policy() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        let mut claim = writer.claim_with_user_defined(5, true, 100);
+        claim.get_buffer_mut().copy_from_slice(b"hello");
+        claim.commit();
+
+        let mut claim = writer.heartbeat_with_payload_and_user_defined(5, 200);
+        claim.get_buffer_mut().copy_from_slice(b"world");
+        claim.commit();
+
+        let bulk = reader.read_bulk().unwrap().unwrap();
+        let mut dst = AlignedBytes::<32>::new();
+        let mut iter = bulk.into_iter_aligned(&mut dst).unwrap();
+
+        let first = iter.next().unwrap();
+        assert_eq!(0, first.stream_position);
+        assert_eq!(100, first.user_defined);
+        assert_eq!(b"hello", first.payload);
+
+        let second = iter.next().unwrap();
+        assert_eq!(16, second.stream_position);
+        assert_eq!(200, second.user_defined);
+        assert_eq!(b"world", second.payload);
+
+        assert!(iter.next().is_none());
+        assert_eq!(32, reader.position.get());
+    }
+
+    #[test]
+    fn should_skip_padding_frames_in_bulk_iter() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer_at(56);
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
+
+        let mut claim = writer.claim_with_user_defined(4, true, 300);
+        claim.get_buffer_mut().copy_from_slice(b"test");
+        claim.commit();
+
+        let bulk = reader.read_bulk().unwrap().unwrap();
+        let start_position = bulk.start_position();
+        let mut dst = vec![0_u8; bulk.len()];
+        let len = bulk.copy_into(&mut dst).unwrap();
+
+        let mut iter = BulkIter::<Unaligned>::new(&dst[..len], start_position);
+        let msg = iter.next().unwrap();
+        assert_eq!(64, msg.stream_position);
+        assert_eq!(300, msg.user_defined);
+        assert_eq!(b"test", msg.payload);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn should_read_wrapped_bulk() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer_at(56);
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
+
+        let claim = writer.claim(0, true);
+        claim.commit();
+
+        let mut claim = writer.claim(4, true);
+        claim.get_buffer_mut().copy_from_slice(b"test");
+        claim.commit();
+
+        let bulk = reader.read_bulk().unwrap().unwrap();
+        assert_eq!(24, bulk.len());
+
+        let mut dst = vec![0_u8; bulk.len()];
+        assert_eq!(24, bulk.copy_into(&mut dst).unwrap());
+
+        let mut expected = Vec::with_capacity(24);
+        expected.extend_from_slice(&bytes[HEADER_SIZE + 56..HEADER_SIZE + 64]);
+        expected.extend_from_slice(&bytes[HEADER_SIZE..HEADER_SIZE + 16]);
+
+        assert_eq!(expected, dst);
+        assert_eq!(16, reader.index());
+        assert_eq!(80, reader.position.get());
+    }
+
+    #[test]
+    fn should_overrun_read_bulk() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+
+        let bulk = reader.read_bulk().unwrap();
+        assert!(matches!(bulk, Err(Error::Overrun(0))));
+        assert_eq!(0, reader.position.get());
+    }
+
+    #[test]
+    fn should_allow_bulk_reader_to_recover_from_initial_overrun_after_reset() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        writer.claim_with_user_defined(1000, true, 100).commit();
+        assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
+
+        writer.claim_with_user_defined(1000, true, 101).commit();
+        writer.claim_with_user_defined(512, true, 102).commit();
+
+        let mut claim = writer.claim_with_user_defined(1000, true, 103);
+        thread_rng().fill(claim.get_buffer_mut());
+        claim.commit();
+
+        assert!(matches!(reader.read_bulk().unwrap(), Err(Error::Overrun(_))));
+
+        reader.reset();
+        assert!(reader.read_bulk().is_none());
+        assert_eq!(reader.position.get(), writer.position.get());
+
+        let start_position = writer.position.get();
+        writer.claim_with_user_defined(1000, true, 104).commit();
+
+        let bulk = reader.read_bulk().unwrap().unwrap();
+        assert_eq!(start_position, bulk.start_position());
+        assert_eq!(writer.position.get(), bulk.end_position());
+        let mut dst = vec![0_u8; bulk.len()];
+        assert_eq!(bulk.len(), bulk.copy_into(&mut dst).unwrap());
+        assert_eq!(writer.position.get(), reader.position.get());
+    }
+
+    #[test]
+    fn should_error_if_bulk_overruns_during_copy() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+
+        let bulk = reader.read_bulk().unwrap().unwrap();
+        let mut dst = vec![0_u8; bulk.len()];
+
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+
+        assert!(matches!(bulk.copy_into(&mut dst), Err(Error::Overrun(0))));
+        assert_eq!(0, reader.position.get());
+    }
+
+    #[test]
+    fn should_allow_bulk_reader_to_recover_from_copy_overrun_after_reset() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        writer.claim_with_user_defined(16, true, 100).commit();
+        writer.claim_with_user_defined(16, true, 101).commit();
+
+        let bulk = reader.read_bulk().unwrap().unwrap();
+        let mut dst = vec![0_u8; bulk.len()];
+
+        writer.claim_with_user_defined(16, true, 102).commit();
+        writer.claim_with_user_defined(16, true, 103).commit();
+        writer.claim_with_user_defined(16, true, 104).commit();
+        writer.claim_with_user_defined(16, true, 105).commit();
+
+        assert!(matches!(bulk.copy_into(&mut dst), Err(Error::Overrun(0))));
+        assert_eq!(0, reader.position.get());
+
+        reader.reset();
+        assert!(reader.read_bulk().is_none());
+        assert_eq!(reader.position.get(), writer.position.get());
+
+        let start_position = writer.position.get();
+        writer.claim_with_user_defined(16, true, 106).commit();
+
+        let bulk = reader.read_bulk().unwrap().unwrap();
+        assert_eq!(24, bulk.len());
+        assert_eq!(start_position, bulk.start_position());
+        assert_eq!(writer.position.get(), bulk.end_position());
+        let mut dst = vec![0_u8; bulk.len()];
+        assert_eq!(24, bulk.copy_into(&mut dst).unwrap());
+        assert_eq!(writer.position.get(), reader.position.get());
     }
 
     #[test]

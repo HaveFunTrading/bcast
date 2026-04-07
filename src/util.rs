@@ -1,5 +1,5 @@
-use std::ops::Deref;
-use std::ptr::slice_from_raw_parts;
+use std::ops::{Deref, DerefMut};
+use std::ptr::{slice_from_raw_parts, slice_from_raw_parts_mut};
 
 /// Wrapper over array of bytes that provides 128-byte alignment.
 /// ## Example
@@ -33,5 +33,12 @@ impl<const N: usize> Deref for AlignedBytes<N> {
     #[inline]
     fn deref(&self) -> &Self::Target {
         unsafe { &*slice_from_raw_parts(self.0.as_ptr(), N) }
+    }
+}
+
+impl<const N: usize> DerefMut for AlignedBytes<N> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *slice_from_raw_parts_mut(self.0.as_mut_ptr(), N) }
     }
 }

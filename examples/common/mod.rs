@@ -62,3 +62,60 @@ pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
         }
     }
 }
+
+/// Consume messages produced by the writer using the bulk API. It performs the same payload
+/// validation as `reader`, but copies the full bulk window first and then iterates over it
+/// off-ring.
+#[allow(dead_code)]
+pub fn bulk_reader(bytes: &[u8]) -> anyhow::Result<()> {
+    let reader = RingBuffer::new(bytes).into_reader();
+    let mut bulk_bytes = Vec::new();
+
+    loop {
+        #[cfg(debug_assertions)]
+        let mut count = 0;
+
+        if let Some(bulk) = reader.read_bulk() {
+            let bulk = match bulk {
+                Ok(bulk) => bulk,
+                Err(Error::Overrun(position)) => {
+                    println!("overrun for {} bytes, resetting reader", position);
+                    reader.reset();
+                    continue;
+                }
+                Err(e) => return Err(anyhow!(e)),
+            };
+
+            if bulk_bytes.len() < bulk.len() {
+                bulk_bytes.resize(bulk.len(), 0);
+            }
+
+            let iter = match bulk.into_iter(&mut bulk_bytes) {
+                Ok(iter) => iter,
+                Err(Error::Overrun(position)) => {
+                    println!("overrun for {} bytes, resetting reader", position);
+                    reader.reset();
+                    continue;
+                }
+                Err(e) => return Err(anyhow!(e)),
+            };
+
+            for msg in iter {
+                #[cfg(debug_assertions)]
+                {
+                    count += 1;
+                    assert!(msg.payload.iter().all(|b| *b == msg.user_defined as u8));
+                    println!("{}", String::from_utf8_lossy(msg.payload));
+                }
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            if count > 0 {
+                println!("batch_size: {}", count);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}

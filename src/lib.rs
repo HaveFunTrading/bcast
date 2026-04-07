@@ -621,11 +621,9 @@ impl Reader {
         if limit == 0 {
             return None;
         }
-        let position_snapshot = self.position.get();
         Some(Batch {
             reader: self,
             remaining: limit,
-            position_snapshot,
         })
     }
 
@@ -764,8 +762,7 @@ impl Message {
 /// Should be used in conjunction with `BatchIter` to allow iteration.
 pub struct Batch<'a> {
     reader: &'a Reader,
-    remaining: usize,         // remaining bytes to consume
-    position_snapshot: usize, // reader position snapshot
+    remaining: usize, // remaining bytes to consume
 }
 
 impl<'a> IntoIterator for Batch<'a> {
@@ -794,7 +791,7 @@ impl Batch<'_> {
             return None;
         }
         // update iterator with the number of bytes consumed
-        match self.reader.receive_next_impl(self.position_snapshot) {
+        match self.reader.receive_next_impl(self.reader.position.get()) {
             None => None,
             Some(Ok(msg)) => {
                 self.remaining -= get_aligned_size(msg.payload_len) + size_of::<FrameHeader>();
@@ -1472,5 +1469,82 @@ mod tests {
         writer.claim_with_user_defined(1000, true, 104).commit();
 
         assert_eq!(104, reader.receive_next().unwrap().unwrap().user_defined);
+    }
+
+    #[test]
+    fn should_allow_batch_reader_to_recover_from_overrun_when_position_wrapped_around() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        // First claim and read
+        writer.claim_with_user_defined(1000, true, 100).commit();
+        let mut iter = reader.read_batch().unwrap().into_iter();
+        assert_eq!(100, iter.next().unwrap().unwrap().user_defined);
+
+        // Last claim before wrap around
+        writer.claim_with_user_defined(1000, true, 101).commit();
+
+        // First claim after wrap around
+        writer.claim_with_user_defined(512, true, 102).commit();
+
+        // Overrun the reader and overwrite the header frame the reader will read
+        let mut claim = writer.claim_with_user_defined(1000, true, 103);
+        thread_rng().fill(claim.get_buffer_mut());
+        claim.commit();
+
+        let mut iter = reader.read_batch().unwrap().into_iter();
+        assert!(matches!(iter.next().unwrap().unwrap_err(), Error::Overrun(_)));
+
+        // Reset the reader and start over
+        reader.reset();
+        assert!(reader.read_batch().is_none());
+        assert_eq!(reader.position.get(), writer.position.get());
+
+        // Continue writing and reading through the batch API
+        writer.claim_with_user_defined(1000, true, 104).commit();
+
+        let mut iter = reader.read_batch().unwrap().into_iter();
+        assert_eq!(104, iter.next().unwrap().unwrap().user_defined);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn should_not_overrun_batch_when_reader_has_not_been_lapped() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        for i in 0..4_u32 {
+            writer.claim_with_user_defined(16, true, i).commit();
+        }
+
+        let mut batch = reader.read_batch().unwrap();
+        assert_eq!(0, batch.receive_next().unwrap().unwrap().user_defined);
+
+        writer.claim_with_user_defined(16, true, 100).commit();
+        writer.claim_with_user_defined(16, true, 101).commit();
+
+        // Reader has advanced by one frame, so message 1 should still be readable.
+        assert_eq!(1, batch.receive_next().unwrap().unwrap().user_defined);
+    }
+
+    #[test]
+    fn should_allow_receive_next_when_reader_has_not_been_lapped() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        for i in 0..4_u32 {
+            writer.claim_with_user_defined(16, true, i).commit();
+        }
+
+        assert_eq!(0, reader.receive_next().unwrap().unwrap().user_defined);
+
+        writer.claim_with_user_defined(16, true, 100).commit();
+        writer.claim_with_user_defined(16, true, 101).commit();
+
+        // This is the control case for the batch repro above.
+        assert_eq!(1, reader.receive_next().unwrap().unwrap().user_defined);
     }
 }

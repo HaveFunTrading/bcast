@@ -987,6 +987,30 @@ mod tests {
     }
 
     #[test]
+    fn should_not_extend_batch_when_new_messages_arrive() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        writer.claim_with_user_defined(0, true, 100).commit();
+        writer.claim_with_user_defined(0, true, 200).commit();
+
+        let mut iter = reader.read_batch().unwrap().into_iter();
+        assert_eq!(100, iter.next().unwrap().unwrap().user_defined);
+
+        writer.claim_with_user_defined(0, true, 300).commit();
+        writer.claim_with_user_defined(0, true, 400).commit();
+
+        assert_eq!(200, iter.next().unwrap().unwrap().user_defined);
+        assert!(iter.next().is_none());
+
+        let mut iter = reader.read_batch().unwrap().into_iter();
+        assert_eq!(300, iter.next().unwrap().unwrap().user_defined);
+        assert_eq!(400, iter.next().unwrap().unwrap().user_defined);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
     fn should_read_next_message() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();

@@ -605,6 +605,7 @@ impl Reader {
 
     /// Reset reader position to current producer position, for recovering from overrun.
     #[cold]
+    #[inline(never)]
     pub fn reset(&self) {
         let _ = self
             .position

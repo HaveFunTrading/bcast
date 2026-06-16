@@ -42,6 +42,13 @@ let bytes: &[u8] = ...;
 let reader = RingBuffer::new(bytes).into_reader();
 ```
 
+By default a late reader starts from the producer's current position. If you want to include the
+latest non-padding, non-heartbeat message that is still available in the ring window, attach with:
+
+```rust
+let reader = RingBuffer::new(bytes).into_reader_at_last_message();
+```
+
 The `Reader` is batch aware (it knows how far behind a producer it is) and provides an iterator over pending messages.
 
 ```rust

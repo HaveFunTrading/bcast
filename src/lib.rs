@@ -76,19 +76,34 @@ pub const METADATA_BUFFER_SIZE: usize = 1024;
 /// Null value for `user_defined` field.
 pub const USER_DEFINED_NULL_VALUE: u32 = 0;
 
+const HEADER_MAGIC: u32 = u32::from_le_bytes(*b"BCST");
+const HEADER_VERSION: u16 = 1;
+const NO_MESSAGE_POSITION: usize = usize::MAX;
+
 // mask to obtain message length from frame header
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x0FFFFFFF;
 // represents the max value we can encode on the frame header for the payload length
 const MAX_PAYLOAD_LEN: usize = (1 << 28) - 1;
+
+/// Fixed header preamble used to locate and validate the shared-memory format.
+#[derive(Debug)]
+#[repr(C)]
+struct HeaderPreamble {
+    magic: u32,
+    version: u16,
+    reserved: u16,
+}
 
 /// Ring buffer header that contains producer position. The position is expressed in bytes and
 /// will always increment.
 #[derive(Debug)]
 #[repr(C)]
 struct Header {
-    producer_position: CachePadded<AtomicUsize>, // will always increase
-    ready: CachePadded<AtomicBool>,              // indicates channel readiness
-    metadata: CachePadded<[u8; 1024]>,           // metadata buffer
+    preamble: CachePadded<HeaderPreamble>,           // fixed format bootstrap data
+    producer_position: CachePadded<AtomicUsize>,     // will always increase
+    ready: CachePadded<AtomicBool>,                  // indicates channel readiness
+    last_message_position: CachePadded<AtomicUsize>, // last non-padding, non-heartbeat message
+    metadata: CachePadded<[u8; 1024]>,               // metadata buffer
 }
 
 impl Header {
@@ -275,14 +290,35 @@ impl RingBuffer {
         unsafe { &mut *self.ptr.as_ptr() }
     }
 
+    #[inline]
+    fn initialise_header<F: FnOnce(&mut [u8])>(&self, position: usize, metadata: F) {
+        self.header().ready.store(false, Ordering::SeqCst);
+        metadata(self.header().metadata_mut());
+        self.header().preamble.magic = HEADER_MAGIC;
+        self.header().preamble.version = HEADER_VERSION;
+        self.header().preamble.reserved = 0;
+        self.header().producer_position.store(position, Ordering::SeqCst);
+        self.header()
+            .last_message_position
+            .store(NO_MESSAGE_POSITION, Ordering::SeqCst);
+        self.header().ready.store(true, Ordering::SeqCst);
+    }
+
+    #[inline]
+    fn wait_until_ready(&self) {
+        while !self.header().is_ready() {
+            hint::spin_loop();
+        }
+        let preamble = &*self.header().preamble;
+        assert_eq!(HEADER_MAGIC, preamble.magic, "invalid ring buffer header magic");
+        assert_eq!(HEADER_VERSION, preamble.version, "unsupported ring buffer header version");
+    }
+
     /// Will consume `self` and return instance of writer backed by this ring buffer. The writer
     /// will write from the beginning of the ring buffer. If you need to continue writing to the
     /// previous buffer use `RingBuffer::join_writer` instead.
     pub fn into_writer(self) -> Writer {
-        // will write from the start of the buffer
-        self.header().producer_position.store(0, Ordering::SeqCst);
-        // mark as initialised
-        self.header().ready.store(true, Ordering::SeqCst);
+        self.initialise_header(0, |_| {});
         Writer {
             ring: self,
             position: Cell::new(0),
@@ -292,7 +328,7 @@ impl RingBuffer {
     /// Will consume `self` and return instance of writer backed by this ring buffer. The writer
     /// will not reset current `producer_position` and will continue writing from that point.
     pub fn join_writer(self) -> Writer {
-        assert!(self.header().ready.load(Ordering::SeqCst), "unable to join buffer not marked as ready");
+        self.wait_until_ready();
         // read current position
         let position = self.header().producer_position.load(Ordering::SeqCst);
         Writer {
@@ -305,9 +341,7 @@ impl RingBuffer {
     /// initial position set to the provided value.
     pub fn into_writer_at(self, position: usize) -> Writer {
         assert_eq!(get_aligned_size(position), position, "position must be aligned");
-        self.header().producer_position.store(position, Ordering::SeqCst);
-        // mark as initialised after setting the position
-        self.header().ready.store(true, Ordering::SeqCst);
+        self.initialise_header(position, |_| {});
         Writer {
             ring: self,
             position: Cell::new(position),
@@ -317,22 +351,42 @@ impl RingBuffer {
     /// Will consume `self` and return instance of writer backed by this ring buffer. This
     /// method also accepts closure to populate `metadata` buffer.
     pub fn into_writer_with_metadata<F: FnOnce(&mut [u8])>(self, metadata: F) -> Writer {
-        // populate metadata
-        metadata(self.header().metadata_mut());
-        self.into_writer()
+        self.initialise_header(0, metadata);
+        Writer {
+            ring: self,
+            position: Cell::new(0),
+        }
     }
 
     /// Will consume `self` and return instance of reader backed by this ring buffer. The reader
     /// position will be set to producer most up-to-date position.
     pub fn into_reader(self) -> Reader {
-        // wait until buffer has been initialised
-        while !self.header().is_ready() {
-            hint::spin_loop();
-        }
+        self.wait_until_ready();
         let producer_position = self.header().producer_position.load(Ordering::SeqCst);
         Reader {
             ring: self,
             position: Cell::new(producer_position),
+        }
+    }
+
+    /// Will consume `self` and return instance of reader backed by this ring buffer. The reader
+    /// position will be set to the most recently observed non-padding, non-heartbeat message if
+    /// one is available in the current ring window, otherwise to the producer most up-to-date
+    /// position.
+    pub fn into_reader_at_last_message(self) -> Reader {
+        self.wait_until_ready();
+        let producer_position = self.header().producer_position.load(Ordering::Acquire);
+        let last_message_position = self.header().last_message_position.load(Ordering::Relaxed);
+        let position = if last_message_position == NO_MESSAGE_POSITION
+            || producer_position.wrapping_sub(last_message_position) > self.capacity
+        {
+            producer_position
+        } else {
+            last_message_position
+        };
+        Reader {
+            ring: self,
+            position: Cell::new(position),
         }
     }
 }
@@ -540,6 +594,8 @@ impl<'a> Claim<'a> {
 
     #[inline]
     fn commit_impl(&self) {
+        let frame_start = self.writer.position.get();
+
         // update frame header
         let header = self.writer.frame_header();
         let fields = pack_fields(self.fin, self.continuation, false, self.heartbeat, self.limit as u32);
@@ -553,6 +609,15 @@ impl<'a> Claim<'a> {
                 .get()
                 .wrapping_add(self.len + size_of::<FrameHeader>()),
         );
+
+        // store last message position if available
+        if !self.heartbeat {
+            self.writer
+                .ring
+                .header()
+                .last_message_position
+                .store(frame_start, Ordering::Relaxed);
+        }
 
         // signal updated producer position
         self.writer
@@ -1650,6 +1715,55 @@ mod tests {
     }
 
     #[test]
+    fn should_start_read_from_last_message_position() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+
+        writer.claim_with_user_defined(8, true, 100).commit();
+        writer.heartbeat_with_user_defined(200).commit();
+        writer.claim_with_user_defined(8, true, 300).commit();
+        writer.heartbeat_with_user_defined(400).commit();
+
+        let reader = RingBuffer::new(&bytes).into_reader_at_last_message();
+
+        assert_eq!(24, reader.position.get());
+        assert_eq!(300, reader.receive_next().unwrap().unwrap().user_defined);
+        let heartbeat = reader.receive_next().unwrap().unwrap();
+        assert!(heartbeat.is_heartbeat);
+        assert_eq!(400, heartbeat.user_defined);
+        assert!(reader.receive_next().is_none());
+    }
+
+    #[test]
+    fn should_start_read_from_producer_position_when_no_message_is_available() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+
+        writer.heartbeat_with_user_defined(100).commit();
+
+        let reader = RingBuffer::new(&bytes).into_reader_at_last_message();
+
+        assert_eq!(reader.position.get(), writer.position.get());
+        assert!(reader.receive_next().is_none());
+    }
+
+    #[test]
+    fn should_start_read_from_producer_position_when_last_message_is_overwritten() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+
+        writer.claim_with_user_defined(16, true, 100).commit();
+        for _ in 0..9 {
+            writer.heartbeat().commit();
+        }
+
+        let reader = RingBuffer::new(&bytes).into_reader_at_last_message();
+
+        assert_eq!(reader.position.get(), writer.position.get());
+        assert!(reader.receive_next().is_none());
+    }
+
+    #[test]
     fn should_pack_and_unpack_fields() {
         assert_eq!((true, true, true, true, 123), unpack_fields(pack_fields(true, true, true, true, 123)));
         assert_eq!((true, true, true, false, 123), unpack_fields(pack_fields(true, true, true, false, 123)));
@@ -1750,15 +1864,19 @@ mod tests {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 1024 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
 
+        let preamble_addr = addr_of!(writer.ring.header().preamble) as usize;
         let producer_position_addr = addr_of!(writer.ring.header().producer_position) as usize;
         let ready_addr = addr_of!(writer.ring.header().ready) as usize;
+        let last_message_position_addr = addr_of!(writer.ring.header().last_message_position) as usize;
         let metadata_addr = addr_of!(writer.ring.header().metadata) as usize;
         let data_addr = writer.ring.header().data_ptr() as usize;
 
         assert_eq!(METADATA_BUFFER_SIZE, data_addr - metadata_addr);
         // 128 for x86_64, 64 for x86
-        assert_eq!(align_of::<CachePadded<()>>(), metadata_addr - ready_addr);
+        assert_eq!(align_of::<CachePadded<()>>(), producer_position_addr - preamble_addr);
         assert_eq!(align_of::<CachePadded<()>>(), ready_addr - producer_position_addr);
+        assert_eq!(align_of::<CachePadded<()>>(), last_message_position_addr - ready_addr);
+        assert_eq!(align_of::<CachePadded<()>>(), metadata_addr - last_message_position_addr);
 
         let header_ptr = writer.ring.header() as *const Header;
         let data_ptr = writer.ring.header().data_ptr();
@@ -1771,12 +1889,16 @@ mod tests {
         assert_eq!(size_of::<FrameHeader>(), buf_ptr_0 as usize - data_ptr as usize);
         assert_eq!(16, claim.get_buffer().len());
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(1280, size_of::<Header>());
+        assert_eq!(1536, size_of::<Header>());
         #[cfg(target_arch = "x86")]
-        assert_eq!(1152, size_of::<Header>());
+        assert_eq!(1280, size_of::<Header>());
         assert_eq!(8, size_of::<FrameHeader>());
         assert_eq!(8, align_of::<FrameHeader>());
         assert_eq!(size_of::<Header>(), frame_ptr_0 as usize - bytes.as_ptr() as usize);
+        assert_eq!(8, size_of::<HeaderPreamble>());
+        assert_eq!(HEADER_MAGIC, writer.ring.header().preamble.magic);
+        assert_eq!(HEADER_VERSION, writer.ring.header().preamble.version);
+        assert_eq!(0, writer.ring.header().preamble.reserved);
 
         claim.commit();
 

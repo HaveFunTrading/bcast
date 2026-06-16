@@ -89,8 +89,7 @@ impl MappedWriter {
 /// Reader backed by memory mapped object.
 pub struct MappedReader {
     reader: Reader,
-    #[allow(dead_code)]
-    mmap: Mmap,
+    _mmap: Mmap,
 }
 
 impl Deref for MappedReader {
@@ -124,7 +123,7 @@ impl MappedReader {
         let bytes = mmap.as_ref();
         Ok(Self {
             reader: RingBuffer::new(bytes).into_reader(),
-            mmap,
+            _mmap: mmap,
         })
     }
 
@@ -135,7 +134,28 @@ impl MappedReader {
         let bytes = mmap.as_ref();
         Ok(Self {
             reader: RingBuffer::new(bytes).into_reader().with_initial_position(position),
-            mmap,
+            _mmap: mmap,
+        })
+    }
+
+    /// Construct reader backed by memory mapped file with initial position set to the most
+    /// recently observed non-padding, non-heartbeat message if one is available in the current
+    /// ring window, otherwise to the producer most recent position.
+    pub fn new_at_last_message(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        // wait until file has been initialised
+        loop {
+            let len = file.metadata()?.len() as usize;
+            if len > 0 {
+                break;
+            }
+            hint::spin_loop()
+        }
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let bytes = mmap.as_ref();
+        Ok(Self {
+            reader: RingBuffer::new(bytes).into_reader_at_last_message(),
+            _mmap: mmap,
         })
     }
 }
@@ -190,5 +210,21 @@ mod tests {
         assert_eq!(101, iter.next().unwrap().unwrap().user_defined);
         assert_eq!(102, iter.next().unwrap().unwrap().user_defined);
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn should_use_mapped_reader_at_last_message() {
+        const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024;
+
+        let file = NamedTempFile::new().unwrap();
+
+        let writer = MappedWriter::new(&file, RING_BUFFER_SIZE).unwrap();
+        writer.claim_with_user_defined(32, true, 100).commit();
+        writer.heartbeat_with_user_defined(200).commit();
+        writer.claim_with_user_defined(32, true, 300).commit();
+
+        let reader = MappedReader::new_at_last_message(&file).unwrap();
+        assert_eq!(300, reader.receive_next().unwrap().unwrap().user_defined);
+        assert!(reader.receive_next().is_none());
     }
 }

@@ -78,6 +78,7 @@ pub const USER_DEFINED_NULL_VALUE: u32 = 0;
 
 const HEADER_MAGIC: u32 = u32::from_le_bytes(*b"BCST");
 const HEADER_VERSION: u16 = 1;
+const HEADER_FLAG_TRACK_LAST_MESSAGE: u16 = 1 << 0;
 const NO_MESSAGE_POSITION: usize = usize::MAX;
 
 // mask to obtain message length from frame header
@@ -91,7 +92,7 @@ const MAX_PAYLOAD_LEN: usize = (1 << 28) - 1;
 struct HeaderPreamble {
     magic: u32,
     version: u16,
-    reserved: u16,
+    flags: u16,
 }
 
 /// Ring buffer header that contains producer position. The position is expressed in bytes and
@@ -268,6 +269,40 @@ pub struct RingBuffer {
     mtu: usize,
 }
 
+const fn noop_metadata(_: &mut [u8]) {}
+
+/// Configuration used to initialise a writer-backed channel.
+#[derive(Debug, Clone, Copy)]
+pub struct WriterConfig {
+    track_last_message: bool,
+    metadata: fn(&mut [u8]),
+}
+
+impl Default for WriterConfig {
+    fn default() -> Self {
+        Self {
+            track_last_message: false,
+            metadata: noop_metadata,
+        }
+    }
+}
+
+impl WriterConfig {
+    /// Enable or disable tracking the most recently published non-padding, non-heartbeat message.
+    #[inline]
+    pub const fn track_last_message(mut self, enabled: bool) -> Self {
+        self.track_last_message = enabled;
+        self
+    }
+
+    /// Set function used to populate the channel metadata buffer during initialisation.
+    #[inline]
+    pub const fn metadata(mut self, metadata: fn(&mut [u8])) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 impl RingBuffer {
     /// Create new `RingBuffer` by wrapping provided `bytes`. It is necessary to call `into_writer()`
     /// or `into_reader()` following the buffer construction to start using it.
@@ -291,17 +326,27 @@ impl RingBuffer {
     }
 
     #[inline]
-    fn initialise_header<F: FnOnce(&mut [u8])>(&self, position: usize, metadata: F) {
+    fn initialise_header<F: FnOnce(&mut [u8])>(&self, position: usize, flags: u16, metadata: F) {
         self.header().ready.store(false, Ordering::SeqCst);
         metadata(self.header().metadata_mut());
         self.header().preamble.magic = HEADER_MAGIC;
         self.header().preamble.version = HEADER_VERSION;
-        self.header().preamble.reserved = 0;
+        self.header().preamble.flags = flags;
         self.header().producer_position.store(position, Ordering::SeqCst);
         self.header()
             .last_message_position
             .store(NO_MESSAGE_POSITION, Ordering::SeqCst);
         self.header().ready.store(true, Ordering::SeqCst);
+    }
+
+    #[inline]
+    fn writer_from_position(self, position: usize) -> Writer {
+        let track_last_message = self.header().preamble.flags & HEADER_FLAG_TRACK_LAST_MESSAGE != 0;
+        Writer {
+            ring: self,
+            position: Cell::new(position),
+            track_last_message,
+        }
     }
 
     #[inline]
@@ -318,11 +363,19 @@ impl RingBuffer {
     /// will write from the beginning of the ring buffer. If you need to continue writing to the
     /// previous buffer use `RingBuffer::join_writer` instead.
     pub fn into_writer(self) -> Writer {
-        self.initialise_header(0, |_| {});
-        Writer {
-            ring: self,
-            position: Cell::new(0),
-        }
+        self.into_writer_with_cfg(|config| config)
+    }
+
+    /// Will consume `self` and return instance of writer backed by this ring buffer. The writer
+    /// will write from the beginning of the ring buffer using provided channel configuration.
+    pub fn into_writer_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(self, config: F) -> Writer {
+        let config = config(WriterConfig::default());
+        let flags = match config.track_last_message {
+            true => HEADER_FLAG_TRACK_LAST_MESSAGE,
+            false => 0,
+        };
+        self.initialise_header(0, flags, config.metadata);
+        self.writer_from_position(0)
     }
 
     /// Will consume `self` and return instance of writer backed by this ring buffer. The writer
@@ -331,31 +384,21 @@ impl RingBuffer {
         self.wait_until_ready();
         // read current position
         let position = self.header().producer_position.load(Ordering::SeqCst);
-        Writer {
-            ring: self,
-            position: Cell::new(position),
-        }
+        self.writer_from_position(position)
     }
 
     /// Will consume `self` and return instance of writer backed by this ring buffer, with the
-    /// initial position set to the provided value.
+    /// position set to the provided value. The ring buffer must already be initialised.
     pub fn into_writer_at(self, position: usize) -> Writer {
+        self.wait_until_ready();
         assert_eq!(get_aligned_size(position), position, "position must be aligned");
-        self.initialise_header(position, |_| {});
-        Writer {
-            ring: self,
-            position: Cell::new(position),
-        }
+        self.writer_from_position(position)
     }
 
     /// Will consume `self` and return instance of writer backed by this ring buffer. This
     /// method also accepts closure to populate `metadata` buffer.
-    pub fn into_writer_with_metadata<F: FnOnce(&mut [u8])>(self, metadata: F) -> Writer {
-        self.initialise_header(0, metadata);
-        Writer {
-            ring: self,
-            position: Cell::new(0),
-        }
+    pub fn into_writer_with_metadata(self, metadata: fn(&mut [u8])) -> Writer {
+        self.into_writer_with_cfg(|config| config.metadata(metadata))
     }
 
     /// Will consume `self` and return instance of reader backed by this ring buffer. The reader
@@ -396,6 +439,7 @@ impl RingBuffer {
 pub struct Writer {
     ring: RingBuffer,
     position: Cell<usize>, // local producer position
+    track_last_message: bool,
 }
 
 impl From<RingBuffer> for Writer {
@@ -610,8 +654,8 @@ impl<'a> Claim<'a> {
                 .wrapping_add(self.len + size_of::<FrameHeader>()),
         );
 
-        // store last message position if available
-        if !self.heartbeat {
+        // store last message position if tracking is enabled
+        if self.writer.track_last_message && !self.heartbeat {
             self.writer
                 .ring
                 .header()
@@ -1359,6 +1403,7 @@ mod tests {
     #[test]
     fn should_skip_padding_frames_in_bulk_iter() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let _ = RingBuffer::new(&bytes).into_writer();
         let writer = RingBuffer::new(&bytes).into_writer_at(56);
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
 
@@ -1382,6 +1427,7 @@ mod tests {
     #[test]
     fn should_read_wrapped_bulk() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let _ = RingBuffer::new(&bytes).into_writer();
         let writer = RingBuffer::new(&bytes).into_writer_at(56);
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
 
@@ -1426,8 +1472,11 @@ mod tests {
     #[test]
     fn should_allow_bulk_reader_to_recover_from_initial_overrun_after_reset() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
+        let _ = RingBuffer::new(&bytes).into_writer();
         let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
-        let reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes)
+            .into_reader()
+            .with_initial_position(usize::MAX - 2047);
 
         writer.claim_with_user_defined(1000, true, 100).commit();
         assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
@@ -1717,7 +1766,7 @@ mod tests {
     #[test]
     fn should_start_read_from_last_message_position() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.track_last_message(true));
 
         writer.claim_with_user_defined(8, true, 100).commit();
         writer.heartbeat_with_user_defined(200).commit();
@@ -1731,6 +1780,19 @@ mod tests {
         let heartbeat = reader.receive_next().unwrap().unwrap();
         assert!(heartbeat.is_heartbeat);
         assert_eq!(400, heartbeat.user_defined);
+        assert!(reader.receive_next().is_none());
+    }
+
+    #[test]
+    fn should_start_read_from_producer_position_when_last_message_tracking_is_disabled() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+
+        writer.claim_with_user_defined(8, true, 100).commit();
+
+        let reader = RingBuffer::new(&bytes).into_reader_at_last_message();
+
+        assert_eq!(reader.position.get(), writer.position.get());
         assert!(reader.receive_next().is_none());
     }
 
@@ -1898,7 +1960,7 @@ mod tests {
         assert_eq!(8, size_of::<HeaderPreamble>());
         assert_eq!(HEADER_MAGIC, writer.ring.header().preamble.magic);
         assert_eq!(HEADER_VERSION, writer.ring.header().preamble.version);
-        assert_eq!(0, writer.ring.header().preamble.reserved);
+        assert_eq!(0, writer.ring.header().preamble.flags);
 
         claim.commit();
 
@@ -2109,6 +2171,7 @@ mod tests {
     #[test]
     fn should_handle_position_wrap_around_if_no_overrun() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
+        let _ = RingBuffer::new(&bytes).into_writer();
         let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 1023);
         // last claim before wrap around
         writer.claim_with_user_defined(1000, true, 100).commit();
@@ -2134,8 +2197,11 @@ mod tests {
     #[test]
     fn should_allow_reader_to_recover_from_overrun_when_position_wrapped_around() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
+        let _ = RingBuffer::new(&bytes).into_writer();
         let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
-        let reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes)
+            .into_reader()
+            .with_initial_position(usize::MAX - 2047);
 
         // First claim and read
         writer.claim_with_user_defined(1000, true, 100).commit();
@@ -2167,8 +2233,11 @@ mod tests {
     #[test]
     fn should_allow_batch_reader_to_recover_from_overrun_when_position_wrapped_around() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
+        let _ = RingBuffer::new(&bytes).into_writer();
         let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
-        let reader = RingBuffer::new(&bytes).into_reader();
+        let reader = RingBuffer::new(&bytes)
+            .into_reader()
+            .with_initial_position(usize::MAX - 2047);
 
         // First claim and read
         writer.claim_with_user_defined(1000, true, 100).commit();

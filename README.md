@@ -42,10 +42,14 @@ let bytes: &[u8] = ...;
 let reader = RingBuffer::new(bytes).into_reader();
 ```
 
-By default a late reader starts from the producer's current position. If you want to include the
-latest non-padding, non-heartbeat message that is still available in the ring window, attach with:
+By default a late reader starts from the producer's current position. If the channel is configured
+to track the latest non-padding, non-heartbeat message, a reader can include that message when
+attaching:
 
 ```rust
+let writer = RingBuffer::new(bytes).into_writer_with_cfg(|config| {
+    config.track_last_message(true)
+});
 let reader = RingBuffer::new(bytes).into_reader_at_last_message();
 ```
 

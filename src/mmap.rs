@@ -1,6 +1,6 @@
 //! Provides wrappers for `Reader` and `Writer` to work with memory mapped files.
 
-use crate::{Reader, RingBuffer, Writer};
+use crate::{Reader, RingBuffer, Writer, WriterConfig};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use std::hint;
 use std::ops::{Deref, DerefMut};
@@ -32,6 +32,16 @@ impl MappedWriter {
     /// exists it will be removed. If you need to continue writing to existing file use
     /// [`MappedWriter::join`] instead.
     pub fn new(path: impl AsRef<Path>, size: usize) -> std::io::Result<Self> {
+        Self::new_with_cfg(path, size, |config| config)
+    }
+
+    /// Construct writer backed by memory mapped file of certain size using provided channel
+    /// configuration. If the file already exists it will be removed.
+    pub fn new_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(
+        path: impl AsRef<Path>,
+        size: usize,
+        config: F,
+    ) -> std::io::Result<Self> {
         if path.as_ref().exists() {
             std::fs::remove_file(path.as_ref())?;
         }
@@ -52,7 +62,7 @@ impl MappedWriter {
         let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
         let bytes = mmap.as_ref();
         Ok(Self {
-            writer: RingBuffer::new(bytes).into_writer(),
+            writer: RingBuffer::new(bytes).into_writer_with_cfg(config),
             mmap,
         })
     }
@@ -218,7 +228,8 @@ mod tests {
 
         let file = NamedTempFile::new().unwrap();
 
-        let writer = MappedWriter::new(&file, RING_BUFFER_SIZE).unwrap();
+        let writer =
+            MappedWriter::new_with_cfg(&file, RING_BUFFER_SIZE, |config| config.track_last_message(true)).unwrap();
         writer.claim_with_user_defined(32, true, 100).commit();
         writer.heartbeat_with_user_defined(200).commit();
         writer.claim_with_user_defined(32, true, 300).commit();

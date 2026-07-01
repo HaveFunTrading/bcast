@@ -1764,6 +1764,44 @@ mod tests {
     }
 
     #[test]
+    fn should_not_start_reader_at_retained_window_start_unless_it_is_a_frame_boundary() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 1024 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+
+        writer.claim(8, true).commit();
+
+        let mut claim = writer.claim_with_user_defined(16, true, 100);
+        claim.get_buffer_mut().fill(0);
+        claim.commit();
+
+        writer.claim_with_user_defined(504, true, 101).commit();
+        writer.claim(464, true).commit();
+        writer.claim_with_user_defined(16, true, 200).commit();
+
+        let retained_window_start = writer.position.get() - writer.ring.capacity;
+        assert_eq!(24, retained_window_start);
+        let first_valid_frame_position = 40;
+
+        let reader = RingBuffer::new(&bytes)
+            .into_reader()
+            .with_initial_position(retained_window_start);
+
+        let msg = reader.receive_next().unwrap().unwrap();
+        assert_eq!(retained_window_start, msg.stream_position);
+        assert_eq!(0, msg.payload_len);
+        assert_eq!(0, msg.user_defined);
+
+        let reader = RingBuffer::new(&bytes)
+            .into_reader()
+            .with_initial_position(first_valid_frame_position);
+
+        let msg = reader.receive_next().unwrap().unwrap();
+        assert_eq!(first_valid_frame_position, msg.stream_position);
+        assert_eq!(504, msg.payload_len);
+        assert_eq!(101, msg.user_defined);
+    }
+
+    #[test]
     fn should_start_read_from_last_message_position() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.track_last_message(true));

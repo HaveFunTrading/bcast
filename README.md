@@ -42,15 +42,11 @@ let bytes: &[u8] = ...;
 let reader = RingBuffer::new(bytes).into_reader();
 ```
 
-By default a late reader starts from the producer's current position. If the channel is configured
-to track the latest non-padding, non-heartbeat message, a reader can include that message when
-attaching:
+Late readers can also replay up to one lap of retained data from the most recent physical ring
+lap. The writer updates this marker only when a new frame starts at the beginning of the ring:
 
 ```rust
-let writer = RingBuffer::new(bytes).into_writer_with_cfg(|config| {
-    config.track_last_message(true)
-});
-let reader = RingBuffer::new(bytes).into_reader_at_last_message();
+let reader = RingBuffer::new(bytes).into_reader_at_last_lap();
 ```
 
 The `Reader` is batch aware (it knows how far behind a producer it is) and provides an iterator over pending messages.

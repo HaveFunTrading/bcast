@@ -326,7 +326,7 @@ impl RingBuffer {
     }
 
     #[inline]
-    fn initialise_header<F: FnOnce(&mut [u8])>(&self, position: usize, flags: u16, metadata: F) {
+    fn init_header<F: FnOnce(&mut [u8])>(&self, position: usize, flags: u16, metadata: F) {
         self.header().ready.store(false, Ordering::SeqCst);
         metadata(self.header().metadata_mut());
         self.header().preamble.magic = HEADER_MAGIC;
@@ -374,7 +374,7 @@ impl RingBuffer {
             true => HEADER_FLAG_TRACK_LAST_MESSAGE,
             false => 0,
         };
-        self.initialise_header(0, flags, config.metadata);
+        self.init_header(0, flags, config.metadata);
         self.writer_from_position(0)
     }
 

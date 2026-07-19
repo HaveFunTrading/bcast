@@ -70,11 +70,20 @@ impl MappedWriter {
     /// Construct writer backed by memory mapped file and continue writing from the most
     /// recent position. It assumes the file already exists.
     pub fn join(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        Self::join_with_cfg(path, |config| config)
+    }
+
+    /// Construct writer backed by memory mapped file using provided channel configuration and
+    /// continue writing from the most recent position. It assumes the file already exists.
+    pub fn join_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(
+        path: impl AsRef<Path>,
+        config: F,
+    ) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
         let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
         let bytes = mmap.as_ref();
         Ok(Self {
-            writer: RingBuffer::new(bytes).join_writer(),
+            writer: RingBuffer::new(bytes).join_writer_with_cfg(config),
             mmap,
         })
     }
@@ -83,15 +92,26 @@ impl MappedWriter {
     /// recent position if the file exists and is of the required size. Otherwise, it will delegate
     /// writer creation to [`MappedWriter::new`].
     pub fn join_or_create(path: impl AsRef<Path>, size: usize) -> std::io::Result<Self> {
+        Self::join_or_create_with_cfg(path, size, |config| config)
+    }
+
+    /// Construct writer backed by memory mapped file using provided channel configuration and
+    /// continue writing from the most recent position if the file exists and is of the required
+    /// size. Otherwise, it will delegate writer creation to [`MappedWriter::new_with_cfg`].
+    pub fn join_or_create_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(
+        path: impl AsRef<Path>,
+        size: usize,
+        config: F,
+    ) -> std::io::Result<Self> {
         match path.as_ref().exists() {
             true => {
                 let file_len = path.as_ref().metadata()?.len() as usize;
                 match file_len == size {
-                    true => Self::join(path),
-                    false => Self::new(path, size),
+                    true => Self::join_with_cfg(path, config),
+                    false => Self::new_with_cfg(path, size, config),
                 }
             }
-            false => Self::new(path, size),
+            false => Self::new_with_cfg(path, size, config),
         }
     }
 }

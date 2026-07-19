@@ -47,3 +47,8 @@ path = "benches/rtt.rs"
 name = "rx"
 harness = false
 path = "benches/rx.rs"
+
+[[bench]]
+name = "claim_reservation"
+harness = false
+path = "benches/claim_reservation.rs"

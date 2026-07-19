@@ -78,6 +78,7 @@ pub const USER_DEFINED_NULL_VALUE: u32 = 0;
 
 const HEADER_MAGIC: u32 = u32::from_le_bytes(*b"BCST");
 const HEADER_VERSION: u16 = 2;
+const MAX_CLAIM_RESERVE_PERCENT: u8 = 50;
 
 // mask to obtain message length from frame header
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x0FFFFFFF;
@@ -265,6 +266,28 @@ const fn is_overrun(position: usize, cursor: usize, capacity: usize) -> bool {
     cursor.wrapping_sub(position) > capacity
 }
 
+#[inline]
+const fn is_position_after(position: usize, base: usize) -> bool {
+    let distance = position.wrapping_sub(base);
+    distance != 0 && distance < usize::MAX / 2
+}
+
+#[inline]
+const fn is_position_at_or_after(position: usize, base: usize) -> bool {
+    position == base || is_position_after(position, base)
+}
+
+#[inline]
+fn claim_reserve_bytes(capacity: usize, percent: u8) -> usize {
+    if percent == 0 {
+        return 0;
+    }
+
+    let percent = percent as usize;
+    let bytes = (capacity / 100) * percent + ((capacity % 100) * percent).div_ceil(100);
+    bytes.next_power_of_two()
+}
+
 /// Single producer, many consumer (SPMC) ring buffer backed by shared memory.
 #[derive(Debug, Clone)]
 pub struct RingBuffer {
@@ -279,12 +302,14 @@ const fn noop_metadata(_: &mut [u8]) {}
 #[derive(Debug, Clone, Copy)]
 pub struct WriterConfig {
     metadata: fn(&mut [u8]),
+    claim_reserve_percent: u8,
 }
 
 impl Default for WriterConfig {
     fn default() -> Self {
         Self {
             metadata: noop_metadata,
+            claim_reserve_percent: 0,
         }
     }
 }
@@ -294,6 +319,19 @@ impl WriterConfig {
     #[inline]
     pub const fn metadata(mut self, metadata: fn(&mut [u8])) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Set how far ahead the writer may reserve the claimed-position cursor, as a percentage
+    /// of ring capacity. The computed byte reservation is rounded up to the next power of two.
+    ///
+    /// A non-zero value reduces the reader's effective retained window by up to the reserved
+    /// amount, but lets the writer avoid updating the shared claimed-position cursor on every claim.
+    /// The default is `0`.
+    #[inline]
+    pub const fn claim_reserve_percent(mut self, percent: u8) -> Self {
+        assert!(percent <= MAX_CLAIM_RESERVE_PERCENT, "claim reserve percent must be <= 50");
+        self.claim_reserve_percent = percent;
         self
     }
 }
@@ -334,9 +372,17 @@ impl RingBuffer {
     }
 
     #[inline]
-    fn writer_from_position(self, position: usize) -> Writer {
+    fn writer_from_position(self, position: usize, config: WriterConfig) -> Writer {
         let lap_count = self.header().lap_count.load(Ordering::Relaxed);
+        let header_claimed_position = self.header().claimed_position.load(Ordering::Acquire);
+        let claimed_limit = if is_position_at_or_after(header_claimed_position, position) {
+            header_claimed_position
+        } else {
+            position
+        };
         Writer {
+            claim_reserve: claim_reserve_bytes(self.capacity, config.claim_reserve_percent),
+            claimed_limit: Cell::new(claimed_limit),
             ring: self,
             position: Cell::new(position),
             lap_count: Cell::new(lap_count),
@@ -365,24 +411,44 @@ impl RingBuffer {
     pub fn into_writer_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(self, config: F) -> Writer {
         let config = config(WriterConfig::default());
         self.init_header(0, config.metadata);
-        self.writer_from_position(0)
+        self.writer_from_position(0, config)
     }
 
     /// Will consume `self` and return instance of writer backed by this ring buffer. The writer
     /// will not reset current `producer_position` and will continue writing from that point.
     pub fn join_writer(self) -> Writer {
+        self.join_writer_with_cfg(|config| config)
+    }
+
+    /// Will consume `self` and return instance of writer backed by this ring buffer using provided
+    /// channel configuration. The writer will not reset current `producer_position` and will
+    /// continue writing from that point.
+    pub fn join_writer_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(self, config: F) -> Writer {
         self.wait_until_ready();
+        let config = config(WriterConfig::default());
         // read current position
         let position = self.header().producer_position.load(Ordering::SeqCst);
-        self.writer_from_position(position)
+        self.writer_from_position(position, config)
     }
 
     /// Will consume `self` and return instance of writer backed by this ring buffer, with the
     /// position set to the provided value. The ring buffer must already be initialised.
     pub fn into_writer_at(self, position: usize) -> Writer {
+        self.into_writer_at_with_cfg(position, |config| config)
+    }
+
+    /// Will consume `self` and return instance of writer backed by this ring buffer using provided
+    /// channel configuration, with the position set to the provided value. The ring buffer must
+    /// already be initialised.
+    pub fn into_writer_at_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(
+        self,
+        position: usize,
+        config: F,
+    ) -> Writer {
         self.wait_until_ready();
+        let config = config(WriterConfig::default());
         assert_eq!(get_aligned_size(position), position, "position must be aligned");
-        self.writer_from_position(position)
+        self.writer_from_position(position, config)
     }
 
     /// Will consume `self` and return instance of writer backed by this ring buffer. This
@@ -396,9 +462,11 @@ impl RingBuffer {
     pub fn into_reader(self) -> Reader {
         self.wait_until_ready();
         let producer_position = self.header().producer_position.load(Ordering::SeqCst);
+        let claimed_position = self.header().claimed_position.load(Ordering::SeqCst);
         Reader {
             ring: self,
             position: Cell::new(producer_position),
+            claimed_position: Cell::new(claimed_position),
         }
     }
 
@@ -408,6 +476,7 @@ impl RingBuffer {
     pub fn into_reader_at_last_lap(self) -> Reader {
         self.wait_until_ready();
         let producer_position = self.header().producer_position.load(Ordering::Acquire);
+        let claimed_position = self.header().claimed_position.load(Ordering::Acquire);
         let lap_count = self.header().lap_count.load(Ordering::Relaxed);
         let lap_position = lap_count.wrapping_mul(self.capacity);
         let position = if producer_position.wrapping_sub(lap_position) <= self.capacity {
@@ -418,6 +487,7 @@ impl RingBuffer {
         Reader {
             ring: self,
             position: Cell::new(position),
+            claimed_position: Cell::new(claimed_position),
         }
     }
 }
@@ -425,6 +495,8 @@ impl RingBuffer {
 /// Wraps `RingBuffer` and allows to publish messages. Only single writer should be present at any time.
 #[derive(Debug)]
 pub struct Writer {
+    claim_reserve: usize,
+    claimed_limit: Cell<usize>,
     ring: RingBuffer,
     position: Cell<usize>, // local producer position
     lap_count: Cell<usize>,
@@ -542,6 +614,20 @@ impl Writer {
     }
 
     #[inline]
+    fn reserve_claimed_position(&self, claim_end: usize) {
+        if !is_position_after(claim_end, self.claimed_limit.get()) {
+            return;
+        }
+
+        let claimed_limit = claim_end.wrapping_add(self.claim_reserve);
+        self.claimed_limit.set(claimed_limit);
+        self.ring
+            .header()
+            .claimed_position
+            .store(claimed_limit, Ordering::Release);
+    }
+
+    #[inline]
     fn update_lap_count(&self, frame_start: usize) {
         if frame_start & (self.ring.capacity - 1) != 0 {
             return;
@@ -603,11 +689,7 @@ impl<'a> Claim<'a> {
         };
 
         // Publish the overwrite frontier before touching padding bytes or exposing payload memory.
-        writer
-            .ring
-            .header()
-            .claimed_position
-            .store(claim_end, Ordering::Release);
+        writer.reserve_claimed_position(claim_end);
 
         if frame_len > remaining {
             insert_padding_frame(writer, remaining);
@@ -716,6 +798,7 @@ impl Drop for Claim<'_> {
 pub struct Reader {
     ring: RingBuffer,
     position: Cell<usize>, // local position that will always increase
+    claimed_position: Cell<usize>,
 }
 
 impl Reader {
@@ -727,9 +810,11 @@ impl Reader {
     /// Set reader initial position (the default is producer current position).
     pub fn with_initial_position(self, position: usize) -> Self {
         assert_eq!(get_aligned_size(position), position, "position must be aligned");
+        let claimed_position = self.claimed_position.get();
         Self {
             ring: self.ring,
             position: Cell::new(position),
+            claimed_position: Cell::new(claimed_position),
         }
     }
 
@@ -749,9 +834,17 @@ impl Reader {
     #[cold]
     #[inline(never)]
     pub fn reset(&self) {
-        let _ = self
-            .position
-            .replace(self.ring.header().producer_position.load(Ordering::Acquire));
+        let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
+        let claimed_position = self.ring.header().claimed_position.load(Ordering::Acquire);
+        let _ = self.position.replace(producer_position);
+        self.claimed_position.set(claimed_position);
+    }
+
+    #[inline]
+    fn refresh_claimed_position(&self) -> usize {
+        let claimed_position = self.ring.header().claimed_position.load(Ordering::Acquire);
+        self.claimed_position.set(claimed_position);
+        claimed_position
     }
 
     /// Construct `Batch` object that can efficiently read multiple messages in a batch between
@@ -781,7 +874,7 @@ impl Reader {
         if len == 0 {
             return None;
         }
-        let claimed_position = self.ring.header().claimed_position.load(Ordering::Acquire);
+        let claimed_position = self.refresh_claimed_position();
         if len > self.ring.capacity || is_overrun(start_position, claimed_position, self.ring.capacity) {
             return Some(Err(Error::overrun(start_position)));
         }
@@ -813,7 +906,7 @@ impl Reader {
 
     #[inline]
     fn receive_next_impl(&self, reader_position: usize) -> Option<Result<Message>> {
-        let claimed_position_before = self.ring.header().claimed_position.load(Ordering::Acquire);
+        let claimed_position_before = self.claimed_position.get();
         if is_overrun(reader_position, claimed_position_before, self.ring.capacity) {
             return Some(Err(Error::overrun(reader_position)));
         }
@@ -822,7 +915,7 @@ impl Reader {
         let frame_header = self.as_frame_header();
         let (is_fin, is_continuation, is_padding, is_heartbeat, length) = frame_header.unpack_fields();
         let user_defined = frame_header.user_defined.get();
-        let claimed_position_after = self.ring.header().claimed_position.load(Ordering::Acquire);
+        let claimed_position_after = self.refresh_claimed_position();
 
         // ensure we have not been overrun by the writer
         // so the frame header is not overwritten and can be trusted
@@ -1042,7 +1135,7 @@ impl Bulk<'_> {
         let start_index = self.start_position & (self.reader.ring.capacity - 1);
         let first_len = min(self.len, self.reader.ring.capacity - start_index);
         let data_ptr = self.reader.ring.header().data_ptr();
-        let claimed_position_before = self.reader.ring.header().claimed_position.load(Ordering::Acquire);
+        let claimed_position_before = self.reader.claimed_position.get();
 
         if is_overrun(self.start_position, claimed_position_before, self.reader.ring.capacity) {
             return Err(Error::overrun(self.start_position));
@@ -1055,7 +1148,7 @@ impl Bulk<'_> {
             }
         }
 
-        let claimed_position_after = self.reader.ring.header().claimed_position.load(Ordering::Acquire);
+        let claimed_position_after = self.reader.refresh_claimed_position();
         if is_overrun(self.start_position, claimed_position_after, self.reader.ring.capacity) {
             return Err(Error::overrun(self.start_position));
         }
@@ -2085,6 +2178,63 @@ mod tests {
         assert_eq!(0, rb.header().claimed_position.load(SeqCst));
         assert_eq!(2097152, rb.capacity);
         assert_eq!(1048568, rb.mtu);
+    }
+
+    #[test]
+    fn should_calculate_claim_reserve_as_power_of_two_percentage() {
+        assert_eq!(0, claim_reserve_bytes(1024, 0));
+        assert_eq!(16, claim_reserve_bytes(1024, 1));
+        assert_eq!(256, claim_reserve_bytes(1024, 25));
+        assert_eq!(512, claim_reserve_bytes(1024, 50));
+        assert_eq!(1, claim_reserve_bytes(64, 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "claim reserve percent must be <= 50")]
+    fn should_reject_claim_reserve_percent_above_half_capacity() {
+        let _ = WriterConfig::default().claim_reserve_percent(51);
+    }
+
+    #[test]
+    fn should_reserve_claimed_position_in_configured_chunks() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 1024 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_percent(25));
+
+        assert_eq!(256, writer.claim_reserve);
+        assert_eq!(0, writer.claimed_limit.get());
+
+        writer.claim(16, true).commit();
+        assert_eq!(24, writer.position.get());
+        assert_eq!(24, writer.ring.header().producer_position.load(SeqCst));
+        assert_eq!(280, writer.claimed_limit.get());
+        assert_eq!(280, writer.ring.header().claimed_position.load(SeqCst));
+
+        for _ in 0..10 {
+            writer.claim(16, true).commit();
+        }
+
+        assert_eq!(264, writer.position.get());
+        assert_eq!(280, writer.claimed_limit.get());
+        assert_eq!(280, writer.ring.header().claimed_position.load(SeqCst));
+
+        writer.claim(16, true).commit();
+        assert_eq!(288, writer.position.get());
+        assert_eq!(544, writer.claimed_limit.get());
+        assert_eq!(544, writer.ring.header().claimed_position.load(SeqCst));
+    }
+
+    #[test]
+    fn should_allow_claim_reservation_to_reduce_readable_window() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_percent(25));
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        writer.claim(24, true).commit();
+        writer.claim(24, true).commit();
+
+        assert_eq!(64, writer.ring.header().producer_position.load(SeqCst));
+        assert_eq!(80, writer.ring.header().claimed_position.load(SeqCst));
+        assert!(matches!(reader.receive_next().unwrap().unwrap_err(), Error::Overrun(0)));
     }
 
     #[test]

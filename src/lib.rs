@@ -810,7 +810,12 @@ impl Reader {
     /// Set reader initial position (the default is producer current position).
     pub fn with_initial_position(self, position: usize) -> Self {
         assert_eq!(get_aligned_size(position), position, "position must be aligned");
-        let claimed_position = self.claimed_position.get();
+        let cached_claimed_position = self.claimed_position.get();
+        let claimed_position = if is_position_at_or_after(cached_claimed_position, position) {
+            cached_claimed_position
+        } else {
+            position
+        };
         Self {
             ring: self.ring,
             position: Cell::new(position),
@@ -906,9 +911,36 @@ impl Reader {
 
     #[inline]
     fn receive_next_impl(&self, reader_position: usize) -> Option<Result<Message>> {
+        let frame = match self.read_frame(reader_position) {
+            Ok(frame) => frame,
+            Err(err) => return Some(Err(err)),
+        };
+
+        // construct the message
+        let message = Message {
+            header: self.ring.header(),
+            stream_position: self.position.get(),
+            position: self.position.get().wrapping_add(size_of::<FrameHeader>()),
+            payload_len: frame.payload_len,
+            capacity: self.ring.capacity,
+            mtu: self.ring.mtu,
+            is_fin: frame.is_fin,
+            is_continuation: frame.is_continuation,
+            is_padding: frame.is_padding,
+            is_heartbeat: frame.is_heartbeat,
+            user_defined: frame.user_defined,
+        };
+
+        // update reader position
+        self.advance_position(message.payload_len);
+        Some(Ok(message))
+    }
+
+    #[inline]
+    fn read_frame(&self, reader_position: usize) -> Result<Frame> {
         let claimed_position_before = self.claimed_position.get();
         if is_overrun(reader_position, claimed_position_before, self.ring.capacity) {
-            return Some(Err(Error::overrun(reader_position)));
+            return Err(Error::overrun(reader_position));
         }
 
         // extract frame header fields
@@ -920,31 +952,144 @@ impl Reader {
         // ensure we have not been overrun by the writer
         // so the frame header is not overwritten and can be trusted
         if is_overrun(reader_position, claimed_position_after, self.ring.capacity) {
-            return Some(Err(Error::overrun(reader_position)));
+            return Err(Error::overrun(reader_position));
         }
 
-        // construct the massage
-        let message = Message {
-            header: self.ring.header(),
-            stream_position: self.position.get(),
-            position: self.position.get().wrapping_add(size_of::<FrameHeader>()),
+        Ok(Frame {
             payload_len: length as usize,
-            capacity: self.ring.capacity,
-            mtu: self.ring.mtu,
+            user_defined,
             is_fin,
             is_continuation,
             is_padding,
             is_heartbeat,
-            user_defined,
-        };
+        })
+    }
 
-        // update reader position
-        let aligned_payload_len = get_aligned_size(message.payload_len);
+    #[inline]
+    fn advance_position(&self, payload_len: usize) {
+        let aligned_payload_len = get_aligned_size(payload_len);
         let position = self.position.get();
         self.position
             .set(position.wrapping_add(aligned_payload_len + size_of::<FrameHeader>()));
-        Some(Ok(message))
     }
+
+    #[inline]
+    fn skip_frame(&self, frame: Frame) {
+        self.advance_position(frame.payload_len);
+    }
+
+    #[inline]
+    fn copy_frame_into<'a>(
+        &self,
+        reader_position: usize,
+        frame: Frame,
+        dst: &'a mut [u8],
+    ) -> Result<ReceivedMessage<'a>> {
+        if frame.payload_len > dst.len() {
+            return Err(Error::insufficient_buffer_size(dst.len(), frame.payload_len));
+        }
+
+        let payload_start = reader_position.wrapping_add(size_of::<FrameHeader>());
+        let payload_index = payload_start & (self.ring.capacity - 1);
+        debug_assert!(payload_index + frame.payload_len <= self.ring.capacity, "payload over shots ring buffer");
+
+        unsafe {
+            copy_nonoverlapping(self.ring.header().data_ptr().add(payload_index), dst.as_mut_ptr(), frame.payload_len);
+        }
+
+        let claimed_position_after = self.refresh_claimed_position();
+        if is_overrun(payload_start, claimed_position_after, self.ring.capacity) {
+            return Err(Error::overrun(payload_start));
+        }
+
+        self.advance_position(frame.payload_len);
+        Ok(ReceivedMessage {
+            stream_position: reader_position,
+            user_defined: frame.user_defined,
+            is_fin: frame.is_fin,
+            is_continuation: frame.is_continuation,
+            is_heartbeat: frame.is_heartbeat,
+            payload: &dst[..frame.payload_len],
+        })
+    }
+
+    /// Receive next pending message from the ring buffer, copying its payload into `dst`.
+    /// Padding frames are skipped internally.
+    #[inline]
+    pub fn receive_next_into<'a>(&self, dst: &'a mut [u8]) -> Option<Result<ReceivedMessage<'a>>> {
+        loop {
+            let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
+            // no new messages
+            if producer_position_before.wrapping_sub(self.position.get()) == 0 {
+                return None;
+            }
+
+            let reader_position = self.position.get();
+            let frame = match self.read_frame(reader_position) {
+                Ok(frame) => frame,
+                Err(err) => return Some(Err(err)),
+            };
+
+            if frame.is_padding {
+                self.advance_position(frame.payload_len);
+                continue;
+            }
+
+            return Some(self.copy_frame_into(reader_position, frame, dst));
+        }
+    }
+
+    /// Skip next pending non-padding message from the ring buffer.
+    #[inline]
+    pub fn skip_next(&self) -> Option<Result<()>> {
+        loop {
+            let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
+            // no new messages
+            if producer_position_before.wrapping_sub(self.position.get()) == 0 {
+                return None;
+            }
+
+            let frame = match self.read_frame(self.position.get()) {
+                Ok(frame) => frame,
+                Err(err) => return Some(Err(err)),
+            };
+
+            let is_padding = frame.is_padding;
+            self.skip_frame(frame);
+
+            if is_padding {
+                continue;
+            }
+
+            return Some(Ok(()));
+        }
+    }
+}
+
+struct Frame {
+    payload_len: usize,
+    user_defined: u32,
+    is_fin: bool,
+    is_continuation: bool,
+    is_padding: bool,
+    is_heartbeat: bool,
+}
+
+/// Message copied out of the ring into a caller-provided buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct ReceivedMessage<'a> {
+    /// Absolute position within stream. Marks beginning of message header.
+    pub stream_position: usize,
+    /// User defined field.
+    pub user_defined: u32,
+    /// Indicates final message fragment.
+    pub is_fin: bool,
+    /// Indicates continuation frame.
+    pub is_continuation: bool,
+    /// Indicates heartbeat frame.
+    pub is_heartbeat: bool,
+    /// Message payload copied into the caller-provided buffer.
+    pub payload: &'a [u8],
 }
 
 /// Contains coordinates to some payload at particular point in time. Messages are consumer in a
@@ -966,7 +1111,7 @@ pub struct Message {
     pub is_fin: bool,
     /// Indicates continuation frame
     pub is_continuation: bool,
-    /// Indicates padding frame.
+    /// Indic ates padding frame.
     pub is_padding: bool,
     /// Indicates heartbeat frame.
     pub is_heartbeat: bool,
@@ -1065,6 +1210,58 @@ impl Batch<'_> {
             }
             Some(Err(err)) => Some(Err(err)),
         }
+    }
+
+    /// Receive next non-padding message from the current batch, copying its payload into `dst`.
+    /// Returns an error if `dst` is too small or if the reader has been overrun.
+    #[inline]
+    pub fn receive_next_into<'a>(&mut self, dst: &'a mut [u8]) -> Option<Result<ReceivedMessage<'a>>> {
+        loop {
+            // we reached end of batch
+            if self.remaining == 0 {
+                return None;
+            }
+
+            let reader_position = self.reader.position.get();
+            let frame = match self.reader.read_frame(reader_position) {
+                Ok(frame) => frame,
+                Err(err) => return Some(Err(err)),
+            };
+            let frame_len = get_aligned_size(frame.payload_len) + size_of::<FrameHeader>();
+
+            if frame.is_padding {
+                self.remaining -= frame_len;
+                self.reader.advance_position(frame.payload_len);
+                continue;
+            }
+
+            return match self.reader.copy_frame_into(reader_position, frame, dst) {
+                Ok(msg) => {
+                    self.remaining -= frame_len;
+                    Some(Ok(msg))
+                }
+                Err(err) => Some(Err(err)),
+            };
+        }
+    }
+
+    /// Skip all remaining frames in this batch.
+    #[inline]
+    pub fn skip_remaining(self) -> Result<()> {
+        if self.remaining == 0 {
+            return Ok(());
+        }
+
+        let start_position = self.reader.position.get();
+        let claimed_position = self.reader.refresh_claimed_position();
+        if self.remaining > self.reader.ring.capacity
+            || is_overrun(start_position, claimed_position, self.reader.ring.capacity)
+        {
+            return Err(Error::overrun(start_position));
+        }
+
+        self.reader.position.set(start_position.wrapping_add(self.remaining));
+        Ok(())
     }
 }
 
@@ -1846,6 +2043,225 @@ mod tests {
     }
 
     #[test]
+    fn should_skip_next_message() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        writer.claim_with_user_defined(1, true, 100).commit();
+        writer.claim_with_user_defined(1, true, 200).commit();
+        writer.claim_with_user_defined(1, true, 300).commit();
+
+        assert_eq!(Some(Ok(())), reader.skip_next());
+
+        let msg = reader.receive_next().unwrap().unwrap();
+        assert_eq!(200, msg.user_defined);
+
+        assert_eq!(Some(Ok(())), reader.skip_next());
+        assert!(reader.skip_next().is_none());
+        assert!(reader.receive_next().is_none());
+    }
+
+    #[test]
+    fn should_skip_padding_when_skipping_next_message() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let _ = RingBuffer::new(&bytes).into_writer();
+        let writer = RingBuffer::new(&bytes).into_writer_at(56);
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
+
+        let mut claim = writer.claim_with_user_defined(4, true, 123);
+        claim.get_buffer_mut().copy_from_slice(b"test");
+        claim.commit();
+
+        assert_eq!(Some(Ok(())), reader.skip_next());
+        assert!(reader.skip_next().is_none());
+        assert_eq!(80, reader.position.get());
+    }
+
+    #[test]
+    fn should_receive_next_message_into_buffer() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        let mut claim = writer.claim_with_user_defined(5, true, 123);
+        claim.get_buffer_mut().copy_from_slice(b"hello");
+        claim.commit();
+
+        let mut payload = [0u8; 16];
+        {
+            let msg = reader.receive_next_into(&mut payload).unwrap().unwrap();
+            assert_eq!(0, msg.stream_position);
+            assert_eq!(123, msg.user_defined);
+            assert!(msg.is_fin);
+            assert!(!msg.is_continuation);
+            assert!(!msg.is_heartbeat);
+            assert_eq!(b"hello", msg.payload);
+        }
+        assert_eq!(16, reader.position.get());
+        assert!(reader.receive_next_into(&mut payload).is_none());
+    }
+
+    #[test]
+    fn should_return_error_if_receive_next_into_buffer_is_too_small() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        let mut claim = writer.claim(5, true);
+        claim.get_buffer_mut().copy_from_slice(b"hello");
+        claim.commit();
+
+        let mut too_small = [0u8; 4];
+        let err = reader.receive_next_into(&mut too_small).unwrap().unwrap_err();
+        assert_eq!(Error::InsufficientBufferSize(4, 5), err);
+        assert_eq!(0, reader.position.get());
+
+        let mut payload = [0u8; 5];
+        let msg = reader.receive_next_into(&mut payload).unwrap().unwrap();
+        assert_eq!(b"hello", msg.payload);
+        assert_eq!(16, reader.position.get());
+    }
+
+    #[test]
+    fn should_skip_padding_when_receiving_next_message_into_buffer() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let _ = RingBuffer::new(&bytes).into_writer();
+        let writer = RingBuffer::new(&bytes).into_writer_at(56);
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
+
+        let mut claim = writer.claim_with_user_defined(4, true, 123);
+        claim.get_buffer_mut().copy_from_slice(b"test");
+        claim.commit();
+
+        let mut payload = [0u8; 4];
+        {
+            let msg = reader.receive_next_into(&mut payload).unwrap().unwrap();
+            assert_eq!(64, msg.stream_position);
+            assert_eq!(123, msg.user_defined);
+            assert_eq!(b"test", msg.payload);
+        }
+        assert!(reader.receive_next_into(&mut payload).is_none());
+    }
+
+    #[test]
+    fn should_receive_batch_message_into_buffer() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        let mut claim = writer.claim_with_user_defined(5, true, 100);
+        claim.get_buffer_mut().copy_from_slice(b"hello");
+        claim.commit();
+
+        let mut claim = writer.claim_with_user_defined(5, true, 200);
+        claim.get_buffer_mut().copy_from_slice(b"world");
+        claim.commit();
+
+        let mut batch = reader.read_batch().unwrap();
+        let mut payload = [0u8; 16];
+
+        {
+            let msg = batch.receive_next_into(&mut payload).unwrap().unwrap();
+            assert_eq!(100, msg.user_defined);
+            assert_eq!(b"hello", msg.payload);
+        }
+
+        {
+            let msg = batch.receive_next_into(&mut payload).unwrap().unwrap();
+            assert_eq!(200, msg.user_defined);
+            assert_eq!(b"world", msg.payload);
+        }
+
+        assert!(batch.receive_next_into(&mut payload).is_none());
+        assert_eq!(32, reader.position.get());
+    }
+
+    #[test]
+    fn should_skip_padding_when_receiving_batch_message_into_buffer() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let _ = RingBuffer::new(&bytes).into_writer();
+        let writer = RingBuffer::new(&bytes).into_writer_at(56);
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
+
+        let mut claim = writer.claim_with_user_defined(4, true, 123);
+        claim.get_buffer_mut().copy_from_slice(b"test");
+        claim.commit();
+
+        let mut batch = reader.read_batch().unwrap();
+        let mut payload = [0u8; 4];
+        let msg = batch.receive_next_into(&mut payload).unwrap().unwrap();
+        assert_eq!(64, msg.stream_position);
+        assert_eq!(123, msg.user_defined);
+        assert_eq!(b"test", msg.payload);
+        assert!(batch.receive_next_into(&mut payload).is_none());
+        assert_eq!(80, reader.position.get());
+    }
+
+    #[test]
+    fn should_skip_remaining_batch() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        writer.claim_with_user_defined(1, true, 100).commit();
+        writer.claim_with_user_defined(1, true, 200).commit();
+        writer.claim_with_user_defined(1, true, 300).commit();
+
+        let batch = reader.read_batch().unwrap();
+        assert_eq!(48, batch.remaining());
+        batch.skip_remaining().unwrap();
+
+        assert_eq!(48, reader.position.get());
+        assert!(reader.receive_next().is_none());
+    }
+
+    #[test]
+    fn should_skip_remaining_after_partial_batch_read() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        writer.claim_with_user_defined(1, true, 100).commit();
+        writer.claim_with_user_defined(1, true, 200).commit();
+        writer.claim_with_user_defined(1, true, 300).commit();
+
+        let mut batch = reader.read_batch().unwrap();
+        let msg = batch.receive_next().unwrap().unwrap();
+        assert_eq!(100, msg.user_defined);
+        assert_eq!(32, batch.remaining());
+
+        batch.skip_remaining().unwrap();
+
+        assert_eq!(48, reader.position.get());
+        assert!(reader.receive_next().is_none());
+    }
+
+    #[test]
+    fn should_return_error_if_batch_receive_next_into_buffer_is_too_small() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        let mut claim = writer.claim(5, true);
+        claim.get_buffer_mut().copy_from_slice(b"hello");
+        claim.commit();
+
+        let mut batch = reader.read_batch().unwrap();
+        let mut too_small = [0u8; 4];
+        let err = batch.receive_next_into(&mut too_small).unwrap().unwrap_err();
+        assert_eq!(Error::InsufficientBufferSize(4, 5), err);
+        assert_eq!(0, reader.position.get());
+        assert_eq!(16, batch.remaining());
+
+        let mut payload = [0u8; 5];
+        let msg = batch.receive_next_into(&mut payload).unwrap().unwrap();
+        assert_eq!(b"hello", msg.payload);
+        assert_eq!(16, reader.position.get());
+        assert_eq!(0, batch.remaining());
+    }
+
+    #[test]
     fn should_overrun_reader() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
@@ -1858,6 +2274,22 @@ mod tests {
 
         let msg = reader.receive_next().unwrap();
         assert!(matches!(msg.unwrap_err(), Error::Overrun(_)));
+    }
+
+    #[test]
+    fn should_overrun_skip_next() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+
+        let err = reader.skip_next().unwrap().unwrap_err();
+        assert!(matches!(err, Error::Overrun(_)));
+        assert_eq!(0, reader.position.get());
     }
 
     #[test]
@@ -1874,6 +2306,23 @@ mod tests {
         let mut iter = reader.read_batch().unwrap().into_iter();
         let msg = iter.next().unwrap();
         assert!(matches!(msg.unwrap_err(), Error::Overrun(_)));
+    }
+
+    #[test]
+    fn should_overrun_batch_skip_remaining() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+        writer.claim(16, true).commit();
+
+        let batch = reader.read_batch().unwrap();
+        let err = batch.skip_remaining().unwrap_err();
+        assert!(matches!(err, Error::Overrun(_)));
+        assert_eq!(0, reader.position.get());
     }
 
     #[test]
@@ -2616,6 +3065,48 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+
+        outstanding.abort();
+    }
+
+    #[test]
+    fn should_not_receive_uncommitted_claim_into_buffer() {
+        const CAPACITY: usize = 64;
+        const PAYLOAD_LEN: usize = 24;
+
+        let bytes = AlignedBytes::<{ HEADER_SIZE + CAPACITY }>::new();
+
+        let ring = RingBuffer::new(&bytes);
+        let writer = ring.clone().into_writer();
+        let reader = ring.into_reader();
+
+        {
+            let mut claim = writer.claim(PAYLOAD_LEN, true);
+            claim.get_buffer_mut().fill(0x11);
+            claim.commit();
+        }
+
+        {
+            let mut claim = writer.claim(PAYLOAD_LEN, true);
+            claim.get_buffer_mut().fill(0x22);
+            claim.commit();
+        }
+
+        let mut outstanding = writer.claim(PAYLOAD_LEN, true);
+        outstanding.get_buffer_mut().fill(0xAA);
+
+        let mut payload = [0u8; PAYLOAD_LEN];
+        match reader.receive_next_into(&mut payload).unwrap() {
+            Err(_) => {
+                // Detecting an overrun before returning a message is acceptable.
+            }
+            Ok(msg) => {
+                assert_eq!(
+                    msg.payload, &[0x11; PAYLOAD_LEN],
+                    "reader returned payload bytes from an uncommitted claim"
+                );
             }
         }
 

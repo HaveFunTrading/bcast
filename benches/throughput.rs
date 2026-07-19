@@ -20,7 +20,7 @@ struct CaseResult {
 }
 
 fn main() {
-    println!("claim reservation benchmark");
+    println!("throughput benchmark");
     println!("ring capacity: {} bytes", CAPACITY);
     println!("message payload: {} bytes", MESSAGE_SIZE);
     println!("messages: {}", NUM_MESSAGES);
@@ -107,22 +107,16 @@ fn reader_loop(addr: usize, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> Rea
     barrier.wait();
 
     while !stop.load(Ordering::Acquire) {
-        let Some(batch) = reader.read_batch() else {
+        let Some(mut batch) = reader.read_batch() else {
             std::hint::spin_loop();
             continue;
         };
 
-        for msg in batch {
+        while let Some(msg) = batch.receive_next_into(&mut payload) {
             match msg {
                 Ok(msg) => {
-                    if msg.read(&mut payload).is_ok() {
-                        messages += 1;
-                        black_box(payload[0]);
-                    } else {
-                        overruns += 1;
-                        reader.reset();
-                        break;
-                    }
+                    messages += 1;
+                    black_box(msg.payload[0]);
                 }
                 Err(_) => {
                     overruns += 1;

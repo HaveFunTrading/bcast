@@ -49,6 +49,11 @@ harness = false
 path = "benches/rx.rs"
 
 [[bench]]
-name = "claim_reservation"
+name = "throughput"
 harness = false
-path = "benches/claim_reservation.rs"
+path = "benches/throughput.rs"
+
+[[bench]]
+name = "reader_api"
+harness = false
+path = "benches/reader_api.rs"

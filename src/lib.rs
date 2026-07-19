@@ -77,7 +77,7 @@ pub const METADATA_BUFFER_SIZE: usize = 1024;
 pub const USER_DEFINED_NULL_VALUE: u32 = 0;
 
 const HEADER_MAGIC: u32 = u32::from_le_bytes(*b"BCST");
-const HEADER_VERSION: u16 = 1;
+const HEADER_VERSION: u16 = 2;
 
 // mask to obtain message length from frame header
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x0FFFFFFF;
@@ -93,13 +93,13 @@ struct HeaderPreamble {
     _flags: u16, // reserved
 }
 
-/// Ring buffer header that contains producer position. The position is expressed in bytes and
-/// will always increment.
+/// Ring buffer header. Positions are expressed in bytes and will always increment.
 #[derive(Debug)]
 #[repr(C)]
 struct Header {
     preamble: CachePadded<HeaderPreamble>,       // fixed format bootstrap data
     producer_position: CachePadded<AtomicUsize>, // will always increase
+    claimed_position: CachePadded<AtomicUsize>,  // producer may have touched memory up to here
     ready: CachePadded<AtomicBool>,              // indicates channel readiness
     lap_count: CachePadded<AtomicUsize>,         // current physical ring lap
     metadata: CachePadded<[u8; 1024]>,           // metadata buffer
@@ -259,6 +259,12 @@ const fn get_aligned_size(payload_length: usize) -> usize {
     (payload_length + ALIGNMENT_MASK) & !ALIGNMENT_MASK
 }
 
+/// Return whether `cursor` has advanced far enough to make bytes at `position` unsafe to read.
+#[inline]
+const fn is_overrun(position: usize, cursor: usize, capacity: usize) -> bool {
+    cursor.wrapping_sub(position) > capacity
+}
+
 /// Single producer, many consumer (SPMC) ring buffer backed by shared memory.
 #[derive(Debug, Clone)]
 pub struct RingBuffer {
@@ -322,6 +328,7 @@ impl RingBuffer {
         self.header().preamble.version = HEADER_VERSION;
         self.header().preamble._flags = 0;
         self.header().producer_position.store(position, Ordering::SeqCst);
+        self.header().claimed_position.store(position, Ordering::SeqCst);
         self.header().lap_count.store(0, Ordering::SeqCst);
         self.header().ready.store(true, Ordering::SeqCst);
     }
@@ -436,7 +443,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub const fn claim(&self, len: usize, fin: bool) -> Claim<'_> {
+    pub fn claim(&self, len: usize, fin: bool) -> Claim<'_> {
         self.claim_with_user_defined(len, fin, USER_DEFINED_NULL_VALUE)
     }
 
@@ -447,7 +454,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub const fn claim_with_user_defined(&self, len: usize, fin: bool, user_defined: u32) -> Claim<'_> {
+    pub fn claim_with_user_defined(&self, len: usize, fin: bool, user_defined: u32) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, user_defined, fin, false, false)
@@ -459,7 +466,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub const fn continuation(&self, len: usize, fin: bool) -> Claim<'_> {
+    pub fn continuation(&self, len: usize, fin: bool) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, fin, true, false)
@@ -468,21 +475,21 @@ impl Writer {
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication (zero payload,
     /// no user defined field and no fragmentation). This operation will always succeed.
     #[inline]
-    pub const fn heartbeat(&self) -> Claim<'_> {
+    pub fn heartbeat(&self) -> Claim<'_> {
         Claim::new(self, 0, 0, USER_DEFINED_NULL_VALUE, true, false, true)
     }
 
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with user defined
     /// field (zero payload and no fragmentation). This operation will always succeed.
     #[inline]
-    pub const fn heartbeat_with_user_defined(&self, user_defined: u32) -> Claim<'_> {
+    pub fn heartbeat_with_user_defined(&self, user_defined: u32) -> Claim<'_> {
         Claim::new(self, 0, 0, user_defined, true, false, true)
     }
 
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with payload (no
     /// user defined field and no fragmentation). This operation will always succeed.
     #[inline]
-    pub const fn heartbeat_with_payload(&self, len: usize) -> Claim<'_> {
+    pub fn heartbeat_with_payload(&self, len: usize) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, true, false, true)
@@ -491,7 +498,7 @@ impl Writer {
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with payload and
     /// user defined field (no fragmentation). This operation will always succeed.
     #[inline]
-    pub const fn heartbeat_with_payload_and_user_defined(&self, len: usize, user_defined: u32) -> Claim<'_> {
+    pub fn heartbeat_with_payload_and_user_defined(&self, len: usize, user_defined: u32) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, user_defined, true, false, true)
@@ -527,6 +534,14 @@ impl Writer {
     }
 
     #[inline]
+    fn write_padding_frame(&self, padding_len: usize) {
+        let fields = pack_fields(true, false, true, false, padding_len as u32);
+        let header = self.frame_header();
+        let _ = header.fields.replace(fields);
+        let _ = header.user_defined.replace(USER_DEFINED_NULL_VALUE);
+    }
+
+    #[inline]
     fn update_lap_count(&self, frame_start: usize) {
         if frame_start & (self.ring.capacity - 1) != 0 {
             return;
@@ -543,20 +558,19 @@ impl Writer {
 /// Represents region of the `RingBuffer` we can publish message to.
 #[derive(Debug)]
 pub struct Claim<'a> {
-    writer: &'a Writer,       // underlying writer
-    position_snapshot: usize, // writer initial position
-    len: usize,               // frame header aligned payload length
-    limit: usize,             // actual payload length
-    user_defined: u32,        // user defined field
-    fin: bool,                // final message fragment
-    continuation: bool,       // continuation frame
-    heartbeat: bool,          // heartbeat frame
+    writer: &'a Writer, // underlying writer
+    len: usize,         // frame header aligned payload length
+    limit: usize,       // actual payload length
+    user_defined: u32,  // user defined field
+    fin: bool,          // final message fragment
+    continuation: bool, // continuation frame
+    heartbeat: bool,    // heartbeat frame
 }
 
 impl<'a> Claim<'a> {
     /// Create new claim.
     #[inline]
-    const fn new(
+    fn new(
         writer: &'a Writer,
         len: usize,
         limit: usize,
@@ -566,12 +580,9 @@ impl<'a> Claim<'a> {
         heartbeat: bool,
     ) -> Self {
         #[cold]
-        const fn insert_padding_frame(writer: &Writer, remaining: usize) {
+        fn insert_padding_frame(writer: &Writer, remaining: usize) {
             let padding_len = remaining - size_of::<FrameHeader>();
-            let fields = pack_fields(true, false, true, false, padding_len as u32);
-            let header = writer.frame_header();
-            let _ = header.fields.replace(fields);
-            let _ = header.user_defined.replace(USER_DEFINED_NULL_VALUE);
+            writer.write_padding_frame(padding_len);
             let _ = writer.position.replace(
                 writer
                     .position
@@ -580,17 +591,30 @@ impl<'a> Claim<'a> {
             );
         }
 
-        let position_snapshot = writer.position.get();
+        let position = writer.position.get();
+        let frame_len = len + size_of::<FrameHeader>();
 
         // insert padding frame if required
         let remaining = writer.remaining();
-        if len + size_of::<FrameHeader>() > remaining {
+        let claim_end = if frame_len > remaining {
+            position.wrapping_add(remaining).wrapping_add(frame_len)
+        } else {
+            position.wrapping_add(frame_len)
+        };
+
+        // Publish the overwrite frontier before touching padding bytes or exposing payload memory.
+        writer
+            .ring
+            .header()
+            .claimed_position
+            .store(claim_end, Ordering::Release);
+
+        if frame_len > remaining {
             insert_padding_frame(writer, remaining);
         };
 
         Self {
             writer,
-            position_snapshot,
             len,
             limit,
             user_defined,
@@ -614,12 +638,32 @@ impl<'a> Claim<'a> {
         unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, self.limit) }
     }
 
-    /// Abort the publication.
+    /// Abort the publication by committing the reserved frame as padding.
+    /// This consumes the claimed stream position and readers will skip it.
     #[inline]
-    pub const fn abort(self) {
-        // rollback to the initial position (in case padding frame was inserted)
-        let _ = self.writer.position.replace(self.position_snapshot);
-        let _ = ManuallyDrop::new(self);
+    pub fn abort(self) {
+        ManuallyDrop::new(self).abort_impl();
+    }
+
+    #[inline]
+    fn abort_impl(&self) {
+        let frame_start = self.writer.position.get();
+        self.writer.write_padding_frame(self.len);
+
+        let _ = self.writer.position.replace(
+            self.writer
+                .position
+                .get()
+                .wrapping_add(self.len + size_of::<FrameHeader>()),
+        );
+
+        self.writer.update_lap_count(frame_start);
+
+        self.writer
+            .ring
+            .header()
+            .producer_position
+            .store(self.writer.position.get(), Ordering::Release);
     }
 
     /// Commit the message thus making it visible to other consumers. If this operation is not
@@ -737,7 +781,8 @@ impl Reader {
         if len == 0 {
             return None;
         }
-        if len > self.ring.capacity {
+        let claimed_position = self.ring.header().claimed_position.load(Ordering::Acquire);
+        if len > self.ring.capacity || is_overrun(start_position, claimed_position, self.ring.capacity) {
             return Some(Err(Error::overrun(start_position)));
         }
         Some(Ok(Bulk {
@@ -751,30 +796,39 @@ impl Reader {
     /// Receive next pending message from the ring buffer.
     #[inline]
     pub fn receive_next(&self) -> Option<Result<Message>> {
-        let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
-        // no new messages
-        if producer_position_before.wrapping_sub(self.position.get()) == 0 {
-            return None;
-        }
-        // attempt to receive next frame
-        // if the frame is padding will skip it and attempt to return next frame
-        match self.receive_next_impl(self.position.get()) {
-            Some(msg) => match msg {
-                Ok(msg) if !msg.is_padding => Some(Ok(msg)),
-                Ok(_) => self.receive_next_impl(self.position.get()),
-                Err(err) => Some(Err(err)),
-            },
-            None => None,
+        loop {
+            let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
+            // no new messages
+            if producer_position_before.wrapping_sub(self.position.get()) == 0 {
+                return None;
+            }
+            // attempt to receive next frame
+            // if the frame is padding, skip it and re-check for committed data
+            match self.receive_next_impl(self.position.get()) {
+                Some(Ok(msg)) if msg.is_padding => continue,
+                msg => return msg,
+            }
         }
     }
 
     #[inline]
     fn receive_next_impl(&self, reader_position: usize) -> Option<Result<Message>> {
+        let claimed_position_before = self.ring.header().claimed_position.load(Ordering::Acquire);
+        if is_overrun(reader_position, claimed_position_before, self.ring.capacity) {
+            return Some(Err(Error::overrun(reader_position)));
+        }
+
         // extract frame header fields
         let frame_header = self.as_frame_header();
         let (is_fin, is_continuation, is_padding, is_heartbeat, length) = frame_header.unpack_fields();
         let user_defined = frame_header.user_defined.get();
-        let producer_position_after = self.ring.header().producer_position.load(Ordering::Acquire);
+        let claimed_position_after = self.ring.header().claimed_position.load(Ordering::Acquire);
+
+        // ensure we have not been overrun by the writer
+        // so the frame header is not overwritten and can be trusted
+        if is_overrun(reader_position, claimed_position_after, self.ring.capacity) {
+            return Some(Err(Error::overrun(reader_position)));
+        }
 
         // construct the massage
         let message = Message {
@@ -790,12 +844,6 @@ impl Reader {
             is_heartbeat,
             user_defined,
         };
-
-        // ensure we have not been overrun by the writer
-        // so the frame header is not overwritten and can be trusted
-        if producer_position_after.wrapping_sub(reader_position) > self.ring.capacity {
-            return Some(Err(Error::overrun(reader_position)));
-        }
 
         // update reader position
         let aligned_payload_len = get_aligned_size(message.payload_len);
@@ -864,14 +912,18 @@ impl Message {
         }
 
         // attempt to copy message data into provided buffer
-        let producer_position_before = self.position;
+        let claimed_position_before = self.header.claimed_position.load(Ordering::Acquire);
+        if is_overrun(self.position, claimed_position_before, self.capacity) {
+            return Err(Error::overrun(self.position));
+        }
+
         unsafe {
             copy_nonoverlapping(self.header.data_ptr().add(self.index()), buf.as_mut_ptr(), self.payload_len);
         }
-        let producer_position_after = self.header.producer_position.load(Ordering::Acquire);
+        let claimed_position_after = self.header.claimed_position.load(Ordering::Acquire);
 
         // ensure we have not been overrun by the producer
-        if producer_position_after.wrapping_sub(producer_position_before) > self.capacity {
+        if is_overrun(self.position, claimed_position_after, self.capacity) {
             return Err(Error::overrun(self.position));
         }
 
@@ -990,6 +1042,11 @@ impl Bulk<'_> {
         let start_index = self.start_position & (self.reader.ring.capacity - 1);
         let first_len = min(self.len, self.reader.ring.capacity - start_index);
         let data_ptr = self.reader.ring.header().data_ptr();
+        let claimed_position_before = self.reader.ring.header().claimed_position.load(Ordering::Acquire);
+
+        if is_overrun(self.start_position, claimed_position_before, self.reader.ring.capacity) {
+            return Err(Error::overrun(self.start_position));
+        }
 
         unsafe {
             copy_nonoverlapping(data_ptr.add(start_index), dst.as_mut_ptr(), first_len);
@@ -998,8 +1055,8 @@ impl Bulk<'_> {
             }
         }
 
-        let producer_position_after = self.reader.ring.header().producer_position.load(Ordering::Acquire);
-        if producer_position_after.wrapping_sub(self.start_position) > self.reader.ring.capacity {
+        let claimed_position_after = self.reader.ring.header().claimed_position.load(Ordering::Acquire);
+        if is_overrun(self.start_position, claimed_position_after, self.reader.ring.capacity) {
             return Err(Error::overrun(self.start_position));
         }
 
@@ -1962,6 +2019,7 @@ mod tests {
 
         let preamble_addr = addr_of!(writer.ring.header().preamble) as usize;
         let producer_position_addr = addr_of!(writer.ring.header().producer_position) as usize;
+        let claimed_position_addr = addr_of!(writer.ring.header().claimed_position) as usize;
         let ready_addr = addr_of!(writer.ring.header().ready) as usize;
         let lap_count_addr = addr_of!(writer.ring.header().lap_count) as usize;
         let metadata_addr = addr_of!(writer.ring.header().metadata) as usize;
@@ -1970,7 +2028,8 @@ mod tests {
         assert_eq!(METADATA_BUFFER_SIZE, data_addr - metadata_addr);
         // 128 for x86_64, 64 for x86
         assert_eq!(align_of::<CachePadded<()>>(), producer_position_addr - preamble_addr);
-        assert_eq!(align_of::<CachePadded<()>>(), ready_addr - producer_position_addr);
+        assert_eq!(align_of::<CachePadded<()>>(), claimed_position_addr - producer_position_addr);
+        assert_eq!(align_of::<CachePadded<()>>(), ready_addr - claimed_position_addr);
         assert_eq!(align_of::<CachePadded<()>>(), lap_count_addr - ready_addr);
         assert_eq!(align_of::<CachePadded<()>>(), metadata_addr - lap_count_addr);
 
@@ -1985,9 +2044,9 @@ mod tests {
         assert_eq!(size_of::<FrameHeader>(), buf_ptr_0 as usize - data_ptr as usize);
         assert_eq!(16, claim.get_buffer().len());
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(1536, size_of::<Header>());
+        assert_eq!(1664, size_of::<Header>());
         #[cfg(target_arch = "x86")]
-        assert_eq!(1280, size_of::<Header>());
+        assert_eq!(1344, size_of::<Header>());
         assert_eq!(8, size_of::<FrameHeader>());
         assert_eq!(8, align_of::<FrameHeader>());
         assert_eq!(size_of::<Header>(), frame_ptr_0 as usize - bytes.as_ptr() as usize);
@@ -2014,6 +2073,7 @@ mod tests {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let rb = RingBuffer::new(&bytes);
         assert_eq!(0, rb.header().producer_position.load(SeqCst));
+        assert_eq!(0, rb.header().claimed_position.load(SeqCst));
         assert_eq!(64, rb.capacity);
     }
 
@@ -2022,6 +2082,7 @@ mod tests {
         let bytes = avec![[128] | 0u8; HEADER_SIZE + (1024 * 1024 * 2)];
         let rb = RingBuffer::new(&bytes);
         assert_eq!(0, rb.header().producer_position.load(SeqCst));
+        assert_eq!(0, rb.header().claimed_position.load(SeqCst));
         assert_eq!(2097152, rb.capacity);
         assert_eq!(1048568, rb.mtu);
     }
@@ -2079,23 +2140,32 @@ mod tests {
     fn should_abort_publication() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
         assert_eq!(0, writer.position.get());
 
         let claim = writer.claim(16, true);
         claim.abort();
-        assert_eq!(0, writer.position.get());
+        assert_eq!(24, writer.position.get());
+        assert_eq!(24, writer.ring.header().producer_position.load(SeqCst));
+        assert_eq!(24, writer.ring.header().claimed_position.load(SeqCst));
+        assert!(reader.receive_next().is_none());
+        assert_eq!(24, reader.position.get());
 
         let claim = writer.claim(24, true);
         claim.commit();
-        assert_eq!(32, writer.position.get());
+        assert_eq!(56, writer.position.get());
+        assert_eq!(24, reader.receive_next().unwrap().unwrap().payload_len);
 
         let claim = writer.claim(8, true);
         claim.commit();
-        assert_eq!(48, writer.position.get());
+        assert_eq!(80, writer.position.get());
+        assert_eq!(8, reader.receive_next().unwrap().unwrap().payload_len);
 
         let claim = writer.claim(16, true);
         claim.abort();
-        assert_eq!(48, writer.position.get()); // wll rollback padding frame
+        assert_eq!(104, writer.position.get());
+        assert!(reader.receive_next().is_none());
+        assert_eq!(104, reader.position.get());
     }
 
     #[test]
@@ -2376,23 +2446,26 @@ mod tests {
         let mut outstanding = writer.claim(PAYLOAD_LEN, true);
         outstanding.get_buffer_mut().fill(0xAA);
 
-        // The old frame header is still present, so receive_next() identifies
-        // the first committed message.
-        let message = reader.receive_next().unwrap().unwrap();
-
-        let mut payload = [0u8; PAYLOAD_LEN];
-        match message.read(&mut payload) {
+        match reader.receive_next().unwrap() {
             Err(_) => {
-                // Detecting an overrun is acceptable.
+                // Detecting an overrun before returning a message is acceptable.
             }
-            Ok(len) => {
-                // Returning successfully is only acceptable if we got the
-                // previously committed payload, never the outstanding claim.
-                assert_eq!(
-                    &payload[..len],
-                    &[0x11; PAYLOAD_LEN],
-                    "reader returned payload bytes from an uncommitted claim"
-                );
+            Ok(message) => {
+                let mut payload = [0u8; PAYLOAD_LEN];
+                match message.read(&mut payload) {
+                    Err(_) => {
+                        // Detecting an overrun while copying is acceptable.
+                    }
+                    Ok(len) => {
+                        // Returning successfully is only acceptable if we got the
+                        // previously committed payload, never the outstanding claim.
+                        assert_eq!(
+                            &payload[..len],
+                            &[0x11; PAYLOAD_LEN],
+                            "reader returned payload bytes from an uncommitted claim"
+                        );
+                    }
+                }
             }
         }
 

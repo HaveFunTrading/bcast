@@ -2343,4 +2343,59 @@ mod tests {
         // This is the control case for the batch repro above.
         assert_eq!(1, reader.receive_next().unwrap().unwrap().user_defined);
     }
+
+    #[test]
+    fn should_not_return_uncommitted_claim_as_committed_payload() {
+        const CAPACITY: usize = 64;
+        const PAYLOAD_LEN: usize = 24;
+
+        let bytes = AlignedBytes::<{ HEADER_SIZE + CAPACITY }>::new();
+
+        let ring = RingBuffer::new(&bytes);
+        let writer = ring.clone().into_writer();
+        let reader = ring.into_reader();
+
+        // Each frame is 8-byte header + 24-byte payload = 32 bytes.
+        // Two frames fill one complete 64-byte ring lap.
+        {
+            let mut claim = writer.claim(PAYLOAD_LEN, true);
+            claim.get_buffer_mut().fill(0x11);
+            claim.commit();
+        }
+
+        {
+            let mut claim = writer.claim(PAYLOAD_LEN, true);
+            claim.get_buffer_mut().fill(0x22);
+            claim.commit();
+        }
+
+        // Producer position is now exactly one capacity ahead of reader.
+        //
+        // Claiming the next message reuses physical slot 0. Mutate its payload
+        // but deliberately leave the claim uncommitted.
+        let mut outstanding = writer.claim(PAYLOAD_LEN, true);
+        outstanding.get_buffer_mut().fill(0xAA);
+
+        // The old frame header is still present, so receive_next() identifies
+        // the first committed message.
+        let message = reader.receive_next().unwrap().unwrap();
+
+        let mut payload = [0u8; PAYLOAD_LEN];
+        match message.read(&mut payload) {
+            Err(_) => {
+                // Detecting an overrun is acceptable.
+            }
+            Ok(len) => {
+                // Returning successfully is only acceptable if we got the
+                // previously committed payload, never the outstanding claim.
+                assert_eq!(
+                    &payload[..len],
+                    &[0x11; PAYLOAD_LEN],
+                    "reader returned payload bytes from an uncommitted claim"
+                );
+            }
+        }
+
+        outstanding.abort();
+    }
 }

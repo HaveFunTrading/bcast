@@ -52,8 +52,3 @@ path = "benches/rx.rs"
 name = "throughput"
 harness = false
 path = "benches/throughput.rs"
-
-[[bench]]
-name = "reader_api"
-harness = false
-path = "benches/reader_api.rs"

@@ -20,28 +20,26 @@
 //! claim.get_buffer_mut().copy_from_slice(b"world");
 //! claim.commit();
 //! ```
-//! Create `Reader` and use `batch_iter` tp receive messages.
+//! Create `Reader` and use `read_batch` to receive messages.
 //! ```no_run
 //! use bcast::RingBuffer;
 //!
 //! // create reader
 //! let bytes = [0u8; 1024];
 //! let mut reader = RingBuffer::new(&bytes).into_reader();
-//! let mut iter = reader.read_batch().unwrap().into_iter();
+//! let mut batch = reader.read_batch().unwrap();
 //! let mut payload = [0u8; 1024];
 //!
 //! // read first message
-//! let msg = iter.next().unwrap().unwrap();
-//! let len = msg.read(&mut payload).unwrap();
-//! assert_eq!(b"hello", &payload[..len]);
+//! let msg = batch.receive_next(&mut payload).unwrap().unwrap();
+//! assert_eq!(b"hello", msg.payload);
 //!
 //! // read second message
-//! let msg = iter.next().unwrap().unwrap();
-//! let len = msg.read(&mut payload).unwrap();
-//! assert_eq!(b"world", &payload[..len]);
+//! let msg = batch.receive_next(&mut payload).unwrap().unwrap();
+//! assert_eq!(b"world", msg.payload);
 //!
 //! // no more messages
-//! assert!(iter.next().is_none())
+//! assert!(batch.receive_next(&mut payload).is_none())
 //! ```
 
 pub mod error;
@@ -466,6 +464,7 @@ impl RingBuffer {
         Reader {
             ring: self,
             position: Cell::new(producer_position),
+            producer_position: Cell::new(producer_position),
             claimed_position: Cell::new(claimed_position),
         }
     }
@@ -487,6 +486,7 @@ impl RingBuffer {
         Reader {
             ring: self,
             position: Cell::new(position),
+            producer_position: Cell::new(producer_position),
             claimed_position: Cell::new(claimed_position),
         }
     }
@@ -797,8 +797,9 @@ impl Drop for Claim<'_> {
 /// can be overrun by the producer if it's unable to keep up.
 pub struct Reader {
     ring: RingBuffer,
-    position: Cell<usize>, // local position that will always increase
-    claimed_position: Cell<usize>,
+    position: Cell<usize>,          // next stream position this reader will consume
+    producer_position: Cell<usize>, // cached committed/readable limit observed from producer
+    claimed_position: Cell<usize>,  // cached overwrite frontier observed from producer
 }
 
 impl Reader {
@@ -810,6 +811,12 @@ impl Reader {
     /// Set reader initial position (the default is producer current position).
     pub fn with_initial_position(self, position: usize) -> Self {
         assert_eq!(get_aligned_size(position), position, "position must be aligned");
+        let cached_producer_position = self.producer_position.get();
+        let producer_position = if is_position_at_or_after(cached_producer_position, position) {
+            cached_producer_position
+        } else {
+            position
+        };
         let cached_claimed_position = self.claimed_position.get();
         let claimed_position = if is_position_at_or_after(cached_claimed_position, position) {
             cached_claimed_position
@@ -819,6 +826,7 @@ impl Reader {
         Self {
             ring: self.ring,
             position: Cell::new(position),
+            producer_position: Cell::new(producer_position),
             claimed_position: Cell::new(claimed_position),
         }
     }
@@ -842,7 +850,32 @@ impl Reader {
         let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
         let claimed_position = self.ring.header().claimed_position.load(Ordering::Acquire);
         let _ = self.position.replace(producer_position);
+        self.producer_position.set(producer_position);
         self.claimed_position.set(claimed_position);
+    }
+
+    #[inline]
+    fn refresh_producer_position(&self) -> usize {
+        let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
+        self.producer_position.set(producer_position);
+        producer_position
+    }
+
+    #[inline]
+    fn readable_limit(&self) -> usize {
+        let reader_position = self.position.get();
+        let producer_position = self.producer_position.get();
+        if is_position_after(producer_position, reader_position) {
+            return producer_position;
+        }
+
+        let producer_position = self.refresh_producer_position();
+        if is_position_at_or_after(producer_position, reader_position) {
+            producer_position
+        } else {
+            self.producer_position.set(reader_position);
+            reader_position
+        }
     }
 
     #[inline]
@@ -853,11 +886,11 @@ impl Reader {
     }
 
     /// Construct `Batch` object that can efficiently read multiple messages in a batch between
-    /// `Reader` current position and prevailing producer position. Returns `None` if there is
+    /// `Reader` current position and last observed producer position. Returns `None` if there is
     /// no new data to read.
     #[inline]
     pub fn read_batch(&self) -> Option<Batch<'_>> {
-        let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
+        let producer_position = self.readable_limit();
         let limit = producer_position.wrapping_sub(self.position.get());
         if limit == 0 {
             return None;
@@ -869,12 +902,12 @@ impl Reader {
     }
 
     /// Construct `Bulk` object representing raw bytes between `Reader` current position and the
-    /// prevailing producer position. Returned bulk includes message frame headers and payload bytes
-    /// exactly as they appear in the ring buffer data section.
+    /// last observed producer position. Returned bulk includes message frame headers and payload
+    /// bytes exactly as they appear in the ring buffer data section.
     #[inline]
     pub fn read_bulk(&self) -> Option<Result<Bulk<'_>>> {
         let start_position = self.position.get();
-        let end_position = self.ring.header().producer_position.load(Ordering::Acquire);
+        let end_position = self.readable_limit();
         let len = end_position.wrapping_sub(start_position);
         if len == 0 {
             return None;
@@ -889,51 +922,6 @@ impl Reader {
             end_position,
             len,
         }))
-    }
-
-    /// Receive next pending message from the ring buffer.
-    #[inline]
-    pub fn receive_next(&self) -> Option<Result<Message>> {
-        loop {
-            let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
-            // no new messages
-            if producer_position_before.wrapping_sub(self.position.get()) == 0 {
-                return None;
-            }
-            // attempt to receive next frame
-            // if the frame is padding, skip it and re-check for committed data
-            match self.receive_next_impl(self.position.get()) {
-                Some(Ok(msg)) if msg.is_padding => continue,
-                msg => return msg,
-            }
-        }
-    }
-
-    #[inline]
-    fn receive_next_impl(&self, reader_position: usize) -> Option<Result<Message>> {
-        let frame = match self.read_frame(reader_position) {
-            Ok(frame) => frame,
-            Err(err) => return Some(Err(err)),
-        };
-
-        // construct the message
-        let message = Message {
-            header: self.ring.header(),
-            stream_position: self.position.get(),
-            position: self.position.get().wrapping_add(size_of::<FrameHeader>()),
-            payload_len: frame.payload_len,
-            capacity: self.ring.capacity,
-            mtu: self.ring.mtu,
-            is_fin: frame.is_fin,
-            is_continuation: frame.is_continuation,
-            is_padding: frame.is_padding,
-            is_heartbeat: frame.is_heartbeat,
-            user_defined: frame.user_defined,
-        };
-
-        // update reader position
-        self.advance_position(message.payload_len);
-        Some(Ok(message))
     }
 
     #[inline]
@@ -955,8 +943,10 @@ impl Reader {
             return Err(Error::overrun(reader_position));
         }
 
+        let payload_len = length as usize;
         Ok(Frame {
-            payload_len: length as usize,
+            payload_len,
+            frame_len: get_aligned_size(payload_len) + size_of::<FrameHeader>(),
             user_defined,
             is_fin,
             is_continuation,
@@ -966,25 +956,18 @@ impl Reader {
     }
 
     #[inline]
-    fn advance_position(&self, payload_len: usize) {
-        let aligned_payload_len = get_aligned_size(payload_len);
+    fn advance_position(&self, frame_len: usize) {
         let position = self.position.get();
-        self.position
-            .set(position.wrapping_add(aligned_payload_len + size_of::<FrameHeader>()));
+        self.position.set(position.wrapping_add(frame_len));
     }
 
     #[inline]
     fn skip_frame(&self, frame: Frame) {
-        self.advance_position(frame.payload_len);
+        self.advance_position(frame.frame_len);
     }
 
     #[inline]
-    fn copy_frame_into<'a>(
-        &self,
-        reader_position: usize,
-        frame: Frame,
-        dst: &'a mut [u8],
-    ) -> Result<ReceivedMessage<'a>> {
+    fn copy_frame_into<'a>(&self, reader_position: usize, frame: Frame, dst: &'a mut [u8]) -> Result<Message<'a>> {
         if frame.payload_len > dst.len() {
             return Err(Error::insufficient_buffer_size(dst.len(), frame.payload_len));
         }
@@ -1002,8 +985,8 @@ impl Reader {
             return Err(Error::overrun(payload_start));
         }
 
-        self.advance_position(frame.payload_len);
-        Ok(ReceivedMessage {
+        self.advance_position(frame.frame_len);
+        Ok(Message {
             stream_position: reader_position,
             user_defined: frame.user_defined,
             is_fin: frame.is_fin,
@@ -1016,9 +999,9 @@ impl Reader {
     /// Receive next pending message from the ring buffer, copying its payload into `dst`.
     /// Padding frames are skipped internally.
     #[inline]
-    pub fn receive_next_into<'a>(&self, dst: &'a mut [u8]) -> Option<Result<ReceivedMessage<'a>>> {
+    pub fn receive_next<'a>(&self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
         loop {
-            let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
+            let producer_position_before = self.readable_limit();
             // no new messages
             if producer_position_before.wrapping_sub(self.position.get()) == 0 {
                 return None;
@@ -1031,7 +1014,7 @@ impl Reader {
             };
 
             if frame.is_padding {
-                self.advance_position(frame.payload_len);
+                self.advance_position(frame.frame_len);
                 continue;
             }
 
@@ -1043,7 +1026,7 @@ impl Reader {
     #[inline]
     pub fn skip_next(&self) -> Option<Result<()>> {
         loop {
-            let producer_position_before = self.ring.header().producer_position.load(Ordering::Acquire);
+            let producer_position_before = self.readable_limit();
             // no new messages
             if producer_position_before.wrapping_sub(self.position.get()) == 0 {
                 return None;
@@ -1066,8 +1049,10 @@ impl Reader {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Frame {
     payload_len: usize,
+    frame_len: usize,
     user_defined: u32,
     is_fin: bool,
     is_continuation: bool,
@@ -1075,9 +1060,9 @@ struct Frame {
     is_heartbeat: bool,
 }
 
-/// Message copied out of the ring into a caller-provided buffer.
+/// Message payload and metadata parsed from caller-owned bytes.
 #[derive(Debug, Clone, Copy)]
-pub struct ReceivedMessage<'a> {
+pub struct Message<'a> {
     /// Absolute position within stream. Marks beginning of message header.
     pub stream_position: usize,
     /// User defined field.
@@ -1092,97 +1077,10 @@ pub struct ReceivedMessage<'a> {
     pub payload: &'a [u8],
 }
 
-/// Contains coordinates to some payload at particular point in time. Messages are consumer in a
-/// 'lazily' way that's why it's safe to `clone()` and pass them around. When message is read
-/// (consumed) it can result in overrun error if the producer has lapped around.
-#[derive(Debug, Clone)]
-pub struct Message {
-    header: &'static Header, // ring buffer header
-    capacity: usize,         // ring buffer capacity
-    mtu: usize,              // ring buffer mtu
-    position: usize,         // marks beginning of message payload
-    /// Absolute position within stream. Marks beginning of message header.
-    pub stream_position: usize,
-    /// Message length.
-    pub payload_len: usize,
-    /// User defined field.
-    pub user_defined: u32,
-    /// Indicates final message fragment.
-    pub is_fin: bool,
-    /// Indicates continuation frame
-    pub is_continuation: bool,
-    /// Indic ates padding frame.
-    pub is_padding: bool,
-    /// Indicates heartbeat frame.
-    pub is_heartbeat: bool,
-}
-
-impl Message {
-    /// Buffer index at which read will happen.
-    #[inline]
-    const fn index(&self) -> usize {
-        self.position & (self.capacity - 1)
-    }
-
-    /// Read the message into specified buffer. It will return error if the provided buffer
-    /// is too small. Will also return error if at any point the producer has overrun this consumer.
-    /// On success, it will return the number of bytes written to the buffer.
-    /// ## Examples
-    /// ```no_run
-    /// use bcast::Message;
-    ///
-    /// fn consume_message(msg: &Message) {
-    ///     let mut payload = [0u8; 1024];
-    ///     // read into provided buffer (error means overrun)
-    ///     let len = msg.read(&mut payload).unwrap();
-    ///     // process payload
-    ///     // ...
-    /// }
-    /// ```
-    #[inline]
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        debug_assert!(self.payload_len <= self.mtu, "payload size is greater than mtu");
-        debug_assert!(self.index() + self.payload_len <= self.capacity, "payload over shots ring buffer");
-
-        // ensure destination buffer is of sufficient size
-        if self.payload_len > buf.len() {
-            return Err(Error::insufficient_buffer_size(buf.len(), self.payload_len));
-        }
-
-        // attempt to copy message data into provided buffer
-        let claimed_position_before = self.header.claimed_position.load(Ordering::Acquire);
-        if is_overrun(self.position, claimed_position_before, self.capacity) {
-            return Err(Error::overrun(self.position));
-        }
-
-        unsafe {
-            copy_nonoverlapping(self.header.data_ptr().add(self.index()), buf.as_mut_ptr(), self.payload_len);
-        }
-        let claimed_position_after = self.header.claimed_position.load(Ordering::Acquire);
-
-        // ensure we have not been overrun by the producer
-        if is_overrun(self.position, claimed_position_after, self.capacity) {
-            return Err(Error::overrun(self.position));
-        }
-
-        Ok(self.payload_len)
-    }
-}
-
 /// Represents pending batch of messages between last observed producer position and the reader current position.
-/// Should be used in conjunction with `BatchIter` to allow iteration.
 pub struct Batch<'a> {
     reader: &'a Reader,
     remaining: usize, // remaining bytes to consume
-}
-
-impl<'a> IntoIterator for Batch<'a> {
-    type Item = <BatchIter<'a> as Iterator>::Item;
-    type IntoIter = BatchIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        BatchIter { batch: self }
-    }
 }
 
 impl Batch<'_> {
@@ -1192,30 +1090,10 @@ impl Batch<'_> {
         self.remaining
     }
 
-    /// Receive next message from the current batch or `None` if end of batch. This is a low level
-    /// method that will also return padding frames. Use `into_iter()` to work with more user-friendly
-    /// `BatchIter`.
-    #[inline]
-    pub fn receive_next(&mut self) -> Option<Result<Message>> {
-        // we reached end of batch
-        if self.remaining == 0 {
-            return None;
-        }
-        // update iterator with the number of bytes consumed
-        match self.reader.receive_next_impl(self.reader.position.get()) {
-            None => None,
-            Some(Ok(msg)) => {
-                self.remaining -= get_aligned_size(msg.payload_len) + size_of::<FrameHeader>();
-                Some(Ok(msg))
-            }
-            Some(Err(err)) => Some(Err(err)),
-        }
-    }
-
     /// Receive next non-padding message from the current batch, copying its payload into `dst`.
     /// Returns an error if `dst` is too small or if the reader has been overrun.
     #[inline]
-    pub fn receive_next_into<'a>(&mut self, dst: &'a mut [u8]) -> Option<Result<ReceivedMessage<'a>>> {
+    pub fn receive_next<'a>(&mut self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
         loop {
             // we reached end of batch
             if self.remaining == 0 {
@@ -1227,17 +1105,16 @@ impl Batch<'_> {
                 Ok(frame) => frame,
                 Err(err) => return Some(Err(err)),
             };
-            let frame_len = get_aligned_size(frame.payload_len) + size_of::<FrameHeader>();
 
             if frame.is_padding {
-                self.remaining -= frame_len;
-                self.reader.advance_position(frame.payload_len);
+                self.remaining -= frame.frame_len;
+                self.reader.advance_position(frame.frame_len);
                 continue;
             }
 
             return match self.reader.copy_frame_into(reader_position, frame, dst) {
                 Ok(msg) => {
-                    self.remaining -= frame_len;
+                    self.remaining -= frame.frame_len;
                     Some(Ok(msg))
                 }
                 Err(err) => Some(Err(err)),
@@ -1262,29 +1139,6 @@ impl Batch<'_> {
 
         self.reader.position.set(start_position.wrapping_add(self.remaining));
         Ok(())
-    }
-}
-
-/// Iterator that allows to process pending messages in a batch. This is more efficient than iterating
-/// over the messages using `receive_next()` on the `Reader` directly.
-pub struct BatchIter<'a> {
-    batch: Batch<'a>,
-}
-
-impl Iterator for BatchIter<'_> {
-    type Item = Result<Message>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // attempt to receive next frame
-        // if the frame is padding will skip it and attempt to return next frame
-        match self.batch.receive_next() {
-            None => None,
-            Some(msg) => match msg {
-                Ok(msg) if !msg.is_padding => Some(Ok(msg)),
-                Ok(_) => self.batch.receive_next(),
-                Err(err) => Some(Err(err)),
-            },
-        }
     }
 }
 
@@ -1378,24 +1232,6 @@ impl Bulk<'_> {
     }
 }
 
-/// Parsed message view produced from a raw bulk buffer.
-pub struct BulkMessage<'a> {
-    /// Absolute stream position within the original stream. Marks beginning of message header.
-    pub stream_position: usize,
-    /// Message length.
-    pub payload_len: usize,
-    /// User defined field.
-    pub user_defined: u32,
-    /// Indicates final message fragment.
-    pub is_fin: bool,
-    /// Indicates continuation frame.
-    pub is_continuation: bool,
-    /// Indicates heartbeat frame.
-    pub is_heartbeat: bool,
-    /// Message payload copied out of the ring buffer.
-    pub payload: &'a [u8],
-}
-
 /// Marker indicating raw bulk bytes may be unaligned and must be parsed with unaligned loads.
 pub struct Unaligned;
 
@@ -1425,7 +1261,7 @@ impl<'a, Policy> BulkIter<'a, Policy> {
 }
 
 impl<'a, Policy> BulkIter<'a, Policy> {
-    fn next_impl(&mut self, read_header: unsafe fn(*const u8) -> (u32, u32)) -> Option<BulkMessage<'a>> {
+    fn next_impl(&mut self, read_header: unsafe fn(*const u8) -> (u32, u32)) -> Option<Message<'a>> {
         while self.index < self.bytes.len() {
             let header_end = self.index + size_of::<FrameHeader>();
             if header_end > self.bytes.len() {
@@ -1452,9 +1288,8 @@ impl<'a, Policy> BulkIter<'a, Policy> {
                 continue;
             }
 
-            return Some(BulkMessage {
+            return Some(Message {
                 stream_position,
-                payload_len,
                 user_defined,
                 is_fin,
                 is_continuation,
@@ -1481,7 +1316,7 @@ const unsafe fn read_bulk_header_aligned(ptr: *const u8) -> (u32, u32) {
 }
 
 impl<'a> Iterator for BulkIter<'a, Unaligned> {
-    type Item = BulkMessage<'a>;
+    type Item = Message<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_impl(read_bulk_header_unaligned)
@@ -1489,7 +1324,7 @@ impl<'a> Iterator for BulkIter<'a, Unaligned> {
 }
 
 impl<'a> Iterator for BulkIter<'a, Aligned> {
-    type Item = BulkMessage<'a>;
+    type Item = Message<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_impl(read_bulk_header_aligned)
@@ -1506,6 +1341,41 @@ mod tests {
     use std::ptr::addr_of;
     use std::sync::atomic::Ordering::SeqCst;
 
+    fn receive_user_defined(reader: &Reader) -> u32 {
+        let mut payload = [0u8; 4096];
+        reader.receive_next(&mut payload).unwrap().unwrap().user_defined
+    }
+
+    fn receive_payload_len(reader: &Reader) -> usize {
+        let mut payload = [0u8; 4096];
+        reader.receive_next(&mut payload).unwrap().unwrap().payload.len()
+    }
+
+    fn receive_error(reader: &Reader) -> Error {
+        let mut payload = [0u8; 4096];
+        reader.receive_next(&mut payload).unwrap().unwrap_err()
+    }
+
+    fn assert_no_message(reader: &Reader) {
+        let mut payload = [0u8; 4096];
+        assert!(reader.receive_next(&mut payload).is_none());
+    }
+
+    fn receive_batch_user_defined(batch: &mut Batch<'_>) -> u32 {
+        let mut payload = [0u8; 4096];
+        batch.receive_next(&mut payload).unwrap().unwrap().user_defined
+    }
+
+    fn receive_batch_error(batch: &mut Batch<'_>) -> Error {
+        let mut payload = [0u8; 4096];
+        batch.receive_next(&mut payload).unwrap().unwrap_err()
+    }
+
+    fn assert_batch_empty(batch: &mut Batch<'_>) {
+        let mut payload = [0u8; 4096];
+        assert!(batch.receive_next(&mut payload).is_none());
+    }
+
     #[test]
     fn should_read_messages_in_batch() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
@@ -1520,28 +1390,23 @@ mod tests {
         claim.get_buffer_mut().copy_from_slice(b"world");
         claim.commit();
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
-
-        let msg = iter.next().unwrap().unwrap();
         let mut payload = [0u8; 1024];
-        msg.read(&mut payload).unwrap();
-        let payload = &payload[..msg.payload_len];
-        assert_eq!(payload, b"hello");
+        let mut batch = reader.read_batch().unwrap();
 
-        let msg = iter.next().unwrap().unwrap();
-        let mut payload = [0u8; 1024];
-        msg.read(&mut payload).unwrap();
-        let payload = &payload[..msg.payload_len];
-        assert_eq!(payload, b"world");
+        let msg = batch.receive_next(&mut payload).unwrap().unwrap();
+        assert_eq!(msg.payload, b"hello");
+
+        let msg = batch.receive_next(&mut payload).unwrap().unwrap();
+        assert_eq!(msg.payload, b"world");
 
         assert_eq!(32, writer.index());
         assert_eq!(32, writer.remaining());
-        assert_eq!(32, iter.batch.reader.index());
+        assert_eq!(32, reader.index());
 
-        assert!(iter.next().is_none());
+        assert_batch_empty(&mut batch);
 
-        assert_eq!(32, iter.batch.reader.index());
-        assert_eq!(32, iter.batch.reader.position.get());
+        assert_eq!(32, reader.index());
+        assert_eq!(32, reader.position.get());
         assert_eq!(32, writer.position.get());
         assert_eq!(32, writer.remaining());
 
@@ -1555,18 +1420,15 @@ mod tests {
         claim.get_buffer_mut().copy_from_slice(b"test");
         claim.commit();
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
+        let mut batch = reader.read_batch().unwrap();
 
         // skip big message
-        let _ = iter.next().unwrap().unwrap();
-        let msg = iter.next().unwrap().unwrap();
+        let _ = batch.receive_next(&mut payload).unwrap().unwrap();
+        let msg = batch.receive_next(&mut payload).unwrap().unwrap();
 
-        let mut payload = [0u8; 1024];
-        msg.read(&mut payload).unwrap();
-        let payload = &payload[..msg.payload_len];
-        assert_eq!(payload, b"test");
+        assert_eq!(msg.payload, b"test");
 
-        assert!(iter.next().is_none());
+        assert_batch_empty(&mut batch);
 
         assert_eq!(reader.index(), writer.index());
         assert_eq!(reader.position.get(), writer.position.get());
@@ -1814,7 +1676,7 @@ mod tests {
             .with_initial_position(usize::MAX - 2047);
 
         writer.claim_with_user_defined(1000, true, 100).commit();
-        assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(100, receive_user_defined(&reader));
 
         writer.claim_with_user_defined(1000, true, 101).commit();
         writer.claim_with_user_defined(512, true, 102).commit();
@@ -1915,28 +1777,74 @@ mod tests {
         claim.get_buffer_mut().copy_from_slice(b"c");
         claim.commit();
 
-        let mut iter = reader.read_batch().unwrap().into_iter().take(2);
-
-        let msg = iter.next().unwrap().unwrap();
         let mut payload = [0u8; 1];
-        msg.read(&mut payload).unwrap();
-        assert_eq!(b"a", &payload);
+        {
+            let mut batch = reader.read_batch().unwrap();
 
-        let msg = iter.next().unwrap().unwrap();
-        let mut payload = [0u8; 1];
-        msg.read(&mut payload).unwrap();
-        assert_eq!(b"b", &payload);
+            let msg = batch.receive_next(&mut payload).unwrap().unwrap();
+            assert_eq!(b"a", msg.payload);
 
-        assert!(iter.next().is_none());
+            let msg = batch.receive_next(&mut payload).unwrap().unwrap();
+            assert_eq!(b"b", msg.payload);
+        }
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
+        let mut batch = reader.read_batch().unwrap();
 
-        let msg = iter.next().unwrap().unwrap();
-        let mut payload = [0u8; 1];
-        msg.read(&mut payload).unwrap();
-        assert_eq!(b"c", &payload);
+        let msg = batch.receive_next(&mut payload).unwrap().unwrap();
+        assert_eq!(b"c", msg.payload);
 
-        assert!(iter.next().is_none());
+        assert_batch_empty(&mut batch);
+    }
+
+    #[test]
+    fn should_cache_producer_position_until_reader_catches_up() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+
+        writer.claim_with_user_defined(0, true, 100).commit();
+        writer.claim_with_user_defined(0, true, 200).commit();
+
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+        assert_eq!(16, reader.producer_position.get());
+
+        writer.claim_with_user_defined(0, true, 300).commit();
+        assert_eq!(24, writer.ring.header().producer_position.load(SeqCst));
+        assert_eq!(16, reader.producer_position.get());
+
+        assert_eq!(100, receive_user_defined(&reader));
+        assert_eq!(16, reader.producer_position.get());
+
+        assert_eq!(200, receive_user_defined(&reader));
+        assert_eq!(16, reader.producer_position.get());
+
+        assert_eq!(300, receive_user_defined(&reader));
+        assert_eq!(24, reader.producer_position.get());
+    }
+
+    #[test]
+    fn should_read_batch_from_cached_producer_position_until_reader_catches_up() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+
+        writer.claim_with_user_defined(0, true, 100).commit();
+        writer.claim_with_user_defined(0, true, 200).commit();
+
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        writer.claim_with_user_defined(0, true, 300).commit();
+
+        let mut batch = reader.read_batch().unwrap();
+        assert_eq!(16, batch.remaining());
+        assert_eq!(100, receive_batch_user_defined(&mut batch));
+        assert_eq!(200, receive_batch_user_defined(&mut batch));
+        assert_batch_empty(&mut batch);
+        assert_eq!(16, reader.producer_position.get());
+
+        let mut batch = reader.read_batch().unwrap();
+        assert_eq!(8, batch.remaining());
+        assert_eq!(300, receive_batch_user_defined(&mut batch));
+        assert_batch_empty(&mut batch);
+        assert_eq!(24, reader.producer_position.get());
     }
 
     #[test]
@@ -1950,15 +1858,15 @@ mod tests {
         writer.claim_with_user_defined(0, true, 300).commit();
         writer.claim_with_user_defined(0, true, 400).commit();
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
+        let mut batch = reader.read_batch().unwrap();
 
-        assert_eq!(100, iter.next().unwrap().unwrap().user_defined);
-        assert_eq!(200, iter.next().unwrap().unwrap().user_defined);
-        assert_eq!(300, iter.next().unwrap().unwrap().user_defined);
+        assert_eq!(100, receive_batch_user_defined(&mut batch));
+        assert_eq!(200, receive_batch_user_defined(&mut batch));
+        assert_eq!(300, receive_batch_user_defined(&mut batch));
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
-        assert_eq!(400, iter.next().unwrap().unwrap().user_defined);
-        assert!(iter.next().is_none());
+        let mut batch = reader.read_batch().unwrap();
+        assert_eq!(400, receive_batch_user_defined(&mut batch));
+        assert_batch_empty(&mut batch);
     }
 
     #[test]
@@ -1972,14 +1880,14 @@ mod tests {
         writer.claim_with_user_defined(0, true, 300).commit();
         writer.claim_with_user_defined(0, true, 400).commit();
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
+        let mut batch = reader.read_batch().unwrap();
 
-        assert_eq!(100, iter.next().unwrap().unwrap().user_defined);
-        assert_eq!(200, iter.next().unwrap().unwrap().user_defined);
-        assert_eq!(300, iter.next().unwrap().unwrap().user_defined);
+        assert_eq!(100, receive_batch_user_defined(&mut batch));
+        assert_eq!(200, receive_batch_user_defined(&mut batch));
+        assert_eq!(300, receive_batch_user_defined(&mut batch));
 
-        assert_eq!(400, reader.receive_next().unwrap().unwrap().user_defined);
-        assert!(reader.receive_next().is_none());
+        assert_eq!(400, receive_user_defined(&reader));
+        assert_no_message(&reader);
     }
 
     #[test]
@@ -1991,19 +1899,19 @@ mod tests {
         writer.claim_with_user_defined(0, true, 100).commit();
         writer.claim_with_user_defined(0, true, 200).commit();
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
-        assert_eq!(100, iter.next().unwrap().unwrap().user_defined);
+        let mut batch = reader.read_batch().unwrap();
+        assert_eq!(100, receive_batch_user_defined(&mut batch));
 
         writer.claim_with_user_defined(0, true, 300).commit();
         writer.claim_with_user_defined(0, true, 400).commit();
 
-        assert_eq!(200, iter.next().unwrap().unwrap().user_defined);
-        assert!(iter.next().is_none());
+        assert_eq!(200, receive_batch_user_defined(&mut batch));
+        assert_batch_empty(&mut batch);
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
-        assert_eq!(300, iter.next().unwrap().unwrap().user_defined);
-        assert_eq!(400, iter.next().unwrap().unwrap().user_defined);
-        assert!(iter.next().is_none());
+        let mut batch = reader.read_batch().unwrap();
+        assert_eq!(300, receive_batch_user_defined(&mut batch));
+        assert_eq!(400, receive_batch_user_defined(&mut batch));
+        assert_batch_empty(&mut batch);
     }
 
     #[test]
@@ -2024,22 +1932,17 @@ mod tests {
         claim.get_buffer_mut().copy_from_slice(b"c");
         claim.commit();
 
-        let msg = reader.receive_next().unwrap().unwrap();
         let mut payload = [0u8; 1];
-        msg.read(&mut payload).unwrap();
-        assert_eq!(b"a", &payload);
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+        assert_eq!(b"a", msg.payload);
 
-        let msg = reader.receive_next().unwrap().unwrap();
-        let mut payload = [0u8; 1];
-        msg.read(&mut payload).unwrap();
-        assert_eq!(b"b", &payload);
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+        assert_eq!(b"b", msg.payload);
 
-        let msg = reader.receive_next().unwrap().unwrap();
-        let mut payload = [0u8; 1];
-        msg.read(&mut payload).unwrap();
-        assert_eq!(b"c", &payload);
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+        assert_eq!(b"c", msg.payload);
 
-        assert!(reader.receive_next().is_none());
+        assert_no_message(&reader);
     }
 
     #[test]
@@ -2054,12 +1957,13 @@ mod tests {
 
         assert_eq!(Some(Ok(())), reader.skip_next());
 
-        let msg = reader.receive_next().unwrap().unwrap();
+        let mut payload = [0u8; 1];
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
         assert_eq!(200, msg.user_defined);
 
         assert_eq!(Some(Ok(())), reader.skip_next());
         assert!(reader.skip_next().is_none());
-        assert!(reader.receive_next().is_none());
+        assert_no_message(&reader);
     }
 
     #[test]
@@ -2090,7 +1994,7 @@ mod tests {
 
         let mut payload = [0u8; 16];
         {
-            let msg = reader.receive_next_into(&mut payload).unwrap().unwrap();
+            let msg = reader.receive_next(&mut payload).unwrap().unwrap();
             assert_eq!(0, msg.stream_position);
             assert_eq!(123, msg.user_defined);
             assert!(msg.is_fin);
@@ -2099,11 +2003,11 @@ mod tests {
             assert_eq!(b"hello", msg.payload);
         }
         assert_eq!(16, reader.position.get());
-        assert!(reader.receive_next_into(&mut payload).is_none());
+        assert!(reader.receive_next(&mut payload).is_none());
     }
 
     #[test]
-    fn should_return_error_if_receive_next_into_buffer_is_too_small() {
+    fn should_return_error_if_receive_next_buffer_is_too_small() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
@@ -2113,12 +2017,12 @@ mod tests {
         claim.commit();
 
         let mut too_small = [0u8; 4];
-        let err = reader.receive_next_into(&mut too_small).unwrap().unwrap_err();
+        let err = reader.receive_next(&mut too_small).unwrap().unwrap_err();
         assert_eq!(Error::InsufficientBufferSize(4, 5), err);
         assert_eq!(0, reader.position.get());
 
         let mut payload = [0u8; 5];
-        let msg = reader.receive_next_into(&mut payload).unwrap().unwrap();
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
         assert_eq!(b"hello", msg.payload);
         assert_eq!(16, reader.position.get());
     }
@@ -2136,12 +2040,12 @@ mod tests {
 
         let mut payload = [0u8; 4];
         {
-            let msg = reader.receive_next_into(&mut payload).unwrap().unwrap();
+            let msg = reader.receive_next(&mut payload).unwrap().unwrap();
             assert_eq!(64, msg.stream_position);
             assert_eq!(123, msg.user_defined);
             assert_eq!(b"test", msg.payload);
         }
-        assert!(reader.receive_next_into(&mut payload).is_none());
+        assert!(reader.receive_next(&mut payload).is_none());
     }
 
     #[test]
@@ -2162,18 +2066,18 @@ mod tests {
         let mut payload = [0u8; 16];
 
         {
-            let msg = batch.receive_next_into(&mut payload).unwrap().unwrap();
+            let msg = batch.receive_next(&mut payload).unwrap().unwrap();
             assert_eq!(100, msg.user_defined);
             assert_eq!(b"hello", msg.payload);
         }
 
         {
-            let msg = batch.receive_next_into(&mut payload).unwrap().unwrap();
+            let msg = batch.receive_next(&mut payload).unwrap().unwrap();
             assert_eq!(200, msg.user_defined);
             assert_eq!(b"world", msg.payload);
         }
 
-        assert!(batch.receive_next_into(&mut payload).is_none());
+        assert!(batch.receive_next(&mut payload).is_none());
         assert_eq!(32, reader.position.get());
     }
 
@@ -2190,11 +2094,11 @@ mod tests {
 
         let mut batch = reader.read_batch().unwrap();
         let mut payload = [0u8; 4];
-        let msg = batch.receive_next_into(&mut payload).unwrap().unwrap();
+        let msg = batch.receive_next(&mut payload).unwrap().unwrap();
         assert_eq!(64, msg.stream_position);
         assert_eq!(123, msg.user_defined);
         assert_eq!(b"test", msg.payload);
-        assert!(batch.receive_next_into(&mut payload).is_none());
+        assert!(batch.receive_next(&mut payload).is_none());
         assert_eq!(80, reader.position.get());
     }
 
@@ -2213,7 +2117,7 @@ mod tests {
         batch.skip_remaining().unwrap();
 
         assert_eq!(48, reader.position.get());
-        assert!(reader.receive_next().is_none());
+        assert_no_message(&reader);
     }
 
     #[test]
@@ -2227,18 +2131,19 @@ mod tests {
         writer.claim_with_user_defined(1, true, 300).commit();
 
         let mut batch = reader.read_batch().unwrap();
-        let msg = batch.receive_next().unwrap().unwrap();
+        let mut payload = [0u8; 1];
+        let msg = batch.receive_next(&mut payload).unwrap().unwrap();
         assert_eq!(100, msg.user_defined);
         assert_eq!(32, batch.remaining());
 
         batch.skip_remaining().unwrap();
 
         assert_eq!(48, reader.position.get());
-        assert!(reader.receive_next().is_none());
+        assert_no_message(&reader);
     }
 
     #[test]
-    fn should_return_error_if_batch_receive_next_into_buffer_is_too_small() {
+    fn should_return_error_if_batch_receive_next_buffer_is_too_small() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
@@ -2249,13 +2154,13 @@ mod tests {
 
         let mut batch = reader.read_batch().unwrap();
         let mut too_small = [0u8; 4];
-        let err = batch.receive_next_into(&mut too_small).unwrap().unwrap_err();
+        let err = batch.receive_next(&mut too_small).unwrap().unwrap_err();
         assert_eq!(Error::InsufficientBufferSize(4, 5), err);
         assert_eq!(0, reader.position.get());
         assert_eq!(16, batch.remaining());
 
         let mut payload = [0u8; 5];
-        let msg = batch.receive_next_into(&mut payload).unwrap().unwrap();
+        let msg = batch.receive_next(&mut payload).unwrap().unwrap();
         assert_eq!(b"hello", msg.payload);
         assert_eq!(16, reader.position.get());
         assert_eq!(0, batch.remaining());
@@ -2272,7 +2177,8 @@ mod tests {
         writer.claim(16, true).commit();
         writer.claim(16, true).commit();
 
-        let msg = reader.receive_next().unwrap();
+        let mut payload = [0u8; 16];
+        let msg = reader.receive_next(&mut payload).unwrap();
         assert!(matches!(msg.unwrap_err(), Error::Overrun(_)));
     }
 
@@ -2303,9 +2209,9 @@ mod tests {
         writer.claim(16, true).commit();
         writer.claim(16, true).commit();
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
-        let msg = iter.next().unwrap();
-        assert!(matches!(msg.unwrap_err(), Error::Overrun(_)));
+        let mut batch = reader.read_batch().unwrap();
+        let err = receive_batch_error(&mut batch);
+        assert!(matches!(err, Error::Overrun(_)));
     }
 
     #[test]
@@ -2373,18 +2279,19 @@ mod tests {
             .into_reader()
             .with_initial_position(retained_window_start);
 
-        let msg = reader.receive_next().unwrap().unwrap();
+        let mut payload = [0u8; 1024];
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
         assert_eq!(retained_window_start, msg.stream_position);
-        assert_eq!(0, msg.payload_len);
+        assert_eq!(0, msg.payload.len());
         assert_eq!(0, msg.user_defined);
 
         let reader = RingBuffer::new(&bytes)
             .into_reader()
             .with_initial_position(first_valid_frame_position);
 
-        let msg = reader.receive_next().unwrap().unwrap();
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
         assert_eq!(first_valid_frame_position, msg.stream_position);
-        assert_eq!(504, msg.payload_len);
+        assert_eq!(504, msg.payload.len());
         assert_eq!(101, msg.user_defined);
     }
 
@@ -2399,9 +2306,9 @@ mod tests {
         let reader = RingBuffer::new(&bytes).into_reader_at_last_lap();
 
         assert_eq!(0, reader.position.get());
-        assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
-        assert_eq!(101, reader.receive_next().unwrap().unwrap().user_defined);
-        assert!(reader.receive_next().is_none());
+        assert_eq!(100, receive_user_defined(&reader));
+        assert_eq!(101, receive_user_defined(&reader));
+        assert_no_message(&reader);
     }
 
     #[test]
@@ -2415,17 +2322,17 @@ mod tests {
         let reader = RingBuffer::new(&bytes).into_reader_at_last_lap();
 
         assert_eq!(0, reader.position.get());
-        assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
-        assert_eq!(101, reader.receive_next().unwrap().unwrap().user_defined);
-        assert!(reader.receive_next().is_none());
+        assert_eq!(100, receive_user_defined(&reader));
+        assert_eq!(101, receive_user_defined(&reader));
+        assert_no_message(&reader);
 
         writer.claim_with_user_defined(16, true, 102).commit();
 
         let reader = RingBuffer::new(&bytes).into_reader_at_last_lap();
 
         assert_eq!(128, reader.position.get());
-        assert_eq!(102, reader.receive_next().unwrap().unwrap().user_defined);
-        assert!(reader.receive_next().is_none());
+        assert_eq!(102, receive_user_defined(&reader));
+        assert_no_message(&reader);
     }
 
     #[test]
@@ -2440,8 +2347,8 @@ mod tests {
         let reader = RingBuffer::new(&bytes).into_reader_at_last_lap();
 
         assert_eq!(128, reader.position.get());
-        assert_eq!(102, reader.receive_next().unwrap().unwrap().user_defined);
-        assert!(reader.receive_next().is_none());
+        assert_eq!(102, receive_user_defined(&reader));
+        assert_no_message(&reader);
     }
 
     #[test]
@@ -2454,8 +2361,8 @@ mod tests {
         let reader = RingBuffer::new(&bytes).into_reader_at_last_lap();
 
         assert_eq!(0, reader.position.get());
-        assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
-        assert!(reader.receive_next().is_none());
+        assert_eq!(100, receive_user_defined(&reader));
+        assert_no_message(&reader);
     }
 
     #[test]
@@ -2683,7 +2590,7 @@ mod tests {
 
         assert_eq!(64, writer.ring.header().producer_position.load(SeqCst));
         assert_eq!(80, writer.ring.header().claimed_position.load(SeqCst));
-        assert!(matches!(reader.receive_next().unwrap().unwrap_err(), Error::Overrun(0)));
+        assert!(matches!(receive_error(&reader), Error::Overrun(0)));
     }
 
     #[test]
@@ -2696,14 +2603,10 @@ mod tests {
         claim.get_buffer_mut().copy_from_slice(b"hello world");
         claim.commit();
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
-        let msg = iter.next().unwrap().unwrap();
-
         let mut payload = vec![0u8; 1024];
-        unsafe { payload.set_len(msg.payload_len) };
-        msg.read(&mut payload).unwrap();
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
 
-        assert_eq!(payload, b"hello world");
+        assert_eq!(msg.payload, b"hello world");
     }
 
     #[test]
@@ -2715,8 +2618,7 @@ mod tests {
         let claim = writer.claim(0, true);
         claim.commit();
 
-        let msg = reader.receive_next().unwrap().unwrap();
-        assert_eq!(0, msg.payload_len);
+        assert_eq!(0, receive_payload_len(&reader));
     }
 
     #[test]
@@ -2728,11 +2630,11 @@ mod tests {
         let claim = writer.heartbeat();
         claim.commit();
 
-        let msg = reader.receive_next().unwrap().unwrap();
-        assert_eq!(0, msg.payload_len);
+        let mut payload = [0u8; 1];
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+        assert_eq!(0, msg.payload.len());
         assert!(msg.is_fin);
         assert!(!msg.is_continuation);
-        assert!(!msg.is_padding);
     }
 
     #[test]
@@ -2747,23 +2649,23 @@ mod tests {
         assert_eq!(24, writer.position.get());
         assert_eq!(24, writer.ring.header().producer_position.load(SeqCst));
         assert_eq!(24, writer.ring.header().claimed_position.load(SeqCst));
-        assert!(reader.receive_next().is_none());
+        assert_no_message(&reader);
         assert_eq!(24, reader.position.get());
 
         let claim = writer.claim(24, true);
         claim.commit();
         assert_eq!(56, writer.position.get());
-        assert_eq!(24, reader.receive_next().unwrap().unwrap().payload_len);
+        assert_eq!(24, receive_payload_len(&reader));
 
         let claim = writer.claim(8, true);
         claim.commit();
         assert_eq!(80, writer.position.get());
-        assert_eq!(8, reader.receive_next().unwrap().unwrap().payload_len);
+        assert_eq!(8, receive_payload_len(&reader));
 
         let claim = writer.claim(16, true);
         claim.abort();
         assert_eq!(104, writer.position.get());
-        assert!(reader.receive_next().is_none());
+        assert_no_message(&reader);
         assert_eq!(104, reader.position.get());
     }
 
@@ -2787,24 +2689,20 @@ mod tests {
 
         let claim = writer.claim_with_user_defined(24, true, 123);
         claim.commit();
-        let msg = reader.receive_next().unwrap().unwrap();
-        msg.read(&mut buffer).unwrap();
-        assert!(!msg.is_padding);
+        let msg = reader.receive_next(&mut buffer).unwrap().unwrap();
+        assert_eq!(123, msg.user_defined);
 
         let claim = writer.claim(8, true);
         claim.commit();
-        let msg = reader.receive_next().unwrap().unwrap();
-        msg.read(&mut buffer).unwrap();
-        assert!(!msg.is_padding);
+        let msg = reader.receive_next(&mut buffer).unwrap().unwrap();
+        assert_eq!(8, msg.payload.len());
 
         let claim = writer.claim(24, true);
         claim.commit();
-        let msg = reader.receive_next().unwrap().unwrap();
-        msg.read(&mut buffer).unwrap();
-        assert!(!msg.is_padding);
+        let msg = reader.receive_next(&mut buffer).unwrap().unwrap();
+        assert_eq!(24, msg.payload.len());
 
-        let msg = reader.receive_next();
-        assert!(msg.is_none())
+        assert!(reader.receive_next(&mut buffer).is_none())
     }
 
     #[test]
@@ -2815,30 +2713,27 @@ mod tests {
 
         let claim = writer.claim_with_user_defined(24, false, 123);
         claim.commit();
-        let msg = reader.receive_next().unwrap().unwrap();
+        let mut buffer = [0u8; 1024];
+        let msg = reader.receive_next(&mut buffer).unwrap().unwrap();
         assert!(!msg.is_fin);
         assert!(!msg.is_continuation);
-        assert!(!msg.is_padding);
         assert_eq!(123, msg.user_defined); // only attached to the first frame
 
         let claim = writer.continuation(8, false);
         claim.commit();
-        let msg = reader.receive_next().unwrap().unwrap();
+        let msg = reader.receive_next(&mut buffer).unwrap().unwrap();
         assert!(!msg.is_fin);
         assert!(msg.is_continuation);
-        assert!(!msg.is_padding);
         assert_eq!(USER_DEFINED_NULL_VALUE, msg.user_defined);
 
         let claim = writer.continuation(24, true);
         claim.commit();
-        let msg = reader.receive_next().unwrap().unwrap();
+        let msg = reader.receive_next(&mut buffer).unwrap().unwrap();
         assert!(msg.is_fin);
         assert!(msg.is_continuation);
-        assert!(!msg.is_padding);
         assert_eq!(USER_DEFINED_NULL_VALUE, msg.user_defined);
 
-        let msg = reader.receive_next();
-        assert!(msg.is_none())
+        assert!(reader.receive_next(&mut buffer).is_none())
     }
 
     #[test]
@@ -2863,12 +2758,12 @@ mod tests {
 
         // verify we got all the messages
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
-        assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
-        assert_eq!(101, reader.receive_next().unwrap().unwrap().user_defined);
-        assert_eq!(102, reader.receive_next().unwrap().unwrap().user_defined);
-        assert_eq!(103, reader.receive_next().unwrap().unwrap().user_defined);
-        assert_eq!(104, reader.receive_next().unwrap().unwrap().user_defined);
-        assert_eq!(105, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(100, receive_user_defined(&reader));
+        assert_eq!(101, receive_user_defined(&reader));
+        assert_eq!(102, receive_user_defined(&reader));
+        assert_eq!(103, receive_user_defined(&reader));
+        assert_eq!(104, receive_user_defined(&reader));
+        assert_eq!(105, receive_user_defined(&reader));
     }
 
     #[test]
@@ -2890,9 +2785,9 @@ mod tests {
         let reader = RingBuffer::new(&bytes)
             .into_reader()
             .with_initial_position(usize::MAX - 1023);
-        assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
-        assert_eq!(101, reader.receive_next().unwrap().unwrap().user_defined);
-        assert_eq!(102, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(100, receive_user_defined(&reader));
+        assert_eq!(101, receive_user_defined(&reader));
+        assert_eq!(102, receive_user_defined(&reader));
         // and are still in sync
         assert_eq!(160, reader.position.get());
     }
@@ -2908,7 +2803,7 @@ mod tests {
 
         // First claim and read
         writer.claim_with_user_defined(1000, true, 100).commit();
-        assert_eq!(100, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(100, receive_user_defined(&reader));
 
         // Last claim before wrap around
         writer.claim_with_user_defined(1000, true, 101).commit();
@@ -2921,16 +2816,16 @@ mod tests {
         thread_rng().fill(claim.get_buffer_mut());
         claim.commit();
 
-        assert!(matches!(reader.receive_next().unwrap().unwrap_err(), Error::Overrun(_)));
+        assert!(matches!(receive_error(&reader), Error::Overrun(_)));
         // Reset the reader and start over
         reader.reset();
-        assert!(reader.receive_next().is_none());
+        assert_no_message(&reader);
         // Continue writing and reading
         assert_eq!(reader.position.get(), writer.position.get());
 
         writer.claim_with_user_defined(1000, true, 104).commit();
 
-        assert_eq!(104, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(104, receive_user_defined(&reader));
     }
 
     #[test]
@@ -2944,8 +2839,8 @@ mod tests {
 
         // First claim and read
         writer.claim_with_user_defined(1000, true, 100).commit();
-        let mut iter = reader.read_batch().unwrap().into_iter();
-        assert_eq!(100, iter.next().unwrap().unwrap().user_defined);
+        let mut batch = reader.read_batch().unwrap();
+        assert_eq!(100, receive_batch_user_defined(&mut batch));
 
         // Last claim before wrap around
         writer.claim_with_user_defined(1000, true, 101).commit();
@@ -2958,8 +2853,8 @@ mod tests {
         thread_rng().fill(claim.get_buffer_mut());
         claim.commit();
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
-        assert!(matches!(iter.next().unwrap().unwrap_err(), Error::Overrun(_)));
+        let mut batch = reader.read_batch().unwrap();
+        assert!(matches!(receive_batch_error(&mut batch), Error::Overrun(_)));
 
         // Reset the reader and start over
         reader.reset();
@@ -2969,9 +2864,9 @@ mod tests {
         // Continue writing and reading through the batch API
         writer.claim_with_user_defined(1000, true, 104).commit();
 
-        let mut iter = reader.read_batch().unwrap().into_iter();
-        assert_eq!(104, iter.next().unwrap().unwrap().user_defined);
-        assert!(iter.next().is_none());
+        let mut batch = reader.read_batch().unwrap();
+        assert_eq!(104, receive_batch_user_defined(&mut batch));
+        assert_batch_empty(&mut batch);
     }
 
     #[test]
@@ -2985,13 +2880,13 @@ mod tests {
         }
 
         let mut batch = reader.read_batch().unwrap();
-        assert_eq!(0, batch.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(0, receive_batch_user_defined(&mut batch));
 
         writer.claim_with_user_defined(16, true, 100).commit();
         writer.claim_with_user_defined(16, true, 101).commit();
 
         // Reader has advanced by one frame, so message 1 should still be readable.
-        assert_eq!(1, batch.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(1, receive_batch_user_defined(&mut batch));
     }
 
     #[test]
@@ -3004,75 +2899,17 @@ mod tests {
             writer.claim_with_user_defined(16, true, i).commit();
         }
 
-        assert_eq!(0, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(0, receive_user_defined(&reader));
 
         writer.claim_with_user_defined(16, true, 100).commit();
         writer.claim_with_user_defined(16, true, 101).commit();
 
         // This is the control case for the batch repro above.
-        assert_eq!(1, reader.receive_next().unwrap().unwrap().user_defined);
+        assert_eq!(1, receive_user_defined(&reader));
     }
 
     #[test]
     fn should_not_return_uncommitted_claim_as_committed_payload() {
-        const CAPACITY: usize = 64;
-        const PAYLOAD_LEN: usize = 24;
-
-        let bytes = AlignedBytes::<{ HEADER_SIZE + CAPACITY }>::new();
-
-        let ring = RingBuffer::new(&bytes);
-        let writer = ring.clone().into_writer();
-        let reader = ring.into_reader();
-
-        // Each frame is 8-byte header + 24-byte payload = 32 bytes.
-        // Two frames fill one complete 64-byte ring lap.
-        {
-            let mut claim = writer.claim(PAYLOAD_LEN, true);
-            claim.get_buffer_mut().fill(0x11);
-            claim.commit();
-        }
-
-        {
-            let mut claim = writer.claim(PAYLOAD_LEN, true);
-            claim.get_buffer_mut().fill(0x22);
-            claim.commit();
-        }
-
-        // Producer position is now exactly one capacity ahead of reader.
-        //
-        // Claiming the next message reuses physical slot 0. Mutate its payload
-        // but deliberately leave the claim uncommitted.
-        let mut outstanding = writer.claim(PAYLOAD_LEN, true);
-        outstanding.get_buffer_mut().fill(0xAA);
-
-        match reader.receive_next().unwrap() {
-            Err(_) => {
-                // Detecting an overrun before returning a message is acceptable.
-            }
-            Ok(message) => {
-                let mut payload = [0u8; PAYLOAD_LEN];
-                match message.read(&mut payload) {
-                    Err(_) => {
-                        // Detecting an overrun while copying is acceptable.
-                    }
-                    Ok(len) => {
-                        // Returning successfully is only acceptable if we got the
-                        // previously committed payload, never the outstanding claim.
-                        assert_eq!(
-                            &payload[..len],
-                            &[0x11; PAYLOAD_LEN],
-                            "reader returned payload bytes from an uncommitted claim"
-                        );
-                    }
-                }
-            }
-        }
-
-        outstanding.abort();
-    }
-
-    #[test]
-    fn should_not_receive_uncommitted_claim_into_buffer() {
         const CAPACITY: usize = 64;
         const PAYLOAD_LEN: usize = 24;
 
@@ -3098,7 +2935,7 @@ mod tests {
         outstanding.get_buffer_mut().fill(0xAA);
 
         let mut payload = [0u8; PAYLOAD_LEN];
-        match reader.receive_next_into(&mut payload).unwrap() {
+        match reader.receive_next(&mut payload).unwrap() {
             Err(_) => {
                 // Detecting an overrun before returning a message is acceptable.
             }

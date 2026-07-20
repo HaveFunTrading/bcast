@@ -24,10 +24,10 @@ fn main() -> anyhow::Result<()> {
 
         'outer: loop {
             let mut msg_count = 0;
-            if let Some(batch) = rx.read_batch() {
-                for msg in batch.into_iter().flatten() {
-                    if msg.read(&mut payload).is_ok() {
-                        let time = u64::from_le_bytes(payload);
+            if let Some(mut batch) = rx.read_batch() {
+                while let Some(msg) = batch.receive_next(&mut payload) {
+                    if let Ok(msg) = msg {
+                        let time = u64::from_le_bytes(msg.payload.try_into().unwrap());
 
                         #[cold]
                         #[inline(never)]

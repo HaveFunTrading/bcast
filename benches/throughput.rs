@@ -112,7 +112,7 @@ fn reader_loop(addr: usize, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> Rea
             continue;
         };
 
-        while let Some(msg) = batch.receive_next_into(&mut payload) {
+        while let Some(msg) = batch.receive_next(&mut payload) {
             match msg {
                 Ok(msg) => {
                     messages += 1;

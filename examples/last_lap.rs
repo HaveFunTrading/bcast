@@ -27,10 +27,9 @@ fn main() -> anyhow::Result<()> {
     let reader = RingBuffer::new(&bytes).into_reader_at_last_lap();
     let mut payload = unsafe { MaybeUninit::new([0u8; RING_CAPACITY]).assume_init() };
 
-    while let Some(msg) = reader.receive_next() {
+    while let Some(msg) = reader.receive_next(&mut payload) {
         let msg = msg?;
-        let len = msg.read(&mut payload)?;
-        println!("{}: {}", msg.user_defined, String::from_utf8_lossy(&payload[..len]));
+        println!("{}: {}", msg.user_defined, String::from_utf8_lossy(msg.payload));
     }
 
     Ok(())

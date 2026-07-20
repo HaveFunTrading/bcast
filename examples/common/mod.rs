@@ -24,11 +24,12 @@ pub fn writer(bytes: &[u8]) {
 #[allow(dead_code)]
 pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
     let reader = RingBuffer::new(bytes).into_reader();
+    let mut payload = unsafe { MaybeUninit::new([0u8; 1024]).assume_init() };
     loop {
         #[cfg(debug_assertions)]
         let mut count = 0;
-        if let Some(batch) = reader.read_batch() {
-            for msg in batch {
+        if let Some(mut batch) = reader.read_batch() {
+            while let Some(msg) = batch.receive_next(&mut payload) {
                 let msg = match msg {
                     Ok(msg) => msg,
                     Err(Error::Overrun(position)) => {
@@ -40,15 +41,11 @@ pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
                         return Err(anyhow!(e));
                     }
                 };
-                debug_assert!(!msg.is_padding, "padding frames should be skipped");
-                let mut payload = unsafe { MaybeUninit::new([0u8; 1024]).assume_init() };
-                msg.read(&mut payload)?;
                 #[cfg(debug_assertions)]
                 {
                     count += 1;
-                    let payload = &payload[..msg.payload_len];
-                    assert!(payload.iter().all(|b| *b == msg.user_defined as u8));
-                    println!("{}", String::from_utf8_lossy(payload));
+                    assert!(msg.payload.iter().all(|b| *b == msg.user_defined as u8));
+                    println!("{}", String::from_utf8_lossy(msg.payload));
                 }
             }
         }

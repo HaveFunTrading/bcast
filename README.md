@@ -7,7 +7,7 @@
 
 Low latency, single producer & many consumer (SPMC) ring buffer that works with shared memory. `bcast` natively supports variable message sizes (`&[u8]`) and offers two read styles:
 
-- lazy message access via `read_batch()` / `receive_next()`
+- message copy via `read_batch()` / `receive_next(&mut payload)`
 - raw bulk copy via `read_bulk()` for lower reader-side overhead
 
 ## Supported Platforms
@@ -49,14 +49,15 @@ lap. The writer updates this marker only when a new frame starts at the beginnin
 let reader = RingBuffer::new(bytes).into_reader_at_last_lap();
 ```
 
-The `Reader` is batch aware (it knows how far behind a producer it is) and provides an iterator over pending messages.
+The `Reader` is batch aware (it knows how far behind a producer it is) and can copy pending messages into a caller-provided buffer.
 
 ```rust
-if let Some(batch) = reader.read_batch() {
-    for msg in batch {
-        let mut payload = [0u8; 1024];
-        let len = msg?.read(&mut payload)?;
-        println!("{}", String::from_utf8_lossy(&payload[..len]));
+let mut payload = [0u8; 1024];
+
+if let Some(mut batch) = reader.read_batch() {
+    while let Some(msg) = batch.receive_next(&mut payload) {
+        let msg = msg?;
+        println!("{}", String::from_utf8_lossy(msg.payload));
     }
 }
 ```
@@ -77,17 +78,15 @@ When the `mmap` feature is enabled, `MappedWriter` and `MappedReader` provide fi
 
 ## Backpressure (and the lack of it)
 `bcast` design is to allow producer to process and publish messages at full line rate and deliver the same latency irrespective
-of the number of consumers (in reality there is a tiny penalty associated with adding each additional consumer). With the `Message`
-API, consumer can detect when it has been overrun by the producer and take appropriate action (such as crashing
-the application).
+of the number of consumers (in reality there is a tiny penalty associated with adding each additional consumer). Consumers can detect when they have been overrun by the producer and take appropriate action, such as resetting or crashing the application.
 
 ```rust
-match msg.read(&mut payload) {
-    Ok(_) => { /* read succeeded */},
-    Err(err) => if let Error::Overrun(_) = err { /* handle overrun */ },
+match reader.receive_next(&mut payload) {
+    Some(Ok(msg)) => { /* process msg.payload */ },
+    Some(Err(Error::Overrun(_))) => { /* handle overrun */ },
+    Some(Err(err)) => return Err(err.into()),
+    None => { /* no message available */ },
 }
 ```
 
-The message API is intentionally lazy: payload bytes are only copied when `Message::read(...)` is called, and `Message`
-can be cloned if you need to defer consumption. If you prefer eager copying with a single overrun check at the end of
-the copy, use `read_bulk()` instead.
+If a message or batch should be discarded, use `Reader::skip_next()` or `Batch::skip_remaining()` to advance without copying payload bytes.

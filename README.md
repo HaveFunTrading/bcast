@@ -10,6 +10,17 @@ Low latency, single producer & many consumer (SPMC) ring buffer that works with 
 - message copy via `read_batch()` / `receive_next(&mut payload)`
 - raw bulk copy via `read_bulk()` for lower reader-side overhead
 
+## What's changing in 1.0
+
+Relative to the latest non-RC release, `0.0.29`, the 1.0 line makes the reader API explicit about payload ownership and tightens overrun semantics:
+
+- the lazy `Message::read(...)` API is removed; `Reader::receive_next(&mut payload)` and `Batch::receive_next(&mut payload)` now copy directly into caller-provided storage and return a `Message` view over that buffer
+- `BulkIter` now yields the same `Message` type as direct receives, so message metadata has one shape across the reader APIs
+- readers can discard without copying via `Reader::skip_next()` and `Batch::skip_remaining()`
+- late readers can start from the retained most recent lap via `into_reader_at_last_lap()` / `MappedReader::new_at_last_lap(...)`
+- overrun detection now tracks the producer's claimed overwrite frontier separately from committed readable position, with writer-side claim reservation and reader-side producer-position caching to reduce shared cursor traffic
+- writer claim reservation is configured as a capacity ratio, for example `claim_reserve_ratio(0.05)` for 5%
+
 ## Supported Platforms
 The crate has been developed and tested exclusively on `x86_64-linux`. It should also work (but it's by 
 no means guaranteed) on CPU architectures with weaker memory ordering semantics. If you want a particular platform

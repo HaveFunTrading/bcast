@@ -75,8 +75,8 @@ pub const METADATA_BUFFER_SIZE: usize = 1024;
 pub const USER_DEFINED_NULL_VALUE: u32 = 0;
 
 const HEADER_MAGIC: u32 = u32::from_le_bytes(*b"BCST");
-const HEADER_VERSION: u16 = 2;
-const MAX_CLAIM_RESERVE_PERCENT: u8 = 50;
+const HEADER_VERSION: u16 = 1;
+const MAX_CLAIM_RESERVE_RATIO: f64 = 0.5;
 
 // mask to obtain message length from frame header
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x0FFFFFFF;
@@ -276,13 +276,12 @@ const fn is_position_at_or_after(position: usize, base: usize) -> bool {
 }
 
 #[inline]
-fn claim_reserve_bytes(capacity: usize, percent: u8) -> usize {
-    if percent == 0 {
+fn claim_reserve_bytes(capacity: usize, ratio: f64) -> usize {
+    if ratio <= 0.0 {
         return 0;
     }
 
-    let percent = percent as usize;
-    let bytes = (capacity / 100) * percent + ((capacity % 100) * percent).div_ceil(100);
+    let bytes = (capacity as f64 * ratio).ceil() as usize;
     bytes.next_power_of_two()
 }
 
@@ -300,14 +299,14 @@ const fn noop_metadata(_: &mut [u8]) {}
 #[derive(Debug, Clone, Copy)]
 pub struct WriterConfig {
     metadata: fn(&mut [u8]),
-    claim_reserve_percent: u8,
+    claim_reserve_ratio: f64,
 }
 
 impl Default for WriterConfig {
     fn default() -> Self {
         Self {
             metadata: noop_metadata,
-            claim_reserve_percent: 0,
+            claim_reserve_ratio: 0.0,
         }
     }
 }
@@ -320,16 +319,17 @@ impl WriterConfig {
         self
     }
 
-    /// Set how far ahead the writer may reserve the claimed-position cursor, as a percentage
-    /// of ring capacity. The computed byte reservation is rounded up to the next power of two.
+    /// Set how far ahead the writer may reserve the claimed-position cursor, as a ratio of ring
+    /// capacity. For example, `0.01` reserves 1% and `0.5` reserves 50%. The computed byte
+    /// reservation is rounded up to the next power of two.
     ///
     /// A non-zero value reduces the reader's effective retained window by up to the reserved
     /// amount, but lets the writer avoid updating the shared claimed-position cursor on every claim.
-    /// The default is `0`.
+    /// The default is `0.0`.
     #[inline]
-    pub const fn claim_reserve_percent(mut self, percent: u8) -> Self {
-        assert!(percent <= MAX_CLAIM_RESERVE_PERCENT, "claim reserve percent must be <= 50");
-        self.claim_reserve_percent = percent;
+    pub fn claim_reserve_ratio(mut self, ratio: f64) -> Self {
+        assert!((0.0..=MAX_CLAIM_RESERVE_RATIO).contains(&ratio), "claim reserve ratio must be in 0.0..=0.5");
+        self.claim_reserve_ratio = ratio;
         self
     }
 }
@@ -379,7 +379,7 @@ impl RingBuffer {
             position
         };
         Writer {
-            claim_reserve: claim_reserve_bytes(self.capacity, config.claim_reserve_percent),
+            claim_reserve: claim_reserve_bytes(self.capacity, config.claim_reserve_ratio),
             claimed_limit: Cell::new(claimed_limit),
             ring: self,
             position: Cell::new(position),
@@ -2537,24 +2537,24 @@ mod tests {
     }
 
     #[test]
-    fn should_calculate_claim_reserve_as_power_of_two_percentage() {
-        assert_eq!(0, claim_reserve_bytes(1024, 0));
-        assert_eq!(16, claim_reserve_bytes(1024, 1));
-        assert_eq!(256, claim_reserve_bytes(1024, 25));
-        assert_eq!(512, claim_reserve_bytes(1024, 50));
-        assert_eq!(1, claim_reserve_bytes(64, 1));
+    fn should_calculate_claim_reserve_as_power_of_two_ratio() {
+        assert_eq!(0, claim_reserve_bytes(1024, 0.0));
+        assert_eq!(16, claim_reserve_bytes(1024, 0.01));
+        assert_eq!(256, claim_reserve_bytes(1024, 0.25));
+        assert_eq!(512, claim_reserve_bytes(1024, 0.5));
+        assert_eq!(1, claim_reserve_bytes(64, 0.01));
     }
 
     #[test]
-    #[should_panic(expected = "claim reserve percent must be <= 50")]
-    fn should_reject_claim_reserve_percent_above_half_capacity() {
-        let _ = WriterConfig::default().claim_reserve_percent(51);
+    #[should_panic(expected = "claim reserve ratio must be in 0.0..=0.5")]
+    fn should_reject_claim_reserve_ratio_above_half_capacity() {
+        let _ = WriterConfig::default().claim_reserve_ratio(0.51);
     }
 
     #[test]
     fn should_reserve_claimed_position_in_configured_chunks() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 1024 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_percent(25));
+        let writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_ratio(0.25));
 
         assert_eq!(256, writer.claim_reserve);
         assert_eq!(0, writer.claimed_limit.get());
@@ -2582,7 +2582,7 @@ mod tests {
     #[test]
     fn should_allow_claim_reservation_to_reduce_readable_window() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_percent(25));
+        let writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_ratio(0.25));
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         writer.claim(24, true).commit();

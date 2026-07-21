@@ -16,7 +16,6 @@ default = []
 mmap = ["dep:memmap2"]
 
 [dependencies]
-thiserror = "2.0.3"
 crossbeam-utils = "0.8.20"
 memmap2 = { version = "0.9.5", optional = true }
 
@@ -51,3 +50,11 @@ path = "benches/rx.rs"
 name = "throughput"
 harness = false
 path = "benches/throughput.rs"
+
+[[example]]
+name = "reader_ipc"
+required-features = ["mmap"]
+
+[[example]]
+name = "writer_ipc"
+required-features = ["mmap"]

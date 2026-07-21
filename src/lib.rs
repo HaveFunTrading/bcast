@@ -312,45 +312,6 @@ pub struct RingBuffer {
     mtu: usize,
 }
 
-const fn noop_metadata(_: &mut [u8]) {}
-
-/// Configuration used to initialise a writer-backed channel.
-#[derive(Debug, Clone, Copy)]
-pub struct WriterConfig {
-    metadata: fn(&mut [u8]),
-    claim_reserve_ratio: f64,
-}
-
-impl Default for WriterConfig {
-    fn default() -> Self {
-        Self {
-            metadata: noop_metadata,
-            claim_reserve_ratio: 0.0,
-        }
-    }
-}
-
-impl WriterConfig {
-    /// Set function used to populate the channel metadata buffer during initialisation.
-    pub fn metadata(mut self, metadata: fn(&mut [u8])) -> Self {
-        self.metadata = metadata;
-        self
-    }
-
-    /// Set how far ahead the writer may reserve the claimed-position cursor, as a ratio of ring
-    /// capacity. For example, `0.01` reserves 1% and `0.5` reserves 50%. The computed byte
-    /// reservation is rounded up to the next power of two.
-    ///
-    /// A non-zero value reduces the reader's effective retained window by up to the reserved
-    /// amount, but lets the writer avoid updating the shared claimed-position cursor on every claim.
-    /// The default is `0.0`.
-    pub fn claim_reserve_ratio(mut self, ratio: f64) -> Self {
-        assert!((0.0..=MAX_CLAIM_RESERVE_RATIO).contains(&ratio), "claim reserve ratio must be in 0.0..=0.5");
-        self.claim_reserve_ratio = ratio;
-        self
-    }
-}
-
 impl RingBuffer {
     /// Create new `RingBuffer` by wrapping provided `bytes`. It is necessary to call `into_writer()`
     /// or `into_reader()` following the buffer construction to start using it.
@@ -506,6 +467,44 @@ impl RingBuffer {
             producer_position: Cell::new(producer_position),
             claimed_position: Cell::new(claimed_position),
         }
+    }
+}
+
+/// Configuration used to initialise a writer-backed channel.
+#[derive(Debug, Clone, Copy)]
+pub struct WriterConfig {
+    metadata: fn(&mut [u8]),
+    claim_reserve_ratio: f64,
+}
+
+impl Default for WriterConfig {
+    fn default() -> Self {
+        const fn noop_metadata(_: &mut [u8]) {}
+        Self {
+            metadata: noop_metadata,
+            claim_reserve_ratio: 0.0,
+        }
+    }
+}
+
+impl WriterConfig {
+    /// Set function used to populate the channel metadata buffer during initialisation.
+    pub fn metadata(mut self, metadata: fn(&mut [u8])) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Set how far ahead the writer may reserve the claimed-position cursor, as a ratio of ring
+    /// capacity. For example, `0.01` reserves 1% and `0.5` reserves 50%. The computed byte
+    /// reservation is rounded up to the next power of two.
+    ///
+    /// A non-zero value reduces the reader's effective retained window by up to the reserved
+    /// amount, but lets the writer avoid updating the shared claimed-position cursor on every claim.
+    /// The default is `0.0`.
+    pub fn claim_reserve_ratio(mut self, ratio: f64) -> Self {
+        assert!((0.0..=MAX_CLAIM_RESERVE_RATIO).contains(&ratio), "claim reserve ratio must be in 0.0..=0.5");
+        self.claim_reserve_ratio = ratio;
+        self
     }
 }
 

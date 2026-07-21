@@ -1,4 +1,4 @@
-use bcast::{HEADER_SIZE, LocalStorage, Reader, StorageExt, Writer};
+use bcast::{HEADER_SIZE, LocalStorage, StorageExt, Writer};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Will measure round trip time (RTT). There are 2 shared buffers, one for outgoing messages whose
@@ -16,8 +16,8 @@ fn main() -> anyhow::Result<()> {
     let outbound_for_receiver = outbound.clone();
     let inbound_for_receiver = inbound.clone();
     let receiver = std::thread::spawn(move || {
-        let mut tx = Writer::new(inbound_for_receiver);
-        let rx = Reader::new(outbound_for_receiver).with_initial_position(0);
+        let mut tx = inbound_for_receiver.into_writer();
+        let rx = outbound_for_receiver.into_reader_at(0);
         let mut payload = [0u8; 8];
 
         'outer: loop {
@@ -45,8 +45,8 @@ fn main() -> anyhow::Result<()> {
     });
 
     let sender = std::thread::spawn(move || {
-        let mut tx = Writer::new(outbound);
-        let rx = Reader::new(inbound).with_initial_position(0);
+        let mut tx = outbound.into_writer();
+        let rx = inbound.into_reader_at(0);
 
         let mut payload = [0u8; 8];
         let mut msg_count: usize = 0;

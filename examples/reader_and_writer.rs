@@ -1,5 +1,5 @@
 use crate::common::{reader, writer};
-use bcast::{LocalStorage, Reader, StorageExt, Writer};
+use bcast::{LocalStorage, StorageExt};
 
 mod common;
 
@@ -11,14 +11,14 @@ fn main() -> anyhow::Result<()> {
 
     let writer_storage = storage.clone();
     let writer_task = std::thread::spawn(move || {
-        let mut writer_handle = Writer::new(writer_storage);
+        let mut writer_handle = writer_storage.into_writer();
         writer(&mut writer_handle);
     });
 
     let reader_task = std::thread::spawn(move || {
         // delay for a bit so that we are not joining from position 0
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let reader_handle = Reader::new(storage);
+        let reader_handle = storage.into_reader();
         reader(&reader_handle).unwrap();
     });
 

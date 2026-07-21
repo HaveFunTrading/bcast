@@ -5,7 +5,9 @@
 //! shared-memory adapters. Storage handles own or otherwise keep the underlying
 //! bytes alive while the ring view is in use.
 
+use crate::reader::Reader;
 use crate::ring::Header;
+use crate::writer::{Writer, WriterConfig};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::mem::{align_of, size_of};
 use std::ptr::NonNull;
@@ -121,11 +123,86 @@ unsafe impl<S: Storage> Storage for SharedStorage<S> {
 
 unsafe impl<S: WriteStorage> WriteStorage for SharedStorage<S> {}
 
-/// Extension trait for converting storage into [`SharedStorage`].
+/// Extension trait for fluent storage conversions.
 pub trait StorageExt: Storage + Sized {
     /// Convert this storage value into a cloneable [`SharedStorage`] handle.
     fn into_shared(self) -> SharedStorage<Self> {
         SharedStorage::new(self)
+    }
+
+    /// Convert this storage value into a reader starting at the producer's
+    /// current position.
+    fn into_reader(self) -> Reader<Self> {
+        Reader::new(self)
+    }
+
+    /// Convert this storage value into a reader starting at `position`.
+    fn into_reader_at(self, position: usize) -> Reader<Self> {
+        Reader::new(self).with_initial_position(position)
+    }
+
+    /// Convert this storage value into a reader starting at the most recent
+    /// retained lap when possible.
+    fn into_reader_at_last_lap(self) -> Reader<Self> {
+        Reader::new_at_last_lap(self)
+    }
+
+    /// Convert this writable storage value into a new writer.
+    ///
+    /// This initializes the ring header and overwrites any existing channel
+    /// state in the storage.
+    fn into_writer(self) -> Writer<Self>
+    where
+        Self: WriteStorage,
+    {
+        Writer::new(self)
+    }
+
+    /// Convert this writable storage value into a new writer with custom
+    /// configuration.
+    fn into_writer_with_cfg<F>(self, config: F) -> Writer<Self>
+    where
+        Self: WriteStorage,
+        F: FnOnce(WriterConfig) -> WriterConfig,
+    {
+        Writer::new_with_cfg(self, config)
+    }
+
+    /// Convert this writable storage value into a writer joined to an existing
+    /// channel.
+    fn join_writer(self) -> Writer<Self>
+    where
+        Self: WriteStorage,
+    {
+        Writer::join(self)
+    }
+
+    /// Convert this writable storage value into a writer joined to an existing
+    /// channel with custom configuration.
+    fn join_writer_with_cfg<F>(self, config: F) -> Writer<Self>
+    where
+        Self: WriteStorage,
+        F: FnOnce(WriterConfig) -> WriterConfig,
+    {
+        Writer::join_with_cfg(self, config)
+    }
+
+    /// Convert this writable storage value into a writer joined at `position`.
+    fn join_writer_at(self, position: usize) -> Writer<Self>
+    where
+        Self: WriteStorage,
+    {
+        Writer::join_at(self, position)
+    }
+
+    /// Convert this writable storage value into a writer joined at `position`
+    /// with custom configuration.
+    fn join_writer_at_with_cfg<F>(self, position: usize, config: F) -> Writer<Self>
+    where
+        Self: WriteStorage,
+        F: FnOnce(WriterConfig) -> WriterConfig,
+    {
+        Writer::join_at_with_cfg(self, position, config)
     }
 }
 

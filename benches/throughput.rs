@@ -1,4 +1,4 @@
-use bcast::{HEADER_SIZE, LocalStorage, Reader, SharedStorage, StorageExt, Writer};
+use bcast::{HEADER_SIZE, LocalStorage, Reader, SharedStorage, StorageExt};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -74,7 +74,9 @@ fn main() {
 
 fn run_case(api: ReaderApi, reserve_ratio: f64, reader_count: usize) -> CaseResult {
     let storage = LocalStorage::new(RING_BUFFER_SIZE).into_shared();
-    let mut writer = Writer::new_with_cfg(storage.clone(), |config| config.claim_reserve_ratio(reserve_ratio));
+    let mut writer = storage
+        .clone()
+        .into_writer_with_cfg(|config| config.claim_reserve_ratio(reserve_ratio));
     let payload = [0xAB; MESSAGE_SIZE];
     let stop = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(reader_count + 1));
@@ -123,7 +125,7 @@ fn reader_loop(
     stop: Arc<AtomicBool>,
     barrier: Arc<Barrier>,
 ) -> ReaderStats {
-    let reader = Reader::new(storage).with_initial_position(0);
+    let reader = storage.into_reader_at(0);
 
     match api {
         ReaderApi::ReceiveNext => receive_next_loop(reader, stop, barrier),

@@ -12,8 +12,7 @@ use crate::ring::{
 use crate::storage::{LocalStorage, Storage};
 use std::cell::Cell;
 use std::cmp::min;
-use std::marker::PhantomData;
-use std::mem::{align_of, size_of};
+use std::mem::size_of;
 use std::ptr::{copy_nonoverlapping, read_unaligned};
 use std::sync::atomic::Ordering;
 
@@ -33,11 +32,11 @@ use std::sync::atomic::Ordering;
 /// # Example
 ///
 /// ```
-/// use bcast::{LocalStorage, Reader, StorageExt, Writer};
+/// use bcast::{LocalStorage, StorageExt};
 ///
 /// let storage = LocalStorage::with_capacity(1024).into_shared();
-/// let mut writer = Writer::new(storage.clone());
-/// let reader = Reader::new(storage);
+/// let mut writer = storage.clone().into_writer();
+/// let reader = storage.into_reader();
 ///
 /// writer.send(b"hello", true);
 ///
@@ -217,11 +216,11 @@ impl<S> Reader<S> {
     /// # Example
     ///
     /// ```
-    /// use bcast::{LocalStorage, Reader, StorageExt, Writer};
+    /// use bcast::{LocalStorage, StorageExt};
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
-    /// let mut writer = Writer::new(storage.clone());
-    /// let reader = Reader::new(storage);
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
     ///
     /// writer.send(b"one", true);
     /// writer.send(b"two", true);
@@ -588,16 +587,16 @@ impl<S> Bulk<'_, S> {
     }
 
     /// Copy this bulk window into `dst` and return an iterator over the copied
-    /// data using the default unaligned parsing policy.
+    /// data.
     ///
     /// # Example
     ///
     /// ```
-    /// use bcast::{LocalStorage, Reader, StorageExt, Writer};
+    /// use bcast::{LocalStorage, StorageExt};
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
-    /// let mut writer = Writer::new(storage.clone());
-    /// let reader = Reader::new(storage);
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
     ///
     /// writer.send(b"hello", true);
     ///
@@ -609,50 +608,25 @@ impl<S> Bulk<'_, S> {
     /// assert!(messages.next().is_none());
     /// ```
     #[inline]
-    pub fn into_iter(self, dst: &mut [u8]) -> Result<BulkIter<'_, Unaligned>> {
+    pub fn into_iter(self, dst: &mut [u8]) -> Result<BulkIter<'_>> {
         let start_position = self.start_position;
         let len = self.copy_into(dst)?;
-        Ok(BulkIter::<Unaligned>::new(&dst[..len], start_position))
-    }
-
-    /// Copy this bulk window into `dst` and return an iterator over the copied
-    /// data using the aligned parsing policy.
-    ///
-    /// `dst` must be aligned to the ring frame-header alignment. The method
-    /// checks this with `debug_assert`, so callers must still uphold it in
-    /// release builds.
-    #[inline]
-    pub fn into_iter_aligned(self, dst: &mut [u8]) -> Result<BulkIter<'_, Aligned>> {
-        debug_assert_eq!(
-            dst.as_ptr().align_offset(align_of::<FrameHeader>()),
-            0,
-            "bulk buffer is not aligned to FrameHeader",
-        );
-        let start_position = self.start_position;
-        let len = self.copy_into(dst)?;
-        Ok(BulkIter::<Aligned>::new(&dst[..len], start_position))
+        Ok(BulkIter::new(&dst[..len], start_position))
     }
 }
-
-/// Bulk parsing policy for buffers that may be unaligned.
-pub struct Unaligned;
-
-/// Bulk parsing policy for buffers aligned to the ring frame header alignment.
-pub struct Aligned;
 
 /// Iterator over messages contained in raw bulk bytes.
 ///
 /// Padding frames are skipped automatically. Use [`Bulk::into_iter`] for the
 /// common path where the bytes are copied out of the ring immediately before
 /// iteration.
-pub struct BulkIter<'a, Policy = Unaligned> {
+pub struct BulkIter<'a> {
     bytes: &'a [u8],
     start_position: usize,
     index: usize,
-    policy: PhantomData<Policy>,
 }
 
-impl<'a, Policy> BulkIter<'a, Policy> {
+impl<'a> BulkIter<'a> {
     /// Construct an iterator over raw bulk bytes.
     ///
     /// `start_position` must be the absolute stream position of the first byte
@@ -663,13 +637,10 @@ impl<'a, Policy> BulkIter<'a, Policy> {
             bytes,
             start_position,
             index: 0,
-            policy: PhantomData,
         }
     }
-}
 
-impl<'a, Policy> BulkIter<'a, Policy> {
-    fn next_impl(&mut self, read_header: unsafe fn(*const u8) -> (u32, u32)) -> Option<Message<'a>> {
+    fn next_impl(&mut self) -> Option<Message<'a>> {
         while self.index < self.bytes.len() {
             let header_end = self.index + size_of::<FrameHeader>();
             if header_end > self.bytes.len() {
@@ -677,7 +648,7 @@ impl<'a, Policy> BulkIter<'a, Policy> {
             }
 
             let header_ptr = unsafe { self.bytes.as_ptr().add(self.index) };
-            let (fields, user_defined) = unsafe { read_header(header_ptr) };
+            let (fields, user_defined) = unsafe { read_bulk_header(header_ptr) };
             let (is_fin, is_continuation, is_padding, is_heartbeat, payload_len) = unpack_fields(fields);
             let payload_len = payload_len as usize;
             let aligned_payload_len = get_aligned_size(payload_len);
@@ -711,30 +682,16 @@ impl<'a, Policy> BulkIter<'a, Policy> {
 }
 
 #[inline]
-const unsafe fn read_bulk_header_unaligned(ptr: *const u8) -> (u32, u32) {
+const unsafe fn read_bulk_header(ptr: *const u8) -> (u32, u32) {
     let header = unsafe { read_unaligned(ptr as *const u64) };
     unpack_header(header)
 }
 
-#[inline]
-const unsafe fn read_bulk_header_aligned(ptr: *const u8) -> (u32, u32) {
-    let header = unsafe { &*(ptr as *const FrameHeader) };
-    (header.fields(), header.user_defined())
-}
-
-impl<'a> Iterator for BulkIter<'a, Unaligned> {
+impl<'a> Iterator for BulkIter<'a> {
     type Item = Message<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next_impl(read_bulk_header_unaligned)
-    }
-}
-
-impl<'a> Iterator for BulkIter<'a, Aligned> {
-    type Item = Message<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_impl(read_bulk_header_aligned)
+        self.next_impl()
     }
 }
 

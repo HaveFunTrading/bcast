@@ -1,4 +1,4 @@
-use bcast::{HEADER_SIZE, LocalStorage, Reader, StorageExt, Writer};
+use bcast::{HEADER_SIZE, LocalStorage, StorageExt, Writer};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Will measure receive delays between producer and consumer. The producer will attach current
@@ -13,7 +13,7 @@ fn main() -> anyhow::Result<()> {
 
     let receiver_storage = storage.clone();
     let receiver = std::thread::spawn(move || {
-        let rx = Reader::new(receiver_storage).with_initial_position(0);
+        let rx = receiver_storage.into_reader_at(0);
 
         let mut payload = [0u8; 8];
 
@@ -77,7 +77,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let sender = std::thread::spawn(move || {
-        let mut tx = Writer::new(storage);
+        let mut tx = storage.into_writer();
         let mut msg_count: usize = 0;
 
         loop {

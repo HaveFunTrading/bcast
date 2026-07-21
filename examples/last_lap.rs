@@ -1,4 +1,4 @@
-use bcast::{LocalStorage, Reader, StorageExt, Writer};
+use bcast::{LocalStorage, StorageExt};
 use std::mem::MaybeUninit;
 
 const RING_CAPACITY: usize = 128;
@@ -13,7 +13,7 @@ fn main() -> anyhow::Result<()> {
     let storage = LocalStorage::with_capacity(RING_CAPACITY).into_shared();
 
     {
-        let mut writer = Writer::new(storage.clone());
+        let mut writer = storage.clone().into_writer();
 
         // Each message occupies 48 bytes: 8 bytes frame header + 40 bytes aligned payload.
         // The third publish cannot fit in the remaining 32 bytes, so it inserts padding and
@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
         publish(&mut writer, "lap-1-message-0-------------------------", 2);
     }
 
-    let reader = Reader::new_at_last_lap(storage);
+    let reader = storage.into_reader_at_last_lap();
     let mut payload = unsafe { MaybeUninit::new([0u8; RING_CAPACITY]).assume_init() };
 
     while let Some(msg) = reader.receive_next(&mut payload) {

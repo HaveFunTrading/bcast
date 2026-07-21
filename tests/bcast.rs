@@ -1,6 +1,6 @@
 use bcast::{
-    Aligned, Batch, BulkIter, Error, HEADER_SIZE, LocalStorage, METADATA_BUFFER_SIZE, Reader, SharedStorage, Storage,
-    StorageExt, USER_DEFINED_NULL_VALUE, Unaligned, Writer, WriterConfig,
+    Batch, BulkIter, Error, HEADER_SIZE, LocalStorage, METADATA_BUFFER_SIZE, Reader, SharedStorage, Storage,
+    StorageExt, USER_DEFINED_NULL_VALUE, Writer, WriterConfig,
 };
 use rand::{Rng, thread_rng};
 
@@ -12,16 +12,16 @@ fn shared_storage<const CAPACITY: usize>() -> SharedLocalStorage {
 
 fn writer_and_reader<const CAPACITY: usize>() -> (Writer<SharedLocalStorage>, Reader<SharedLocalStorage>) {
     let storage = shared_storage::<CAPACITY>();
-    let writer = Writer::new(storage.clone());
-    let reader = Reader::new(storage);
+    let writer = storage.clone().into_writer();
+    let reader = storage.into_reader();
     (writer, reader)
 }
 
 fn storage_writer_and_reader<const CAPACITY: usize>()
 -> (SharedLocalStorage, Writer<SharedLocalStorage>, Reader<SharedLocalStorage>) {
     let storage = shared_storage::<CAPACITY>();
-    let writer = Writer::new(storage.clone());
-    let reader = Reader::new(storage.clone());
+    let writer = storage.clone().into_writer();
+    let reader = storage.clone().into_reader();
     (storage, writer, reader)
 }
 
@@ -29,18 +29,14 @@ fn writer_and_reader_at<const CAPACITY: usize>(
     position: usize,
 ) -> (Writer<SharedLocalStorage>, Reader<SharedLocalStorage>) {
     let storage = shared_storage::<CAPACITY>();
-    let _ = Writer::new(storage.clone());
-    let writer = Writer::join_at(storage.clone(), position);
-    let reader = Reader::new(storage).with_initial_position(position);
+    let _ = storage.clone().into_writer();
+    let writer = storage.clone().join_writer_at(position);
+    let reader = storage.into_reader_at(position);
     (writer, reader)
 }
 
 fn storage_bytes<S: Storage>(storage: &S) -> &[u8] {
     unsafe { std::slice::from_raw_parts(storage.ptr().as_ptr(), storage.len()) }
-}
-
-fn storage_bytes_mut<S: Storage>(storage: &mut S) -> &mut [u8] {
-    unsafe { std::slice::from_raw_parts_mut(storage.ptr().as_ptr(), storage.len()) }
 }
 
 fn receive_user_defined<S>(reader: &Reader<S>) -> u32 {
@@ -160,7 +156,7 @@ fn should_iterate_bulk_messages() {
     let mut dst = vec![0_u8; bulk.len()];
     let len = bulk.copy_into(&mut dst).unwrap();
 
-    let mut iter = BulkIter::<Unaligned>::new(&dst[..len], start_position);
+    let mut iter = BulkIter::new(&dst[..len], start_position);
 
     let first = iter.next().unwrap();
     assert_eq!(0, first.stream_position);
@@ -176,40 +172,6 @@ fn should_iterate_bulk_messages() {
     assert!(second.is_fin);
     assert!(!second.is_continuation);
     assert!(second.is_heartbeat);
-    assert_eq!(b"world", second.payload);
-
-    assert!(iter.next().is_none());
-}
-
-#[test]
-fn should_iterate_bulk_messages_with_aligned_policy() {
-    let (mut writer, reader) = writer_and_reader::<64>();
-    let reader = reader.with_initial_position(0);
-
-    let mut claim = writer.claim_with_user_defined(5, true, 100);
-    claim.get_buffer_mut().copy_from_slice(b"hello");
-    claim.commit();
-
-    let mut claim = writer.heartbeat_with_payload_and_user_defined(5, 200);
-    claim.get_buffer_mut().copy_from_slice(b"world");
-    claim.commit();
-
-    let bulk = reader.read_bulk().unwrap().unwrap();
-    let start_position = bulk.start_position();
-    let mut dst_storage = LocalStorage::new(32);
-    let dst = storage_bytes_mut(&mut dst_storage);
-    let len = bulk.copy_into(dst).unwrap();
-
-    let mut iter = BulkIter::<Aligned>::new(&dst[..len], start_position);
-
-    let first = iter.next().unwrap();
-    assert_eq!(0, first.stream_position);
-    assert_eq!(100, first.user_defined);
-    assert_eq!(b"hello", first.payload);
-
-    let second = iter.next().unwrap();
-    assert_eq!(16, second.stream_position);
-    assert_eq!(200, second.user_defined);
     assert_eq!(b"world", second.payload);
 
     assert!(iter.next().is_none());
@@ -246,36 +208,6 @@ fn should_iterate_bulk_messages_via_bulk() {
 }
 
 #[test]
-fn should_iterate_bulk_messages_via_bulk_with_aligned_policy() {
-    let (mut writer, reader) = writer_and_reader::<64>();
-    let reader = reader.with_initial_position(0);
-
-    let mut claim = writer.claim_with_user_defined(5, true, 100);
-    claim.get_buffer_mut().copy_from_slice(b"hello");
-    claim.commit();
-
-    let mut claim = writer.heartbeat_with_payload_and_user_defined(5, 200);
-    claim.get_buffer_mut().copy_from_slice(b"world");
-    claim.commit();
-
-    let bulk = reader.read_bulk().unwrap().unwrap();
-    let mut dst_storage = LocalStorage::new(32);
-    let mut iter = bulk.into_iter_aligned(storage_bytes_mut(&mut dst_storage)).unwrap();
-
-    let first = iter.next().unwrap();
-    assert_eq!(0, first.stream_position);
-    assert_eq!(100, first.user_defined);
-    assert_eq!(b"hello", first.payload);
-
-    let second = iter.next().unwrap();
-    assert_eq!(16, second.stream_position);
-    assert_eq!(200, second.user_defined);
-    assert_eq!(b"world", second.payload);
-
-    assert!(iter.next().is_none());
-}
-
-#[test]
 fn should_skip_padding_frames_in_bulk_iter() {
     let (mut writer, reader) = writer_and_reader_at::<64>(56);
 
@@ -288,7 +220,7 @@ fn should_skip_padding_frames_in_bulk_iter() {
     let mut dst = vec![0_u8; bulk.len()];
     let len = bulk.copy_into(&mut dst).unwrap();
 
-    let mut iter = BulkIter::<Unaligned>::new(&dst[..len], start_position);
+    let mut iter = BulkIter::new(&dst[..len], start_position);
     let msg = iter.next().unwrap();
     assert_eq!(64, msg.stream_position);
     assert_eq!(300, msg.user_defined);
@@ -299,9 +231,9 @@ fn should_skip_padding_frames_in_bulk_iter() {
 #[test]
 fn should_read_wrapped_bulk() {
     let storage = shared_storage::<64>();
-    let _ = Writer::new(storage.clone());
-    let mut writer = Writer::join_at(storage.clone(), 56);
-    let reader = Reader::new(storage.clone()).with_initial_position(56);
+    let _ = storage.clone().into_writer();
+    let mut writer = storage.clone().join_writer_at(56);
+    let reader = storage.clone().into_reader_at(56);
 
     let claim = writer.claim(0, true);
     claim.commit();
@@ -450,12 +382,12 @@ fn should_read_in_batch_with_limit() {
 #[test]
 fn should_cache_producer_position_until_reader_catches_up() {
     let storage = shared_storage::<64>();
-    let mut writer = Writer::new(storage.clone());
+    let mut writer = storage.clone().into_writer();
 
     writer.claim_with_user_defined(0, true, 100).commit();
     writer.claim_with_user_defined(0, true, 200).commit();
 
-    let reader = Reader::new(storage).with_initial_position(0);
+    let reader = storage.into_reader_at(0);
 
     writer.claim_with_user_defined(0, true, 300).commit();
 
@@ -469,12 +401,12 @@ fn should_cache_producer_position_until_reader_catches_up() {
 #[test]
 fn should_read_batch_from_cached_producer_position_until_reader_catches_up() {
     let storage = shared_storage::<64>();
-    let mut writer = Writer::new(storage.clone());
+    let mut writer = storage.clone().into_writer();
 
     writer.claim_with_user_defined(0, true, 100).commit();
     writer.claim_with_user_defined(0, true, 200).commit();
 
-    let reader = Reader::new(storage).with_initial_position(0);
+    let reader = storage.into_reader_at(0);
 
     writer.claim_with_user_defined(0, true, 300).commit();
 
@@ -827,7 +759,7 @@ fn should_overrun_batch_skip_remaining() {
 #[should_panic(expected = "mtu exceeded")]
 fn should_error_if_mtu_exceeded() {
     let storage = shared_storage::<64>();
-    let mut writer = Writer::new(storage);
+    let mut writer = storage.into_writer();
     assert_eq!(24, writer.mtu());
     let _ = writer.claim(32, true);
 }
@@ -835,18 +767,18 @@ fn should_error_if_mtu_exceeded() {
 #[test]
 fn should_start_read_from_last_producer_position() {
     let storage = shared_storage::<64>();
-    let mut writer = Writer::new(storage.clone());
+    let mut writer = storage.clone().into_writer();
 
     writer.claim(16, true).commit();
 
-    let reader = Reader::new(storage);
+    let reader = storage.into_reader();
     assert_no_message(&reader);
 }
 
 #[test]
 fn should_not_start_reader_at_retained_window_start_unless_it_is_a_frame_boundary() {
     let storage = shared_storage::<1024>();
-    let mut writer = Writer::new(storage.clone());
+    let mut writer = storage.clone().into_writer();
 
     writer.claim(8, true).commit();
 
@@ -862,7 +794,7 @@ fn should_not_start_reader_at_retained_window_start_unless_it_is_a_frame_boundar
     assert_eq!(24, retained_window_start);
     let first_valid_frame_position = 40;
 
-    let reader = Reader::new(storage.clone()).with_initial_position(retained_window_start);
+    let reader = storage.clone().into_reader_at(retained_window_start);
 
     let mut payload = [0u8; 1024];
     let msg = reader.receive_next(&mut payload).unwrap().unwrap();
@@ -870,7 +802,7 @@ fn should_not_start_reader_at_retained_window_start_unless_it_is_a_frame_boundar
     assert_eq!(0, msg.payload.len());
     assert_eq!(0, msg.user_defined);
 
-    let reader = Reader::new(storage).with_initial_position(first_valid_frame_position);
+    let reader = storage.into_reader_at(first_valid_frame_position);
 
     let msg = reader.receive_next(&mut payload).unwrap().unwrap();
     assert_eq!(first_valid_frame_position, msg.stream_position);
@@ -881,12 +813,12 @@ fn should_not_start_reader_at_retained_window_start_unless_it_is_a_frame_boundar
 #[test]
 fn should_start_read_from_beginning_before_first_lap_completes() {
     let storage = shared_storage::<128>();
-    let mut writer = Writer::new(storage.clone());
+    let mut writer = storage.clone().into_writer();
 
     writer.claim_with_user_defined(16, true, 100).commit();
     writer.claim_with_user_defined(16, true, 101).commit();
 
-    let reader = Reader::new_at_last_lap(storage);
+    let reader = storage.into_reader_at_last_lap();
 
     assert_eq!(100, receive_user_defined(&reader));
     assert_eq!(101, receive_user_defined(&reader));
@@ -896,12 +828,12 @@ fn should_start_read_from_beginning_before_first_lap_completes() {
 #[test]
 fn should_not_advance_last_lap_until_new_frame_starts_at_ring_beginning() {
     let storage = shared_storage::<128>();
-    let mut writer = Writer::new(storage.clone());
+    let mut writer = storage.clone().into_writer();
 
     writer.claim_with_user_defined(56, true, 100).commit();
     writer.claim_with_user_defined(56, true, 101).commit();
 
-    let reader = Reader::new_at_last_lap(storage.clone());
+    let reader = storage.clone().into_reader_at_last_lap();
 
     assert_eq!(100, receive_user_defined(&reader));
     assert_eq!(101, receive_user_defined(&reader));
@@ -909,7 +841,7 @@ fn should_not_advance_last_lap_until_new_frame_starts_at_ring_beginning() {
 
     writer.claim_with_user_defined(16, true, 102).commit();
 
-    let reader = Reader::new_at_last_lap(storage);
+    let reader = storage.into_reader_at_last_lap();
 
     assert_eq!(102, receive_user_defined(&reader));
     assert_no_message(&reader);
@@ -918,13 +850,13 @@ fn should_not_advance_last_lap_until_new_frame_starts_at_ring_beginning() {
 #[test]
 fn should_start_read_from_last_lap_after_padding_wrap() {
     let storage = shared_storage::<128>();
-    let mut writer = Writer::new(storage.clone());
+    let mut writer = storage.clone().into_writer();
 
     writer.claim_with_user_defined(40, true, 100).commit();
     writer.claim_with_user_defined(40, true, 101).commit();
     writer.claim_with_user_defined(40, true, 102).commit();
 
-    let reader = Reader::new_at_last_lap(storage);
+    let reader = storage.into_reader_at_last_lap();
 
     assert_eq!(102, receive_user_defined(&reader));
     assert_no_message(&reader);
@@ -933,11 +865,11 @@ fn should_start_read_from_last_lap_after_padding_wrap() {
 #[test]
 fn should_start_read_from_last_lap_without_writer_config() {
     let storage = shared_storage::<128>();
-    let mut writer = Writer::new(storage.clone());
+    let mut writer = storage.clone().into_writer();
 
     writer.claim_with_user_defined(16, true, 100).commit();
 
-    let reader = Reader::new_at_last_lap(storage);
+    let reader = storage.into_reader_at_last_lap();
 
     assert_eq!(100, receive_user_defined(&reader));
     assert_no_message(&reader);
@@ -952,8 +884,10 @@ fn should_reject_claim_reserve_ratio_above_half_capacity() {
 #[test]
 fn should_allow_claim_reservation_to_reduce_readable_window() {
     let storage = shared_storage::<64>();
-    let mut writer = Writer::new_with_cfg(storage.clone(), |config| config.claim_reserve_ratio(0.25));
-    let reader = Reader::new(storage).with_initial_position(0);
+    let mut writer = storage
+        .clone()
+        .into_writer_with_cfg(|config| config.claim_reserve_ratio(0.25));
+    let reader = storage.into_reader_at(0);
 
     writer.claim(24, true).commit();
     writer.claim(24, true).commit();
@@ -1053,13 +987,13 @@ fn should_abort_publication() {
 #[test]
 fn should_attach_metadata() {
     let storage = shared_storage::<64>();
-    let _ = Writer::new_with_cfg(storage.clone(), |config| {
+    let _ = storage.clone().into_writer_with_cfg(|config| {
         config.metadata(|metadata| {
             assert_eq!(METADATA_BUFFER_SIZE, metadata.len());
             metadata[0..11].copy_from_slice(b"hello world");
         })
     });
-    let reader = Reader::new(storage);
+    let reader = storage.into_reader();
     assert_eq!(b"hello world", &reader.metadata()[..11]);
 }
 
@@ -1121,7 +1055,7 @@ fn should_join_writer() {
 
     // first writer will write from the beginning
     {
-        let mut writer = Writer::new(storage.clone());
+        let mut writer = storage.clone().into_writer();
         writer.claim_with_user_defined(16, true, 100).commit();
         writer.claim_with_user_defined(16, true, 101).commit();
         writer.claim_with_user_defined(16, true, 102).commit();
@@ -1129,14 +1063,14 @@ fn should_join_writer() {
 
     // second writer will pick up from the current position
     {
-        let mut writer = Writer::join(storage.clone());
+        let mut writer = storage.clone().join_writer();
         writer.claim_with_user_defined(16, true, 103).commit();
         writer.claim_with_user_defined(16, true, 104).commit();
         writer.claim_with_user_defined(16, true, 105).commit();
     }
 
     // verify we got all the messages
-    let reader = Reader::new(storage).with_initial_position(0);
+    let reader = storage.into_reader_at(0);
     assert_eq!(100, receive_user_defined(&reader));
     assert_eq!(101, receive_user_defined(&reader));
     assert_eq!(102, receive_user_defined(&reader));

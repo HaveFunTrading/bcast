@@ -77,11 +77,11 @@ impl WriterConfig {
 /// # Example
 ///
 /// ```
-/// use bcast::{LocalStorage, Reader, StorageExt, Writer};
+/// use bcast::{LocalStorage, StorageExt};
 ///
 /// let storage = LocalStorage::with_capacity(1024).into_shared();
-/// let mut writer = Writer::new(storage.clone());
-/// let reader = Reader::new(storage);
+/// let mut writer = storage.clone().into_writer();
+/// let reader = storage.into_reader();
 ///
 /// writer.send(b"hello", true);
 ///
@@ -196,11 +196,11 @@ impl<S> Writer<S> {
     /// # Example
     ///
     /// ```
-    /// use bcast::{LocalStorage, Reader, StorageExt, Writer};
+    /// use bcast::{LocalStorage, StorageExt};
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
-    /// let mut writer = Writer::new(storage.clone());
-    /// let reader = Reader::new(storage);
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
     ///
     /// let mut claim = writer.claim(5, true);
     /// claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -241,11 +241,11 @@ impl<S> Writer<S> {
     /// # Example
     ///
     /// ```
-    /// use bcast::{LocalStorage, Reader, StorageExt, Writer};
+    /// use bcast::{LocalStorage, StorageExt};
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
-    /// let mut writer = Writer::new(storage.clone());
-    /// let reader = Reader::new(storage);
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
     ///
     /// writer.publish(5, true, |payload| payload.copy_from_slice(b"hello"));
     ///

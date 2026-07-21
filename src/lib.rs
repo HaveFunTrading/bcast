@@ -4,10 +4,10 @@
 //! ## Examples
 //! Create `Writer` and use `claim` to publish a message.
 //! ```no_run
-//! use bcast::{LocalStorage, Writer};
+//! use bcast::{LocalStorage, StorageExt};
 //!
 //! let storage = LocalStorage::with_capacity(1024);
-//! let mut writer = Writer::new(storage);
+//! let mut writer = storage.into_writer();
 //!
 //! // publish first message
 //! let mut claim = writer.claim(5, true);
@@ -21,10 +21,10 @@
 //! ```
 //! Create `Reader` and use `read_batch` to receive messages.
 //! ```no_run
-//! use bcast::{LocalStorage, Reader};
+//! use bcast::{LocalStorage, StorageExt};
 //!
 //! let storage = LocalStorage::with_capacity(1024);
-//! let reader = Reader::new(storage);
+//! let reader = storage.into_reader();
 //! let mut batch = reader.read_batch().unwrap();
 //! let mut payload = [0u8; 1024];
 //!
@@ -51,7 +51,7 @@ mod writer;
 mod mmap;
 
 pub use error::{Error, Result};
-pub use reader::{Aligned, Batch, Bulk, BulkIter, Message, Reader, Unaligned};
+pub use reader::{Batch, Bulk, BulkIter, Message, Reader};
 pub use storage::{LocalStorage, SharedStorage, Storage, StorageExt, WriteStorage};
 pub use writer::{Claim, Writer, WriterConfig};
 

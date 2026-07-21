@@ -32,7 +32,7 @@
 //! # }
 //! ```
 
-use crate::{Reader, Storage, WriteStorage, Writer, WriterConfig};
+use crate::{Reader, Storage, StorageExt, WriteStorage, Writer, WriterConfig};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use std::hint;
 use std::ops::{Deref, DerefMut};
@@ -58,11 +58,11 @@ impl MmapStorage {
     /// # Example
     ///
     /// ```no_run
-    /// use bcast::{MmapStorage, Reader};
+    /// use bcast::{MmapStorage, StorageExt};
     ///
     /// # fn main() -> std::io::Result<()> {
     /// let storage = MmapStorage::attach("/tmp/channel.bcast")?;
-    /// let reader = Reader::new(storage);
+    /// let reader = storage.into_reader();
     /// let _metadata = reader.metadata();
     /// # Ok(())
     /// # }
@@ -105,12 +105,12 @@ impl MmapMutStorage {
     /// # Example
     ///
     /// ```no_run
-    /// use bcast::{HEADER_SIZE, MmapMutStorage, Writer};
+    /// use bcast::{HEADER_SIZE, MmapMutStorage, StorageExt};
     ///
     /// # fn main() -> std::io::Result<()> {
     /// let path = std::env::temp_dir().join("bcast-storage-example.mmap");
     /// let storage = MmapMutStorage::new(&path, HEADER_SIZE + 1024)?;
-    /// let mut writer = Writer::new(storage);
+    /// let mut writer = storage.into_writer();
     ///
     /// writer.send(b"hello", true);
     /// # let _ = std::fs::remove_file(path);
@@ -222,7 +222,7 @@ impl MappedWriter {
         config: F,
     ) -> std::io::Result<Self> {
         Ok(Self {
-            writer: Writer::new_with_cfg(MmapMutStorage::new(path, size)?, config),
+            writer: MmapMutStorage::new(path, size)?.into_writer_with_cfg(config),
         })
     }
 
@@ -239,7 +239,7 @@ impl MappedWriter {
         config: F,
     ) -> std::io::Result<Self> {
         Ok(Self {
-            writer: Writer::join_with_cfg(MmapMutStorage::attach(path)?, config),
+            writer: MmapMutStorage::attach(path)?.join_writer_with_cfg(config),
         })
     }
 
@@ -332,7 +332,7 @@ impl MappedReader {
             hint::spin_loop()
         }
         Ok(Self {
-            reader: Reader::new(MmapStorage::attach(path)?),
+            reader: MmapStorage::attach(path)?.into_reader(),
         })
     }
 
@@ -341,7 +341,7 @@ impl MappedReader {
     /// `position` must be aligned to the frame alignment used by the ring.
     pub fn new_with_position(path: impl AsRef<Path>, position: usize) -> std::io::Result<Self> {
         Ok(Self {
-            reader: Reader::new(MmapStorage::attach(path)?).with_initial_position(position),
+            reader: MmapStorage::attach(path)?.into_reader_at(position),
         })
     }
 
@@ -361,7 +361,7 @@ impl MappedReader {
             hint::spin_loop()
         }
         Ok(Self {
-            reader: Reader::new_at_last_lap(MmapStorage::attach(path)?),
+            reader: MmapStorage::attach(path)?.into_reader_at_last_lap(),
         })
     }
 }

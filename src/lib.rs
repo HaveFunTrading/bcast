@@ -576,47 +576,6 @@ impl Writer {
         claim.commit();
     }
 
-    /// Claim, write, and commit one message, aborting the claim if `write` returns an error.
-    ///
-    /// ## Panics
-    /// When aligned message length is greater than the `MTU`.
-    #[inline]
-    pub fn try_publish<E, F>(&mut self, len: usize, fin: bool, write: F) -> std::result::Result<(), E>
-    where
-        F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
-    {
-        self.try_publish_with_user_defined(len, fin, USER_DEFINED_NULL_VALUE, write)
-    }
-
-    /// Claim, write, and commit one message with a user defined frame header value, aborting the
-    /// claim if `write` returns an error.
-    ///
-    /// ## Panics
-    /// When aligned message length is greater than the `MTU`.
-    #[inline]
-    pub fn try_publish_with_user_defined<E, F>(
-        &mut self,
-        len: usize,
-        fin: bool,
-        user_defined: u32,
-        write: F,
-    ) -> std::result::Result<(), E>
-    where
-        F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
-    {
-        let mut claim = self.claim_with_user_defined(len, fin, user_defined);
-        match write(claim.get_buffer_mut()) {
-            Ok(()) => {
-                claim.commit();
-                Ok(())
-            }
-            Err(err) => {
-                claim.abort();
-                Err(err)
-            }
-        }
-    }
-
     /// Copy one message payload into the ring and commit it.
     ///
     /// ## Panics
@@ -2748,30 +2707,6 @@ mod tests {
         assert_eq!(msg.payload, b"hello world");
         assert!(!msg.is_fin);
         assert_eq!(123, msg.user_defined);
-    }
-
-    #[test]
-    fn should_abort_try_publish_on_error() {
-        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let mut writer = RingBuffer::new(&bytes).into_writer();
-        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
-
-        let result = writer.try_publish(16, true, |payload| {
-            payload.fill(0xAA);
-            Err("write failed")
-        });
-
-        assert_eq!(Err("write failed"), result);
-        assert_eq!(24, writer.position);
-        assert_eq!(24, writer.ring.header().producer_position.load(SeqCst));
-        assert_no_message(&reader);
-
-        writer.publish(8, true, |payload| payload.copy_from_slice(b"continue"));
-
-        let mut payload = [0u8; 8];
-        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
-
-        assert_eq!(msg.payload, b"continue");
     }
 
     #[test]

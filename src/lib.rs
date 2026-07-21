@@ -131,13 +131,10 @@ impl Header {
     }
 }
 
-/// Message frame header that contains packed `fields` (fin, continuation, padding, length)
-/// as well as `user_defined` field.
+/// Message frame header containing packed `fields` in the low 32 bits and `user_defined` in the
+/// high 32 bits.
 #[repr(C, align(8))]
-struct FrameHeader {
-    fields: Cell<u32>,       // contains padding flag and payload length
-    user_defined: Cell<u32>, // user defined field
-}
+struct FrameHeader(Cell<u64>);
 
 impl FrameHeader {
     #[inline]
@@ -151,10 +148,7 @@ impl FrameHeader {
         heartbeat: bool,
     ) -> Self {
         let fields = pack_fields(fin, continuation, padding, heartbeat, payload_len);
-        FrameHeader {
-            fields: Cell::new(fields),
-            user_defined: Cell::new(user_defined),
-        }
+        FrameHeader(Cell::new(pack_header(fields, user_defined)))
     }
 
     #[inline]
@@ -166,37 +160,52 @@ impl FrameHeader {
     #[inline]
     #[cfg(test)]
     fn is_heartbeat(&self) -> bool {
-        ((self.fields.get() >> 28) & 1) == 1
+        ((self.fields() >> 28) & 1) == 1
     }
 
     #[inline]
     #[cfg(test)]
     fn is_padding(&self) -> bool {
-        ((self.fields.get() >> 29) & 1) == 1
+        ((self.fields() >> 29) & 1) == 1
     }
 
     #[inline]
     #[cfg(test)]
     fn is_continuation(&self) -> bool {
-        ((self.fields.get() >> 30) & 1) == 1
+        ((self.fields() >> 30) & 1) == 1
     }
 
     #[inline]
     #[cfg(test)]
     fn is_fin(&self) -> bool {
-        ((self.fields.get() >> 31) & 1) == 1
+        ((self.fields() >> 31) & 1) == 1
     }
 
     #[inline]
     #[cfg(test)]
     fn payload_len(&self) -> u32 {
-        self.fields.get() & FRAME_HEADER_MSG_LEN_MASK
+        self.fields() & FRAME_HEADER_MSG_LEN_MASK
     }
 
     /// Extract `(fin, continuation, padding, heartbeat, length)` fields from the message header.
     #[inline]
-    fn unpack_fields(&self) -> (bool, bool, bool, bool, u32) {
-        unpack_fields(self.fields.get())
+    const fn unpack_fields(&self) -> (bool, bool, bool, bool, u32) {
+        unpack_fields(self.fields())
+    }
+
+    #[inline]
+    const fn fields(&self) -> u32 {
+        unpack_header(self.0.get()).0
+    }
+
+    #[inline]
+    const fn user_defined(&self) -> u32 {
+        unpack_header(self.0.get()).1
+    }
+
+    #[inline]
+    const fn set(&self, fields: u32, user_defined: u32) {
+        self.0.replace(pack_header(fields, user_defined));
     }
 
     /// Get pointer to the message payload.
@@ -238,6 +247,16 @@ const unsafe fn pack_fields_unchecked(
         | ((padding as u32) << 29)
         | ((continuation as u32) << 30)
         | ((fin as u32) << 31)
+}
+
+#[inline]
+const fn pack_header(fields: u32, user_defined: u32) -> u64 {
+    fields as u64 | ((user_defined as u64) << u32::BITS)
+}
+
+#[inline]
+const fn unpack_header(header: u64) -> (u32, u32) {
+    (header as u32, (header >> u32::BITS) as u32)
 }
 
 /// Unpacks `u32` field into a tuple: (fin, continuation, padding, heartbeat, length).
@@ -532,6 +551,94 @@ impl Writer {
         Claim::new(self, aligned_len, len, user_defined, fin, false, false)
     }
 
+    /// Claim, write, and commit one message. The `write` closure receives the claimed payload
+    /// buffer and must fill it before returning.
+    ///
+    /// ## Panics
+    /// When aligned message length is greater than the `MTU`.
+    #[inline]
+    pub fn publish<F>(&self, len: usize, fin: bool, write: F)
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        self.publish_with_user_defined(len, fin, USER_DEFINED_NULL_VALUE, write);
+    }
+
+    /// Claim, write, and commit one message with a user defined frame header value.
+    ///
+    /// ## Panics
+    /// When aligned message length is greater than the `MTU`.
+    #[inline]
+    pub fn publish_with_user_defined<F>(&self, len: usize, fin: bool, user_defined: u32, write: F)
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        let mut claim = self.claim_with_user_defined(len, fin, user_defined);
+        write(claim.get_buffer_mut());
+        claim.commit();
+    }
+
+    /// Claim, write, and commit one message, aborting the claim if `write` returns an error.
+    ///
+    /// ## Panics
+    /// When aligned message length is greater than the `MTU`.
+    #[inline]
+    pub fn try_publish<E, F>(&self, len: usize, fin: bool, write: F) -> std::result::Result<(), E>
+    where
+        F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
+    {
+        self.try_publish_with_user_defined(len, fin, USER_DEFINED_NULL_VALUE, write)
+    }
+
+    /// Claim, write, and commit one message with a user defined frame header value, aborting the
+    /// claim if `write` returns an error.
+    ///
+    /// ## Panics
+    /// When aligned message length is greater than the `MTU`.
+    #[inline]
+    pub fn try_publish_with_user_defined<E, F>(
+        &self,
+        len: usize,
+        fin: bool,
+        user_defined: u32,
+        write: F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
+    {
+        let mut claim = self.claim_with_user_defined(len, fin, user_defined);
+        match write(claim.get_buffer_mut()) {
+            Ok(()) => {
+                claim.commit();
+                Ok(())
+            }
+            Err(err) => {
+                claim.abort();
+                Err(err)
+            }
+        }
+    }
+
+    /// Copy one message payload into the ring and commit it.
+    ///
+    /// ## Panics
+    /// When aligned message length is greater than the `MTU`.
+    #[inline]
+    pub fn send(&self, payload: &[u8], fin: bool) {
+        self.send_with_user_defined(payload, fin, USER_DEFINED_NULL_VALUE);
+    }
+
+    /// Copy one message payload into the ring and commit it with a user defined frame header value.
+    ///
+    /// ## Panics
+    /// When aligned message length is greater than the `MTU`.
+    #[inline]
+    pub fn send_with_user_defined(&self, payload: &[u8], fin: bool, user_defined: u32) {
+        self.publish_with_user_defined(payload.len(), fin, user_defined, |buffer| {
+            buffer.copy_from_slice(payload);
+        });
+    }
+
     /// Claim part of the underlying `RingBuffer` for continuation frame publication also passing
     /// `fin` value to indicate final message fragment.
     ///
@@ -609,8 +716,7 @@ impl Writer {
     fn write_padding_frame(&self, padding_len: usize) {
         let fields = pack_fields(true, false, true, false, padding_len as u32);
         let header = self.frame_header();
-        let _ = header.fields.replace(fields);
-        let _ = header.user_defined.replace(USER_DEFINED_NULL_VALUE);
+        header.set(fields, USER_DEFINED_NULL_VALUE);
     }
 
     #[inline]
@@ -763,8 +869,7 @@ impl<'a> Claim<'a> {
         // update frame header
         let header = self.writer.frame_header();
         let fields = pack_fields(self.fin, self.continuation, false, self.heartbeat, self.limit as u32);
-        let _ = header.fields.replace(fields);
-        let _ = header.user_defined.replace(self.user_defined);
+        header.set(fields, self.user_defined);
 
         // advance writer position
         let _ = self.writer.position.replace(
@@ -934,7 +1039,7 @@ impl Reader {
         // extract frame header fields
         let frame_header = self.as_frame_header();
         let (is_fin, is_continuation, is_padding, is_heartbeat, length) = frame_header.unpack_fields();
-        let user_defined = frame_header.user_defined.get();
+        let user_defined = frame_header.user_defined();
         let claimed_position_after = self.refresh_claimed_position();
 
         // ensure we have not been overrun by the writer
@@ -1303,16 +1408,15 @@ impl<'a, Policy> BulkIter<'a, Policy> {
 }
 
 #[inline]
-const unsafe fn read_bulk_header_unaligned(ptr: *const u8) -> (u32, u32) {
-    let fields = unsafe { read_unaligned(ptr as *const u32) };
-    let user_defined = unsafe { read_unaligned(ptr.add(size_of::<u32>()) as *const u32) };
-    (fields, user_defined)
+unsafe fn read_bulk_header_unaligned(ptr: *const u8) -> (u32, u32) {
+    let header = unsafe { read_unaligned(ptr as *const u64) };
+    unpack_header(header)
 }
 
 #[inline]
-const unsafe fn read_bulk_header_aligned(ptr: *const u8) -> (u32, u32) {
+unsafe fn read_bulk_header_aligned(ptr: *const u8) -> (u32, u32) {
     let header = unsafe { &*(ptr as *const FrameHeader) };
-    (header.fields.get(), header.user_defined.get())
+    (header.fields(), header.user_defined())
 }
 
 impl<'a> Iterator for BulkIter<'a, Unaligned> {
@@ -2377,6 +2481,16 @@ mod tests {
     }
 
     #[test]
+    fn should_pack_and_unpack_header() {
+        let fields = pack_fields(true, false, false, true, 123);
+        let user_defined = 456;
+
+        let header = pack_header(fields, user_defined);
+
+        assert_eq!((fields, user_defined), unpack_header(header));
+    }
+
+    #[test]
     fn should_encode_and_decode_max_payload_len() {
         let frame = FrameHeader::new(MAX_PAYLOAD_LEN as u32, 0, true, false, false, false);
         assert!(frame.is_fin());
@@ -2607,6 +2721,63 @@ mod tests {
         let msg = reader.receive_next(&mut payload).unwrap().unwrap();
 
         assert_eq!(msg.payload, b"hello world");
+    }
+
+    #[test]
+    fn should_publish_message_using_closure() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        writer.publish_with_user_defined(11, true, 123, |payload| {
+            payload.copy_from_slice(b"hello world");
+        });
+
+        let mut payload = [0u8; 16];
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+
+        assert_eq!(msg.payload, b"hello world");
+        assert_eq!(123, msg.user_defined);
+    }
+
+    #[test]
+    fn should_send_message_from_payload_slice() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader();
+
+        writer.send_with_user_defined(b"hello world", false, 123);
+
+        let mut payload = [0u8; 16];
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+
+        assert_eq!(msg.payload, b"hello world");
+        assert!(!msg.is_fin);
+        assert_eq!(123, msg.user_defined);
+    }
+
+    #[test]
+    fn should_abort_try_publish_on_error() {
+        let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
+        let writer = RingBuffer::new(&bytes).into_writer();
+        let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
+
+        let result = writer.try_publish(16, true, |payload| {
+            payload.fill(0xAA);
+            Err("write failed")
+        });
+
+        assert_eq!(Err("write failed"), result);
+        assert_eq!(24, writer.position.get());
+        assert_eq!(24, writer.ring.header().producer_position.load(SeqCst));
+        assert_no_message(&reader);
+
+        writer.publish(8, true, |payload| payload.copy_from_slice(b"continue"));
+
+        let mut payload = [0u8; 8];
+        let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+
+        assert_eq!(msg.payload, b"continue");
     }
 
     #[test]

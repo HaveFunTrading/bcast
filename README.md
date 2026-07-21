@@ -20,6 +20,7 @@ Relative to the latest non-RC release, `0.0.29`, the 1.0 line makes the reader A
 - late readers can start from the retained most recent lap via `into_reader_at_last_lap()` / `MappedReader::new_at_last_lap(...)`
 - overrun detection now tracks the producer's claimed overwrite frontier separately from committed readable position, with writer-side claim reservation and reader-side producer-position caching to reduce shared cursor traffic
 - writer claim reservation is configured as a capacity ratio, for example `claim_reserve_ratio(0.05)` for 5%
+- writers can publish via scoped `publish(...)` closures or copy caller-owned payloads via `send(...)`, in addition to the lower-level `claim(...)` API
 
 ## Supported Platforms
 The crate has been developed and tested exclusively on `x86_64-linux`. It should also work (but it's by 
@@ -36,8 +37,22 @@ let bytes: &[u8] = ...;
 let writer = RingBuffer::new(bytes).into_writer();
 ```
 
-Writing takes place via `claim` operation that returns `Claim` object. We then have access to the underlying buffer to which
-we can write our variable length message.
+The simplest write API copies a caller-owned payload into the ring and commits it as a single message:
+
+```rust
+writer.send(b"hello", true);
+```
+
+To write directly into ring memory without creating an intermediate payload buffer, use `publish`. The closure receives
+the claimed payload region and the message is committed when the closure returns:
+
+```rust
+writer.publish(5, true, |payload| {
+    payload.copy_from_slice(b"hello");
+});
+```
+
+For lower-level zero-copy control, use `claim`. It returns a `Claim` object that exposes the underlying payload buffer:
 
 ```rust
 let mut claim = writer.claim(5, true);

@@ -62,6 +62,24 @@ impl<S: Storage> Reader<S> {
     /// reader.
     ///
     /// This waits until the ring header has been initialized by a writer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, Reader, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    ///
+    /// writer.send(b"before-reader", true);
+    ///
+    /// let reader = Reader::new(storage);
+    /// let mut payload = [0u8; 32];
+    /// assert!(reader.receive_next(&mut payload).is_none());
+    ///
+    /// writer.send(b"after-reader", true);
+    /// assert_eq!(b"after-reader", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
     pub fn new(storage: S) -> Self {
         let ring = RingBuffer::from_storage(&storage);
         Self::from_ring_at_producer_position(storage, ring)
@@ -75,6 +93,20 @@ impl<S: Storage> Reader<S> {
     /// readers that want as much recent data as can still be safely read.
     ///
     /// This waits until the ring header has been initialized by a writer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, Reader, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// writer.send(b"retained", true);
+    ///
+    /// let reader = Reader::new_at_last_lap(storage);
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"retained", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
     pub fn new_at_last_lap(storage: S) -> Self {
         let ring = RingBuffer::from_storage(&storage);
         ring.wait_until_ready();
@@ -112,6 +144,20 @@ impl<S: Storage> Reader<S> {
 
 impl<S> Reader<S> {
     /// Return the channel metadata buffer written during writer initialization.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let _writer = storage.clone().into_writer_with_cfg(|config| {
+    ///     config.metadata(|metadata| metadata[..4].copy_from_slice(b"meta"))
+    /// });
+    ///
+    /// let reader = storage.into_reader();
+    /// assert_eq!(b"meta", &reader.metadata()[..4]);
+    /// ```
     pub fn metadata(&self) -> &'static [u8] {
         self.ring.header().metadata()
     }
@@ -125,6 +171,20 @@ impl<S> Reader<S> {
     /// # Panics
     ///
     /// Panics if `position` is not aligned to the frame alignment.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, Reader, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// writer.send(b"hello", true);
+    ///
+    /// let reader = Reader::new(storage).with_initial_position(0);
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"hello", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
     pub fn with_initial_position(self, position: usize) -> Self {
         assert_eq!(get_aligned_size(position), position, "position must be aligned");
         let cached_producer_position = self.producer_position.get();
@@ -271,6 +331,21 @@ impl<S> Reader<S> {
     /// they appear in the ring data section. Use this when copying a larger
     /// chunk out of the ring is cheaper than receiving one message at a time.
     /// Returns `None` when there is no committed data to read.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader_at(0);
+    ///
+    /// writer.send(b"hello", true);
+    ///
+    /// let bulk = reader.read_bulk().unwrap().unwrap();
+    /// assert!(bulk.len() >= b"hello".len());
+    /// ```
     #[inline]
     pub fn read_bulk(&self) -> Option<Result<Bulk<'_, S>>> {
         let start_position = self.position.get();
@@ -377,6 +452,23 @@ impl<S> Reader<S> {
     /// next payload. Returns [`Error::Overrun`] if the writer has overwritten
     /// the frame before it could be read safely. Returns [`Error::CorruptFrame`]
     /// if the frame header describes payload bytes outside the ring.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader_at(0);
+    ///
+    /// writer.send(b"hello", true);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+    /// assert_eq!(b"hello", msg.payload);
+    /// assert!(reader.receive_next(&mut payload).is_none());
+    /// ```
     #[inline]
     pub fn receive_next<'a>(&self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
         loop {
@@ -405,6 +497,24 @@ impl<S> Reader<S> {
     ///
     /// Returns `None` when there is no committed message available. Padding
     /// frames are skipped internally.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader_at(0);
+    ///
+    /// writer.send(b"skip", true);
+    /// writer.send(b"read", true);
+    ///
+    /// assert_eq!(Some(Ok(())), reader.skip_next());
+    ///
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"read", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
     #[inline]
     pub fn skip_next(&self) -> Option<Result<()>> {
         loop {
@@ -466,6 +576,20 @@ pub struct Batch<'a, S> {
 
 impl<S> Batch<'_, S> {
     /// Return the number of raw frame bytes remaining in this batch.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader_at(0);
+    /// writer.send(b"hello", true);
+    ///
+    /// let batch = reader.read_batch().unwrap();
+    /// assert!(batch.remaining() >= b"hello".len());
+    /// ```
     #[inline]
     pub const fn remaining(&self) -> usize {
         self.remaining
@@ -482,6 +606,23 @@ impl<S> Batch<'_, S> {
     /// next payload. Returns [`Error::Overrun`] if the writer has overwritten
     /// the frame before it could be read safely. Returns [`Error::CorruptFrame`]
     /// if the frame header describes payload bytes outside the ring.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader_at(0);
+    ///
+    /// writer.send(b"hello", true);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let mut batch = reader.read_batch().unwrap();
+    /// assert_eq!(b"hello", batch.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// assert!(batch.receive_next(&mut payload).is_none());
+    /// ```
     #[inline]
     pub fn receive_next<'a>(&mut self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
         loop {
@@ -515,6 +656,23 @@ impl<S> Batch<'_, S> {
     /// Skip all remaining frames in this batch.
     ///
     /// On success the underlying reader advances to the end of the batch.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader_at(0);
+    ///
+    /// writer.send(b"old", true);
+    /// reader.read_batch().unwrap().skip_remaining().unwrap();
+    ///
+    /// writer.send(b"new", true);
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"new", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
     #[inline]
     pub fn skip_remaining(self) -> Result<()> {
         if self.remaining == 0 {
@@ -549,18 +707,60 @@ pub struct Bulk<'a, S> {
 #[allow(clippy::len_without_is_empty)]
 impl<S> Bulk<'_, S> {
     /// Return the number of raw frame bytes available in this bulk window.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader_at(0);
+    /// writer.send(b"hello", true);
+    ///
+    /// let bulk = reader.read_bulk().unwrap().unwrap();
+    /// assert!(bulk.len() >= b"hello".len());
+    /// ```
     #[inline]
     pub const fn len(&self) -> usize {
         self.len
     }
 
     /// Absolute stream position at which this bulk window starts.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader_at(0);
+    /// writer.send(b"hello", true);
+    ///
+    /// let bulk = reader.read_bulk().unwrap().unwrap();
+    /// assert_eq!(0, bulk.start_position());
+    /// ```
     #[inline]
     pub const fn start_position(&self) -> usize {
         self.start_position
     }
 
     /// Absolute stream position immediately after this bulk window.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader_at(0);
+    /// writer.send(b"hello", true);
+    ///
+    /// let bulk = reader.read_bulk().unwrap().unwrap();
+    /// assert_eq!(bulk.start_position() + bulk.len(), bulk.end_position());
+    /// ```
     #[inline]
     pub const fn end_position(&self) -> usize {
         self.end_position
@@ -579,6 +779,21 @@ impl<S> Bulk<'_, S> {
     /// Returns [`Error::InsufficientBufferSize`] if `dst` is smaller than
     /// [`Bulk::len`]. Returns [`Error::Overrun`] if the writer has overwritten
     /// any part of the window before it could be copied safely.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader_at(0);
+    /// writer.send(b"hello", true);
+    ///
+    /// let bulk = reader.read_bulk().unwrap().unwrap();
+    /// let mut bytes = vec![0u8; bulk.len()];
+    /// assert_eq!(bytes.len(), bulk.copy_into(&mut bytes).unwrap());
+    /// ```
     #[inline]
     pub fn copy_into(self, dst: &mut [u8]) -> Result<usize> {
         if dst.len() < self.len {
@@ -655,6 +870,25 @@ impl<'a> BulkIter<'a> {
     ///
     /// `start_position` must be the absolute stream position of the first byte
     /// in `bytes`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{BulkIter, LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader_at(0);
+    /// writer.send(b"hello", true);
+    ///
+    /// let bulk = reader.read_bulk().unwrap().unwrap();
+    /// let start_position = bulk.start_position();
+    /// let mut bytes = vec![0u8; bulk.len()];
+    /// let len = bulk.copy_into(&mut bytes).unwrap();
+    ///
+    /// let mut messages = BulkIter::new(&bytes[..len], start_position);
+    /// assert_eq!(b"hello", messages.next().unwrap().payload);
+    /// ```
     #[inline]
     pub const fn new(bytes: &'a [u8], start_position: usize) -> Self {
         Self {

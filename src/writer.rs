@@ -39,6 +39,20 @@ impl WriterConfig {
     /// The callback receives the full fixed-size metadata buffer and may write
     /// any application-specific bytes into it before readers observe the channel
     /// as ready.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let _writer = storage.clone().into_writer_with_cfg(|config| {
+    ///     config.metadata(|metadata| metadata[..4].copy_from_slice(b"meta"))
+    /// });
+    ///
+    /// let reader = storage.into_reader();
+    /// assert_eq!(b"meta", &reader.metadata()[..4]);
+    /// ```
     pub fn metadata(mut self, metadata: fn(&mut [u8])) -> Self {
         self.metadata = metadata;
         self
@@ -57,6 +71,19 @@ impl WriterConfig {
     /// # Panics
     ///
     /// Panics if `ratio` is outside `0.0..=0.5`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024);
+    /// let mut writer = storage.into_writer_with_cfg(|config| {
+    ///     config.claim_reserve_ratio(0.25)
+    /// });
+    ///
+    /// writer.send(b"hello", true);
+    /// ```
     pub fn claim_reserve_ratio(mut self, ratio: f64) -> Self {
         assert!((0.0..=MAX_CLAIM_RESERVE_RATIO).contains(&ratio), "claim reserve ratio must be in 0.0..=0.5");
         self.claim_reserve_ratio = ratio;
@@ -104,6 +131,21 @@ impl<S: WriteStorage> Writer<S> {
     ///
     /// Existing ring contents in `storage` are overwritten. Use [`Writer::join`]
     /// to continue writing to an already initialized channel.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt, Writer};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = Writer::new(storage.clone());
+    /// let reader = storage.into_reader();
+    ///
+    /// writer.send(b"hello", true);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"hello", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
     pub fn new(storage: S) -> Self {
         Self::new_with_cfg(storage, |config| config)
     }
@@ -112,6 +154,20 @@ impl<S: WriteStorage> Writer<S> {
     /// header at position zero.
     ///
     /// Existing ring contents in `storage` are overwritten.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt, Writer};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let _writer = Writer::new_with_cfg(storage.clone(), |config| {
+    ///     config.metadata(|metadata| metadata[..4].copy_from_slice(b"meta"))
+    /// });
+    ///
+    /// let reader = storage.into_reader();
+    /// assert_eq!(b"meta", &reader.metadata()[..4]);
+    /// ```
     pub fn new_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(storage: S, config: F) -> Self {
         let config = config(WriterConfig::default());
         let ring = RingBuffer::from_storage(&storage);
@@ -124,6 +180,26 @@ impl<S: WriteStorage> Writer<S> {
     ///
     /// This waits until the ring header has been initialized by the original
     /// writer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt, Writer};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// {
+    ///     let mut writer = storage.clone().into_writer();
+    ///     writer.send(b"one", true);
+    /// }
+    ///
+    /// let mut writer = Writer::join(storage.clone());
+    /// let reader = storage.into_reader_at(0);
+    /// writer.send(b"two", true);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"one", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// assert_eq!(b"two", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
     pub fn join(storage: S) -> Self {
         Self::join_with_cfg(storage, |config| config)
     }
@@ -133,6 +209,28 @@ impl<S: WriteStorage> Writer<S> {
     ///
     /// This waits until the ring header has been initialized by the original
     /// writer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt, Writer};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// {
+    ///     let mut writer = storage.clone().into_writer();
+    ///     writer.send(b"one", true);
+    /// }
+    ///
+    /// let mut writer = Writer::join_with_cfg(storage.clone(), |config| {
+    ///     config.claim_reserve_ratio(0.25)
+    /// });
+    /// let reader = storage.into_reader_at(0);
+    /// writer.send(b"two", true);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"one", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// assert_eq!(b"two", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
     pub fn join_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(storage: S, config: F) -> Self {
         let ring = RingBuffer::from_storage(&storage);
         ring.wait_until_ready();
@@ -149,6 +247,24 @@ impl<S: WriteStorage> Writer<S> {
     /// # Panics
     ///
     /// Panics if `position` is not aligned to the frame alignment.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt, Writer};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// {
+    ///     let _writer = storage.clone().into_writer();
+    /// }
+    ///
+    /// let mut writer = Writer::join_at(storage.clone(), 0);
+    /// let reader = storage.into_reader_at(0);
+    /// writer.send(b"hello", true);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"hello", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
     pub fn join_at(storage: S, position: usize) -> Self {
         Self::join_at_with_cfg(storage, position, |config| config)
     }
@@ -159,6 +275,26 @@ impl<S: WriteStorage> Writer<S> {
     /// # Panics
     ///
     /// Panics if `position` is not aligned to the frame alignment.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt, Writer};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// {
+    ///     let _writer = storage.clone().into_writer();
+    /// }
+    ///
+    /// let mut writer = Writer::join_at_with_cfg(storage.clone(), 0, |config| {
+    ///     config.claim_reserve_ratio(0.25)
+    /// });
+    /// let reader = storage.into_reader_at(0);
+    /// writer.send(b"hello", true);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"hello", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
     pub fn join_at_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(storage: S, position: usize, config: F) -> Self {
         let ring = RingBuffer::from_storage(&storage);
         ring.wait_until_ready();
@@ -221,6 +357,25 @@ impl<S> Writer<S> {
     /// Claim a payload buffer for zero-copy publication with a user-defined
     /// frame value.
     ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// let mut claim = writer.claim_with_user_defined(5, true, 123);
+    /// claim.get_buffer_mut().copy_from_slice(b"hello");
+    /// claim.commit();
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+    /// assert_eq!(b"hello", msg.payload);
+    /// assert_eq!(123, msg.user_defined);
+    /// ```
+    ///
     /// ## Panics
     ///
     /// Panics when the aligned payload length is greater than [`Writer::mtu`].
@@ -264,6 +419,25 @@ impl<S> Writer<S> {
 
     /// Claim, write, and commit one frame with a user-defined frame value.
     ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// writer.publish_with_user_defined(5, true, 123, |payload| {
+    ///     payload.copy_from_slice(b"hello");
+    /// });
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+    /// assert_eq!(b"hello", msg.payload);
+    /// assert_eq!(123, msg.user_defined);
+    /// ```
+    ///
     /// ## Panics
     ///
     /// Panics when the aligned payload length is greater than [`Writer::mtu`].
@@ -283,6 +457,21 @@ impl<S> Writer<S> {
     /// memory. Use [`Writer::claim`] or [`Writer::publish`] to avoid preparing a
     /// separate payload buffer.
     ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// writer.send(b"hello", true);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"hello", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
+    ///
     /// ## Panics
     ///
     /// Panics when the aligned payload length is greater than [`Writer::mtu`].
@@ -293,6 +482,23 @@ impl<S> Writer<S> {
 
     /// Copy one payload into the ring and commit it with a user-defined frame
     /// value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// writer.send_with_user_defined(b"hello", true, 123);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+    /// assert_eq!(b"hello", msg.payload);
+    /// assert_eq!(123, msg.user_defined);
+    /// ```
     ///
     /// ## Panics
     ///
@@ -309,6 +515,31 @@ impl<S> Writer<S> {
     /// Use continuation frames to fragment a logical message across multiple
     /// frames. Set `fin` to true on the final fragment.
     ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// writer.claim(5, false).commit();
+    /// let mut continuation = writer.continuation(5, true);
+    /// continuation.get_buffer_mut().copy_from_slice(b"world");
+    /// continuation.commit();
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let first = reader.receive_next(&mut payload).unwrap().unwrap();
+    /// assert!(!first.is_continuation);
+    /// assert!(!first.is_fin);
+    ///
+    /// let second = reader.receive_next(&mut payload).unwrap().unwrap();
+    /// assert_eq!(b"world", second.payload);
+    /// assert!(second.is_continuation);
+    /// assert!(second.is_fin);
+    /// ```
+    ///
     /// ## Panics
     ///
     /// Panics when the aligned payload length is greater than [`Writer::mtu`].
@@ -323,18 +554,71 @@ impl<S> Writer<S> {
     ///
     /// Heartbeat frames are visible to readers as messages with
     /// [`crate::Message::is_heartbeat`] set.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// writer.heartbeat().commit();
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+    /// assert!(msg.payload.is_empty());
+    /// assert!(msg.is_heartbeat);
+    /// ```
     #[inline]
     pub fn heartbeat(&mut self) -> Claim<'_, S> {
         Claim::new(self, 0, 0, USER_DEFINED_NULL_VALUE, true, false, true)
     }
 
     /// Claim a heartbeat frame with a user-defined value and no payload.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// writer.heartbeat_with_user_defined(123).commit();
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+    /// assert!(msg.is_heartbeat);
+    /// assert_eq!(123, msg.user_defined);
+    /// ```
     #[inline]
     pub fn heartbeat_with_user_defined(&mut self, user_defined: u32) -> Claim<'_, S> {
         Claim::new(self, 0, 0, user_defined, true, false, true)
     }
 
     /// Claim a heartbeat frame with payload and no user-defined value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// let mut heartbeat = writer.heartbeat_with_payload(5);
+    /// heartbeat.get_buffer_mut().copy_from_slice(b"hello");
+    /// heartbeat.commit();
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+    /// assert_eq!(b"hello", msg.payload);
+    /// assert!(msg.is_heartbeat);
+    /// ```
     ///
     /// ## Panics
     ///
@@ -347,6 +631,26 @@ impl<S> Writer<S> {
     }
 
     /// Claim a heartbeat frame with payload and a user-defined value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// let mut heartbeat = writer.heartbeat_with_payload_and_user_defined(5, 123);
+    /// heartbeat.get_buffer_mut().copy_from_slice(b"hello");
+    /// heartbeat.commit();
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+    /// assert_eq!(b"hello", msg.payload);
+    /// assert!(msg.is_heartbeat);
+    /// assert_eq!(123, msg.user_defined);
+    /// ```
     ///
     /// ## Panics
     ///
@@ -361,6 +665,16 @@ impl<S> Writer<S> {
     /// Return the maximum unaligned payload length accepted by one frame.
     ///
     /// It is calculated as `min(capacity / 2 - size_of::<FrameHeader>(), MAX_PAYLOAD_LEN)`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let writer = LocalStorage::with_capacity(1024).into_writer();
+    ///
+    /// assert!(writer.mtu() >= 5);
+    /// ```
     #[inline]
     pub const fn mtu(&self) -> usize {
         self.ring.mtu
@@ -438,6 +752,23 @@ impl<S> Writer<S> {
 ///
 /// Because a claim holds `&mut Writer`, the type system prevents multiple open
 /// claims from the same writer.
+///
+/// # Example
+///
+/// ```
+/// use bcast::{LocalStorage, StorageExt};
+///
+/// let storage = LocalStorage::with_capacity(1024).into_shared();
+/// let mut writer = storage.clone().into_writer();
+/// let reader = storage.into_reader();
+///
+/// let mut claim = writer.claim(5, true);
+/// claim.get_buffer_mut().copy_from_slice(b"hello");
+/// claim.commit();
+///
+/// let mut payload = [0u8; 16];
+/// assert_eq!(b"hello", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+/// ```
 #[derive(Debug)]
 pub struct Claim<'a, S> {
     writer: &'a mut Writer<S>, // underlying writer
@@ -498,6 +829,18 @@ impl<'a, S> Claim<'a, S> {
     }
 
     /// Return the claimed payload buffer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let mut writer = LocalStorage::with_capacity(1024).into_writer();
+    ///
+    /// let mut claim = writer.claim(5, true);
+    /// claim.get_buffer_mut().copy_from_slice(b"hello");
+    /// assert_eq!(b"hello", claim.get_buffer());
+    /// ```
     #[inline]
     pub const fn get_buffer(&self) -> &[u8] {
         let ptr = self.writer.frame_header().get_payload_ptr();
@@ -505,6 +848,23 @@ impl<'a, S> Claim<'a, S> {
     }
 
     /// Return the claimed payload buffer mutably.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// let mut claim = writer.claim(5, true);
+    /// claim.get_buffer_mut().copy_from_slice(b"hello");
+    /// claim.commit();
+    ///
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"hello", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
     #[inline]
     pub const fn get_buffer_mut(&mut self) -> &mut [u8] {
         let ptr = self.writer.frame_header_mut().get_payload_ptr_mut();
@@ -515,6 +875,21 @@ impl<'a, S> Claim<'a, S> {
     ///
     /// This consumes the claimed stream position; readers skip the resulting
     /// padding frame.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// writer.claim(5, true).abort();
+    ///
+    /// let mut payload = [0u8; 16];
+    /// assert!(reader.receive_next(&mut payload).is_none());
+    /// ```
     #[inline]
     pub fn abort(self) {
         let mut claim = ManuallyDrop::new(self);
@@ -541,6 +916,22 @@ impl<'a, S> Claim<'a, S> {
     ///
     /// If this method is not called, the claim is committed automatically when
     /// dropped.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let reader = storage.into_reader();
+    ///
+    /// writer.claim(0, true).commit();
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+    /// assert!(msg.payload.is_empty());
+    /// ```
     #[inline]
     pub fn commit(self) {
         // we need to ensure the destructor will not be called in this case

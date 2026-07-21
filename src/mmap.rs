@@ -1,52 +1,128 @@
-//! Provides wrappers for `Reader` and `Writer` to work with memory mapped files.
+//! Memory mapped storage and convenience wrappers.
+//!
+//! The `mmap` feature provides two levels of API:
+//!
+//! - [`MmapStorage`] and [`MmapMutStorage`] are storage adapters for the generic
+//!   [`Reader`] and [`Writer`] types.
+//! - [`MappedReader`] and [`MappedWriter`] are convenience wrappers that open the
+//!   memory map from a file path.
+//!
+//! The mapped file size must be `HEADER_SIZE + capacity`, where `capacity` is a
+//! power of two.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use bcast::{HEADER_SIZE, MappedReader, MappedWriter};
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let path = std::env::temp_dir().join("bcast-example.mmap");
+//! let size = HEADER_SIZE + 1024;
+//!
+//! let mut writer = MappedWriter::new(&path, size)?;
+//! let reader = MappedReader::new(&path)?;
+//!
+//! writer.send(b"hello", true);
+//!
+//! let mut payload = [0u8; 16];
+//! let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+//! assert_eq!(b"hello", msg.payload);
+//! # let _ = std::fs::remove_file(path);
+//! # Ok(())
+//! # }
+//! ```
 
-use crate::{Reader, RingBuffer, Writer, WriterConfig};
+use crate::{Reader, Storage, WriteStorage, Writer, WriterConfig};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use std::hint;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::ptr::NonNull;
 
-/// Writer backed by memory mapped object.
-pub struct MappedWriter {
-    writer: Writer,
-    #[allow(dead_code)]
+/// Read-only memory mapped ring storage.
+///
+/// This adapter owns a read-only [`Mmap`] and can be used with [`Reader`]. Use it
+/// when you want the generic reader API rather than the [`MappedReader`]
+/// convenience wrapper.
+pub struct MmapStorage {
+    mmap: Mmap,
+}
+
+impl MmapStorage {
+    /// Open an existing file as read-only ring storage.
+    ///
+    /// The file must already contain an initialized bcast ring. Readers wait for
+    /// the ring header through [`Reader::new`] or [`Reader::new_at_last_lap`],
+    /// not here.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use bcast::{MmapStorage, Reader};
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let storage = MmapStorage::attach("/tmp/channel.bcast")?;
+    /// let reader = Reader::new(storage);
+    /// let _metadata = reader.metadata();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn attach(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new().read(true).open(&path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        Ok(Self { mmap })
+    }
+}
+
+unsafe impl Storage for MmapStorage {
+    #[inline]
+    fn ptr(&self) -> NonNull<u8> {
+        NonNull::new(self.mmap.as_ptr() as *mut u8).unwrap()
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.mmap.len()
+    }
+}
+
+/// Writable memory mapped ring storage.
+///
+/// This adapter owns a writable [`MmapMut`] and can be used with [`Writer`]. Use
+/// it when you want the generic writer API rather than the [`MappedWriter`]
+/// convenience wrapper.
+pub struct MmapMutStorage {
     mmap: MmapMut,
 }
 
-impl Deref for MappedWriter {
-    type Target = Writer;
-
-    fn deref(&self) -> &Self::Target {
-        &self.writer
-    }
-}
-
-impl DerefMut for MappedWriter {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.writer
-    }
-}
-
-impl MappedWriter {
-    /// Construct writer backed by memory mapped file of certain size. If the file already
-    /// exists it will be removed. If you need to continue writing to existing file use
-    /// [`MappedWriter::join`] instead.
+impl MmapMutStorage {
+    /// Create a new writable mapped file of `size` bytes.
+    ///
+    /// If the path already exists it is removed first. Parent directories are
+    /// created when needed. The size must be valid for bcast ring construction:
+    /// `HEADER_SIZE + capacity`, where `capacity` is a power of two.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use bcast::{HEADER_SIZE, MmapMutStorage, Writer};
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let path = std::env::temp_dir().join("bcast-storage-example.mmap");
+    /// let storage = MmapMutStorage::new(&path, HEADER_SIZE + 1024)?;
+    /// let mut writer = Writer::new(storage);
+    ///
+    /// writer.send(b"hello", true);
+    /// # let _ = std::fs::remove_file(path);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(path: impl AsRef<Path>, size: usize) -> std::io::Result<Self> {
-        Self::new_with_cfg(path, size, |config| config)
-    }
-
-    /// Construct writer backed by memory mapped file of certain size using provided channel
-    /// configuration. If the file already exists it will be removed.
-    pub fn new_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(
-        path: impl AsRef<Path>,
-        size: usize,
-        config: F,
-    ) -> std::io::Result<Self> {
         if path.as_ref().exists() {
             std::fs::remove_file(path.as_ref())?;
         }
 
-        if let Some(parent) = path.as_ref().parent() {
+        if let Some(parent) = path.as_ref().parent().filter(|parent| !parent.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
 
@@ -60,44 +136,125 @@ impl MappedWriter {
         file.sync_all()?;
 
         let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-        let bytes = mmap.as_ref();
+        Ok(Self { mmap })
+    }
+
+    /// Open an existing file as writable ring storage.
+    ///
+    /// This does not initialize the ring header. Use [`Writer::join`] or
+    /// [`Writer::join_with_cfg`] with the returned storage to continue writing to
+    /// an existing channel.
+    pub fn attach(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        Ok(Self { mmap })
+    }
+}
+
+unsafe impl Storage for MmapMutStorage {
+    #[inline]
+    fn ptr(&self) -> NonNull<u8> {
+        NonNull::new(self.mmap.as_ptr() as *mut u8).unwrap()
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.mmap.len()
+    }
+}
+
+unsafe impl WriteStorage for MmapMutStorage {}
+
+/// Writer backed by a writable memory mapped file.
+///
+/// `MappedWriter` dereferences to [`Writer<MmapMutStorage>`], so the normal
+/// writer API is available directly.
+///
+/// # Example
+///
+/// ```no_run
+/// use bcast::{HEADER_SIZE, MappedWriter};
+///
+/// # fn main() -> std::io::Result<()> {
+/// let path = std::env::temp_dir().join("bcast-writer-example.mmap");
+/// let mut writer = MappedWriter::new(&path, HEADER_SIZE + 1024)?;
+///
+/// writer.publish(5, true, |payload| payload.copy_from_slice(b"hello"));
+/// writer.send_with_user_defined(b"world", true, 42);
+/// # let _ = std::fs::remove_file(path);
+/// # Ok(())
+/// # }
+/// ```
+pub struct MappedWriter {
+    writer: Writer<MmapMutStorage>,
+}
+
+impl Deref for MappedWriter {
+    type Target = Writer<MmapMutStorage>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.writer
+    }
+}
+
+impl DerefMut for MappedWriter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.writer
+    }
+}
+
+impl MappedWriter {
+    /// Create a writer backed by a new memory mapped file of `size` bytes.
+    ///
+    /// If the file already exists it is removed. To continue writing to an
+    /// existing file, use [`MappedWriter::join`] instead.
+    pub fn new(path: impl AsRef<Path>, size: usize) -> std::io::Result<Self> {
+        Self::new_with_cfg(path, size, |config| config)
+    }
+
+    /// Create a writer backed by a new memory mapped file using custom writer
+    /// configuration.
+    ///
+    /// If the file already exists it is removed.
+    pub fn new_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(
+        path: impl AsRef<Path>,
+        size: usize,
+        config: F,
+    ) -> std::io::Result<Self> {
         Ok(Self {
-            writer: RingBuffer::new(bytes).into_writer_with_cfg(config),
-            mmap,
+            writer: Writer::new_with_cfg(MmapMutStorage::new(path, size)?, config),
         })
     }
 
-    /// Construct writer backed by memory mapped file and continue writing from the most
-    /// recent position. It assumes the file already exists.
+    /// Open an existing mapped file and continue writing from the most recent
+    /// producer position.
     pub fn join(path: impl AsRef<Path>) -> std::io::Result<Self> {
         Self::join_with_cfg(path, |config| config)
     }
 
-    /// Construct writer backed by memory mapped file using provided channel configuration and
-    /// continue writing from the most recent position. It assumes the file already exists.
+    /// Open an existing mapped file with custom writer configuration and continue
+    /// writing from the most recent producer position.
     pub fn join_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(
         path: impl AsRef<Path>,
         config: F,
     ) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
-        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-        let bytes = mmap.as_ref();
         Ok(Self {
-            writer: RingBuffer::new(bytes).join_writer_with_cfg(config),
-            mmap,
+            writer: Writer::join_with_cfg(MmapMutStorage::attach(path)?, config),
         })
     }
 
-    /// Construct writer backed by memory mapped file and continue writing from the most
-    /// recent position if the file exists and is of the required size. Otherwise, it will delegate
-    /// writer creation to [`MappedWriter::new`].
+    /// Join an existing mapped file when it exists with `size` bytes, otherwise
+    /// create a new mapped writer.
+    ///
+    /// If the path exists with a different size, the file is replaced.
     pub fn join_or_create(path: impl AsRef<Path>, size: usize) -> std::io::Result<Self> {
         Self::join_or_create_with_cfg(path, size, |config| config)
     }
 
-    /// Construct writer backed by memory mapped file using provided channel configuration and
-    /// continue writing from the most recent position if the file exists and is of the required
-    /// size. Otherwise, it will delegate writer creation to [`MappedWriter::new_with_cfg`].
+    /// Join an existing mapped file with custom writer configuration when it
+    /// exists with `size` bytes, otherwise create a new mapped writer.
+    ///
+    /// If the path exists with a different size, the file is replaced.
     pub fn join_or_create_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(
         path: impl AsRef<Path>,
         size: usize,
@@ -116,14 +273,35 @@ impl MappedWriter {
     }
 }
 
-/// Reader backed by memory mapped object.
+/// Reader backed by a read-only memory mapped file.
+///
+/// `MappedReader` dereferences to [`Reader<MmapStorage>`], so the normal reader
+/// API is available directly.
+///
+/// # Example
+///
+/// ```no_run
+/// use bcast::{HEADER_SIZE, MappedReader, MappedWriter};
+///
+/// # fn main() -> std::io::Result<()> {
+/// let path = std::env::temp_dir().join("bcast-reader-example.mmap");
+/// let mut writer = MappedWriter::new(&path, HEADER_SIZE + 1024)?;
+/// writer.send(b"hello", true);
+///
+/// let reader = MappedReader::new_with_position(&path, 0)?;
+/// let mut payload = [0u8; 16];
+/// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+/// assert_eq!(b"hello", msg.payload);
+/// # let _ = std::fs::remove_file(path);
+/// # Ok(())
+/// # }
+/// ```
 pub struct MappedReader {
-    reader: Reader,
-    _mmap: Mmap,
+    reader: Reader<MmapStorage>,
 }
 
 impl Deref for MappedReader {
-    type Target = Reader;
+    type Target = Reader<MmapStorage>;
 
     fn deref(&self) -> &Self::Target {
         &self.reader
@@ -137,10 +315,14 @@ impl DerefMut for MappedReader {
 }
 
 impl MappedReader {
-    /// Construct reader backed by memory mapped file with initial position set to producer
-    /// most recent position.
+    /// Open a reader with its initial position set to the producer's current
+    /// position.
+    ///
+    /// This is suitable for consumers that only want messages published after
+    /// they attach. The call waits until the mapped file has non-zero length;
+    /// the underlying [`Reader`] waits until the ring header is initialized.
     pub fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        let file = std::fs::OpenOptions::new().read(true).open(&path)?;
         // wait until file has been initialised
         loop {
             let len = file.metadata()?.len() as usize;
@@ -149,30 +331,27 @@ impl MappedReader {
             }
             hint::spin_loop()
         }
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let bytes = mmap.as_ref();
         Ok(Self {
-            reader: RingBuffer::new(bytes).into_reader(),
-            _mmap: mmap,
+            reader: Reader::new(MmapStorage::attach(path)?),
         })
     }
 
-    /// Construct reader backed by memory mapped file with specific initial position.
+    /// Open a reader at a specific stream position.
+    ///
+    /// `position` must be aligned to the frame alignment used by the ring.
     pub fn new_with_position(path: impl AsRef<Path>, position: usize) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new().read(true).open(path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let bytes = mmap.as_ref();
         Ok(Self {
-            reader: RingBuffer::new(bytes).into_reader().with_initial_position(position),
-            _mmap: mmap,
+            reader: Reader::new(MmapStorage::attach(path)?).with_initial_position(position),
         })
     }
 
-    /// Construct reader backed by memory mapped file with initial position set to the start of the
-    /// most recent physical ring lap if that position is in the current ring window, otherwise to
-    /// the producer most recent position.
+    /// Open a reader at the start of the most recent physical ring lap when that
+    /// position is still retained.
+    ///
+    /// If the lap start has already been overwritten, the reader starts at the
+    /// producer's current position instead.
     pub fn new_at_last_lap(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        let file = std::fs::OpenOptions::new().read(true).open(&path)?;
         // wait until file has been initialised
         loop {
             let len = file.metadata()?.len() as usize;
@@ -181,11 +360,8 @@ impl MappedReader {
             }
             hint::spin_loop()
         }
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let bytes = mmap.as_ref();
         Ok(Self {
-            reader: RingBuffer::new(bytes).into_reader_at_last_lap(),
-            _mmap: mmap,
+            reader: Reader::new_at_last_lap(MmapStorage::attach(path)?),
         })
     }
 }

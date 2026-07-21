@@ -1,5 +1,4 @@
-use bcast::{HEADER_SIZE, RingBuffer, Writer};
-use std::slice::from_raw_parts;
+use bcast::{HEADER_SIZE, LocalStorage, Reader, StorageExt, Writer};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Will measure receive delays between producer and consumer. The producer will attach current
@@ -10,12 +9,11 @@ const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024 * 1024 * 32;
 const NUM_MESSAGES: usize = 1_000_000;
 
 fn main() -> anyhow::Result<()> {
-    let bytes = vec![0u8; RING_BUFFER_SIZE];
-    let addr = bytes.as_ptr() as usize;
+    let storage = LocalStorage::new(RING_BUFFER_SIZE).into_shared();
 
+    let receiver_storage = storage.clone();
     let receiver = std::thread::spawn(move || {
-        let bytes = unsafe { from_raw_parts(addr as *const u8, RING_BUFFER_SIZE) };
-        let rx = RingBuffer::new(bytes).into_reader().with_initial_position(0);
+        let rx = Reader::new(receiver_storage).with_initial_position(0);
 
         let mut payload = [0u8; 8];
 
@@ -79,8 +77,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let sender = std::thread::spawn(move || {
-        let bytes = unsafe { from_raw_parts(addr as *const u8, RING_BUFFER_SIZE) };
-        let mut tx = RingBuffer::new(bytes).into_writer();
+        let mut tx = Writer::new(storage);
         let mut msg_count: usize = 0;
 
         loop {
@@ -92,7 +89,7 @@ fn main() -> anyhow::Result<()> {
 
             #[cold]
             #[inline(never)]
-            fn send_poison(tx: &mut Writer) {
+            fn send_poison<S>(tx: &mut Writer<S>) {
                 // send POISON pill
                 let mut claim = tx.claim(8, true);
                 let bytes = u64::to_le_bytes(0);

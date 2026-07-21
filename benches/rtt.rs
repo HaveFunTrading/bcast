@@ -1,5 +1,4 @@
-use bcast::{HEADER_SIZE, RingBuffer, Writer};
-use std::slice::from_raw_parts;
+use bcast::{HEADER_SIZE, LocalStorage, Reader, StorageExt, Writer};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Will measure round trip time (RTT). There are 2 shared buffers, one for outgoing messages whose
@@ -11,16 +10,14 @@ const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024 * 1024 * 32;
 const NUM_MESSAGES: usize = 1_000_000;
 
 fn main() -> anyhow::Result<()> {
-    let bytes_tx = vec![0u8; RING_BUFFER_SIZE];
-    let bytes_rx = vec![0u8; RING_BUFFER_SIZE];
-    let addr_tx = bytes_tx.as_ptr() as usize;
-    let addr_rx = bytes_rx.as_ptr() as usize;
+    let outbound = LocalStorage::new(RING_BUFFER_SIZE).into_shared();
+    let inbound = LocalStorage::new(RING_BUFFER_SIZE).into_shared();
 
+    let outbound_for_receiver = outbound.clone();
+    let inbound_for_receiver = inbound.clone();
     let receiver = std::thread::spawn(move || {
-        let bytes_tx = unsafe { from_raw_parts(addr_rx as *const u8, RING_BUFFER_SIZE) };
-        let bytes_rx = unsafe { from_raw_parts(addr_tx as *const u8, RING_BUFFER_SIZE) };
-        let mut tx = RingBuffer::new(bytes_tx).into_writer();
-        let rx = RingBuffer::new(bytes_rx).into_reader().with_initial_position(0);
+        let mut tx = Writer::new(inbound_for_receiver);
+        let rx = Reader::new(outbound_for_receiver).with_initial_position(0);
         let mut payload = [0u8; 8];
 
         'outer: loop {
@@ -48,10 +45,8 @@ fn main() -> anyhow::Result<()> {
     });
 
     let sender = std::thread::spawn(move || {
-        let bytes_tx = unsafe { from_raw_parts(addr_tx as *const u8, RING_BUFFER_SIZE) };
-        let bytes_rx = unsafe { from_raw_parts(addr_rx as *const u8, RING_BUFFER_SIZE) };
-        let mut tx = RingBuffer::new(bytes_tx).into_writer();
-        let rx = RingBuffer::new(bytes_rx).into_reader().with_initial_position(0);
+        let mut tx = Writer::new(outbound);
+        let rx = Reader::new(inbound).with_initial_position(0);
 
         let mut payload = [0u8; 8];
         let mut msg_count: usize = 0;
@@ -77,7 +72,7 @@ fn main() -> anyhow::Result<()> {
 
             #[cold]
             #[inline(never)]
-            fn send_poison(tx: &mut Writer) {
+            fn send_poison<S>(tx: &mut Writer<S>) {
                 // send POISON pill
                 let mut claim = tx.claim(8, true);
                 let bytes = u64::to_le_bytes(0);

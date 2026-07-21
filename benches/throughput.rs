@@ -1,6 +1,5 @@
-use bcast::{HEADER_SIZE, Reader, RingBuffer};
+use bcast::{HEADER_SIZE, LocalStorage, Reader, SharedStorage, StorageExt, Writer};
 use std::hint::black_box;
-use std::slice::from_raw_parts;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -74,9 +73,8 @@ fn main() {
 }
 
 fn run_case(api: ReaderApi, reserve_ratio: f64, reader_count: usize) -> CaseResult {
-    let bytes = vec![0u8; RING_BUFFER_SIZE];
-    let addr = bytes.as_ptr() as usize;
-    let mut writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_ratio(reserve_ratio));
+    let storage = LocalStorage::new(RING_BUFFER_SIZE).into_shared();
+    let mut writer = Writer::new_with_cfg(storage.clone(), |config| config.claim_reserve_ratio(reserve_ratio));
     let payload = [0xAB; MESSAGE_SIZE];
     let stop = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(reader_count + 1));
@@ -85,7 +83,8 @@ fn run_case(api: ReaderApi, reserve_ratio: f64, reader_count: usize) -> CaseResu
         .map(|_| {
             let stop = Arc::clone(&stop);
             let barrier = Arc::clone(&barrier);
-            thread::spawn(move || reader_loop(addr, api, stop, barrier))
+            let storage = storage.clone();
+            thread::spawn(move || reader_loop(storage, api, stop, barrier))
         })
         .collect::<Vec<_>>();
 
@@ -118,9 +117,13 @@ struct ReaderStats {
     overruns: usize,
 }
 
-fn reader_loop(addr: usize, api: ReaderApi, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> ReaderStats {
-    let bytes = unsafe { from_raw_parts(addr as *const u8, RING_BUFFER_SIZE) };
-    let reader = RingBuffer::new(bytes).into_reader().with_initial_position(0);
+fn reader_loop(
+    storage: SharedStorage<LocalStorage>,
+    api: ReaderApi,
+    stop: Arc<AtomicBool>,
+    barrier: Arc<Barrier>,
+) -> ReaderStats {
+    let reader = Reader::new(storage).with_initial_position(0);
 
     match api {
         ReaderApi::ReceiveNext => receive_next_loop(reader, stop, barrier),
@@ -129,7 +132,7 @@ fn reader_loop(addr: usize, api: ReaderApi, stop: Arc<AtomicBool>, barrier: Arc<
     }
 }
 
-fn receive_next_loop(reader: Reader, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> ReaderStats {
+fn receive_next_loop<S>(reader: Reader<S>, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> ReaderStats {
     let mut payload = [0u8; MESSAGE_SIZE];
     let mut messages = 0;
     let mut overruns = 0;
@@ -143,7 +146,7 @@ fn receive_next_loop(reader: Reader, stop: Arc<AtomicBool>, barrier: Arc<Barrier
     ReaderStats { messages, overruns }
 }
 
-fn read_batch_loop(reader: Reader, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> ReaderStats {
+fn read_batch_loop<S>(reader: Reader<S>, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> ReaderStats {
     let mut payload = [0u8; MESSAGE_SIZE];
     let mut messages = 0;
     let mut overruns = 0;
@@ -157,7 +160,7 @@ fn read_batch_loop(reader: Reader, stop: Arc<AtomicBool>, barrier: Arc<Barrier>)
     ReaderStats { messages, overruns }
 }
 
-fn read_bulk_loop(reader: Reader, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> ReaderStats {
+fn read_bulk_loop<S>(reader: Reader<S>, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> ReaderStats {
     let mut bulk = vec![0u8; CAPACITY];
     let mut messages = 0;
     let mut overruns = 0;
@@ -171,7 +174,7 @@ fn read_bulk_loop(reader: Reader, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) 
     ReaderStats { messages, overruns }
 }
 
-fn receive_next(reader: &Reader, payload: &mut [u8], messages: &mut usize, overruns: &mut usize) {
+fn receive_next<S>(reader: &Reader<S>, payload: &mut [u8], messages: &mut usize, overruns: &mut usize) {
     match reader.receive_next(payload) {
         Some(Ok(msg)) => {
             *messages += 1;
@@ -185,7 +188,7 @@ fn receive_next(reader: &Reader, payload: &mut [u8], messages: &mut usize, overr
     }
 }
 
-fn read_batch(reader: &Reader, payload: &mut [u8], messages: &mut usize, overruns: &mut usize) {
+fn read_batch<S>(reader: &Reader<S>, payload: &mut [u8], messages: &mut usize, overruns: &mut usize) {
     let Some(mut batch) = reader.read_batch() else {
         std::hint::spin_loop();
         return;
@@ -206,7 +209,7 @@ fn read_batch(reader: &Reader, payload: &mut [u8], messages: &mut usize, overrun
     }
 }
 
-fn read_bulk(reader: &Reader, bulk_bytes: &mut [u8], messages: &mut usize, overruns: &mut usize) {
+fn read_bulk<S>(reader: &Reader<S>, bulk_bytes: &mut [u8], messages: &mut usize, overruns: &mut usize) {
     let Some(bulk) = reader.read_bulk() else {
         std::hint::spin_loop();
         return;

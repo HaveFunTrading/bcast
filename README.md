@@ -15,7 +15,8 @@ Relative to the latest non-RC release, `0.0.29`, the 1.0 line makes the reader A
 - the lazy `Message::read(...)` API is removed; `Reader::receive_next(&mut payload)` and `Batch::receive_next(&mut payload)` now copy directly into caller-provided storage and return a `Message` view over that buffer
 - `BulkIter` now yields the same `Message` type as direct receives, so message metadata has one shape across the reader APIs
 - readers can discard without copying via `Reader::skip_next()` and `Batch::skip_remaining()`
-- late readers can start from the retained most recent lap via `into_reader_at_last_lap()` / `MappedReader::new_at_last_lap(...)`
+- readers and writers are now generic over owned storage handles; `LocalStorage`, mmap-backed storage and `SharedStorage` cover in-process and file-backed use cases
+- late readers can start from the retained most recent lap via `Reader::open_at_last_lap(...)` / `MappedReader::new_at_last_lap(...)`
 - overrun detection now tracks the producer's claimed overwrite frontier separately from committed readable position, with writer-side claim reservation and reader-side producer-position caching to reduce shared cursor traffic
 - writer claim reservation is configured as a capacity ratio, for example `claim_reserve_ratio(0.05)` for 5%
 - writers can publish via scoped `publish(...)` closures or copy caller-owned payloads via `send(...)`, in addition to the lower-level `claim(...)` API
@@ -28,12 +29,14 @@ to be properly supported feel free to contribute and submit a pull request.
 
 ## Example
 
-Create `Writer` by attaching it to the provided byte slice. It does not matter where the underlying bytes are stored, it
-could be on the heap, stack as well as a result of memory mapping of a file by the process.
+Create storage first, then attach a writer to it. `LocalStorage` owns heap-backed memory for in-process use. Use
+`into_shared()` when the same storage needs to be handed to a writer and one or more readers in the same process.
 
 ```rust
-let bytes: &[u8] = ...;
-let mut writer = RingBuffer::new(bytes).into_writer();
+use bcast::{LocalStorage, StorageExt, Writer};
+
+let storage = LocalStorage::with_capacity(1024).into_shared();
+let mut writer = Writer::create(storage.clone());
 ```
 
 The simplest write API copies a caller-owned payload into the ring and commits it as a single message:
@@ -60,18 +63,20 @@ claim.commit();
 ```
 
 The `commit` operation is optional as the new producer position (as a result of us writing to the buffer) will be made
-visible to other processes (threads) the moment the `Claim` is dropped. The `Reader` is constructed in similar way by attaching it to some 'shared' memory.
+visible to other processes (threads) the moment the `Claim` is dropped. The `Reader` is constructed by opening a storage
+handle over the same ring.
 
 ```rust
-let bytes: &[u8] = ...;
-let reader = RingBuffer::new(bytes).into_reader();
+use bcast::Reader;
+
+let reader = Reader::open(storage.clone());
 ```
 
 Late readers can also replay up to one lap of retained data from the most recent physical ring
 lap. The writer updates this marker only when a new frame starts at the beginning of the ring:
 
 ```rust
-let reader = RingBuffer::new(bytes).into_reader_at_last_lap();
+let reader = Reader::open_at_last_lap(storage.clone());
 ```
 
 The `Reader` is batch aware (it knows how far behind a producer it is) and can copy pending messages into a caller-provided buffer.
@@ -100,6 +105,8 @@ if let Some(bulk) = reader.read_bulk() {
 ```
 
 When the `mmap` feature is enabled, `MappedWriter` and `MappedReader` provide file-backed wrappers over the same API for IPC-style usage.
+The lower-level `MmapMutStorage` and `MmapStorage` types are also available if you want to construct `Writer` and
+`Reader` directly.
 
 ## Backpressure (and the lack of it)
 `bcast` design is to allow producer to process and publish messages at full line rate and deliver the same latency irrespective

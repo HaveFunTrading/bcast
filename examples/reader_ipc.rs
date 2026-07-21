@@ -1,5 +1,4 @@
 use crate::common::reader;
-use memmap2::MmapOptions;
 use std::fs::OpenOptions;
 
 mod common;
@@ -18,10 +17,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
-    let bytes = mmap.as_ref();
-
-    reader(bytes)?;
+    let reader_handle = bcast::MappedReader::new("test.dat")?;
+    reader(&reader_handle)?;
 
     Ok(())
 }

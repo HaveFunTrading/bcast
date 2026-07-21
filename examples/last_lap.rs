@@ -1,20 +1,19 @@
-use bcast::{HEADER_SIZE, RingBuffer};
+use bcast::{LocalStorage, Reader, StorageExt, Writer};
 use std::mem::MaybeUninit;
 
 const RING_CAPACITY: usize = 128;
-const RING_BUFFER_SIZE: usize = HEADER_SIZE + RING_CAPACITY;
 
-fn publish(writer: &mut bcast::Writer, label: &str, user_defined: u32) {
+fn publish<S>(writer: &mut bcast::Writer<S>, label: &str, user_defined: u32) {
     let mut claim = writer.claim_with_user_defined(label.len(), true, user_defined);
     claim.get_buffer_mut().copy_from_slice(label.as_bytes());
     claim.commit();
 }
 
 fn main() -> anyhow::Result<()> {
-    let bytes = bcast::util::AlignedBytes::<RING_BUFFER_SIZE>::new();
+    let storage = LocalStorage::with_capacity(RING_CAPACITY).into_shared();
 
     {
-        let mut writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = Writer::new(storage.clone());
 
         // Each message occupies 48 bytes: 8 bytes frame header + 40 bytes aligned payload.
         // The third publish cannot fit in the remaining 32 bytes, so it inserts padding and
@@ -24,7 +23,7 @@ fn main() -> anyhow::Result<()> {
         publish(&mut writer, "lap-1-message-0-------------------------", 2);
     }
 
-    let reader = RingBuffer::new(&bytes).into_reader_at_last_lap();
+    let reader = Reader::new_at_last_lap(storage);
     let mut payload = unsafe { MaybeUninit::new([0u8; RING_CAPACITY]).assume_init() };
 
     while let Some(msg) = reader.receive_next(&mut payload) {

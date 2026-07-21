@@ -1,12 +1,11 @@
 use anyhow::anyhow;
-use bcast::{RingBuffer, error::Error};
+use bcast::{Reader, Writer, error::Error};
 use rand::{Rng, thread_rng};
 use std::mem::MaybeUninit;
 
 /// Generate random message every 1 millisecond.
 #[allow(dead_code)]
-pub fn writer(bytes: &[u8]) {
-    let mut writer = RingBuffer::new(bytes).into_writer();
+pub fn writer<S>(writer: &mut Writer<S>) {
     loop {
         let symbol = thread_rng().gen_range(b'A'..=b'Z');
         let msg_len = thread_rng().gen_range(1..20);
@@ -22,8 +21,7 @@ pub fn writer(bytes: &[u8]) {
 /// defined field set by the writer) and sleep for 10 milliseconds in order to process messages
 /// in a batch.
 #[allow(dead_code)]
-pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
-    let reader = RingBuffer::new(bytes).into_reader();
+pub fn reader<S>(reader: &Reader<S>) -> anyhow::Result<()> {
     let mut payload = unsafe { MaybeUninit::new([0u8; 1024]).assume_init() };
     loop {
         #[cfg(debug_assertions)]
@@ -64,8 +62,7 @@ pub fn reader(bytes: &[u8]) -> anyhow::Result<()> {
 /// validation as `reader`, but copies the full bulk window first and then iterates over it
 /// off-ring.
 #[allow(dead_code)]
-pub fn bulk_reader(bytes: &[u8]) -> anyhow::Result<()> {
-    let reader = RingBuffer::new(bytes).into_reader();
+pub fn bulk_reader<S>(reader: &Reader<S>) -> anyhow::Result<()> {
     let mut bulk_bytes = Vec::new();
 
     loop {

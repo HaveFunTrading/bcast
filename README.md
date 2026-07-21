@@ -5,10 +5,8 @@
 
 ## Overview
 
-Low latency, single producer & many consumer (SPMC) ring buffer that works with shared memory. `bcast` natively supports variable message sizes (`&[u8]`) and offers two read styles:
-
-- message copy via `read_batch()` / `receive_next(&mut payload)`
-- raw bulk copy via `read_bulk()` for lower reader-side overhead
+Low latency, single producer & many consumer (SPMC) ring buffer that works with shared memory. `bcast` natively supports variable-sized byte messages,
+zero-copy writes and batch aware reads.
 
 ## What's changing in 1.0
 
@@ -21,6 +19,7 @@ Relative to the latest non-RC release, `0.0.29`, the 1.0 line makes the reader A
 - overrun detection now tracks the producer's claimed overwrite frontier separately from committed readable position, with writer-side claim reservation and reader-side producer-position caching to reduce shared cursor traffic
 - writer claim reservation is configured as a capacity ratio, for example `claim_reserve_ratio(0.05)` for 5%
 - writers can publish via scoped `publish(...)` closures or copy caller-owned payloads via `send(...)`, in addition to the lower-level `claim(...)` API
+- writer publication APIs now require mutable writer access, so the type system prevents multiple open claims from the same writer
 
 ## Supported Platforms
 The crate has been developed and tested exclusively on `x86_64-linux`. It should also work (but it's by 
@@ -34,7 +33,7 @@ could be on the heap, stack as well as a result of memory mapping of a file by t
 
 ```rust
 let bytes: &[u8] = ...;
-let writer = RingBuffer::new(bytes).into_writer();
+let mut writer = RingBuffer::new(bytes).into_writer();
 ```
 
 The simplest write API copies a caller-owned payload into the ring and commits it as a single message:

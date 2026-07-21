@@ -76,7 +76,7 @@ fn main() {
 fn run_case(api: ReaderApi, reserve_ratio: f64, reader_count: usize) -> CaseResult {
     let bytes = vec![0u8; RING_BUFFER_SIZE];
     let addr = bytes.as_ptr() as usize;
-    let writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_ratio(reserve_ratio));
+    let mut writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_ratio(reserve_ratio));
     let payload = [0xAB; MESSAGE_SIZE];
     let stop = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(reader_count + 1));

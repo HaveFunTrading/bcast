@@ -134,7 +134,7 @@ impl Header {
 /// Message frame header containing packed `fields` in the low 32 bits and `user_defined` in the
 /// high 32 bits.
 #[repr(C, align(8))]
-struct FrameHeader(Cell<u64>);
+struct FrameHeader(u64);
 
 impl FrameHeader {
     #[inline]
@@ -148,7 +148,7 @@ impl FrameHeader {
         heartbeat: bool,
     ) -> Self {
         let fields = pack_fields(fin, continuation, padding, heartbeat, payload_len);
-        FrameHeader(Cell::new(pack_header(fields, user_defined)))
+        FrameHeader(pack_header(fields, user_defined))
     }
 
     #[inline]
@@ -159,31 +159,31 @@ impl FrameHeader {
 
     #[inline]
     #[cfg(test)]
-    fn is_heartbeat(&self) -> bool {
+    const fn is_heartbeat(&self) -> bool {
         ((self.fields() >> 28) & 1) == 1
     }
 
     #[inline]
     #[cfg(test)]
-    fn is_padding(&self) -> bool {
+    const fn is_padding(&self) -> bool {
         ((self.fields() >> 29) & 1) == 1
     }
 
     #[inline]
     #[cfg(test)]
-    fn is_continuation(&self) -> bool {
+    const fn is_continuation(&self) -> bool {
         ((self.fields() >> 30) & 1) == 1
     }
 
     #[inline]
     #[cfg(test)]
-    fn is_fin(&self) -> bool {
+    const fn is_fin(&self) -> bool {
         ((self.fields() >> 31) & 1) == 1
     }
 
     #[inline]
     #[cfg(test)]
-    fn payload_len(&self) -> u32 {
+    const fn payload_len(&self) -> u32 {
         self.fields() & FRAME_HEADER_MSG_LEN_MASK
     }
 
@@ -195,17 +195,17 @@ impl FrameHeader {
 
     #[inline]
     const fn fields(&self) -> u32 {
-        unpack_header(self.0.get()).0
+        unpack_header(self.0).0
     }
 
     #[inline]
     const fn user_defined(&self) -> u32 {
-        unpack_header(self.0.get()).1
+        unpack_header(self.0).1
     }
 
     #[inline]
-    const fn set(&self, fields: u32, user_defined: u32) {
-        self.0.replace(pack_header(fields, user_defined));
+    const fn set(&mut self, fields: u32, user_defined: u32) {
+        self.0 = pack_header(fields, user_defined);
     }
 
     /// Get pointer to the message payload.
@@ -217,8 +217,8 @@ impl FrameHeader {
 
     /// Get mutable pointer to the message payload.
     #[inline]
-    const fn get_payload_ptr_mut(&self) -> *mut FrameHeader {
-        let message_header_ptr = self as *const FrameHeader as *mut FrameHeader;
+    const fn get_payload_ptr_mut(&mut self) -> *mut FrameHeader {
+        let message_header_ptr = self as *mut FrameHeader;
         unsafe { message_header_ptr.add(1) }
     }
 }
@@ -295,7 +295,7 @@ const fn is_position_at_or_after(position: usize, base: usize) -> bool {
 }
 
 #[inline]
-fn claim_reserve_bytes(capacity: usize, ratio: f64) -> usize {
+const fn claim_reserve_bytes(capacity: usize, ratio: f64) -> usize {
     if ratio <= 0.0 {
         return 0;
     }
@@ -332,8 +332,7 @@ impl Default for WriterConfig {
 
 impl WriterConfig {
     /// Set function used to populate the channel metadata buffer during initialisation.
-    #[inline]
-    pub const fn metadata(mut self, metadata: fn(&mut [u8])) -> Self {
+    pub fn metadata(mut self, metadata: fn(&mut [u8])) -> Self {
         self.metadata = metadata;
         self
     }
@@ -345,7 +344,6 @@ impl WriterConfig {
     /// A non-zero value reduces the reader's effective retained window by up to the reserved
     /// amount, but lets the writer avoid updating the shared claimed-position cursor on every claim.
     /// The default is `0.0`.
-    #[inline]
     pub fn claim_reserve_ratio(mut self, ratio: f64) -> Self {
         assert!((0.0..=MAX_CLAIM_RESERVE_RATIO).contains(&ratio), "claim reserve ratio must be in 0.0..=0.5");
         self.claim_reserve_ratio = ratio;
@@ -399,10 +397,10 @@ impl RingBuffer {
         };
         Writer {
             claim_reserve: claim_reserve_bytes(self.capacity, config.claim_reserve_ratio),
-            claimed_limit: Cell::new(claimed_limit),
+            claimed_limit,
             ring: self,
-            position: Cell::new(position),
-            lap_count: Cell::new(lap_count),
+            position,
+            lap_count,
         }
     }
 
@@ -515,10 +513,10 @@ impl RingBuffer {
 #[derive(Debug)]
 pub struct Writer {
     claim_reserve: usize,
-    claimed_limit: Cell<usize>,
+    claimed_limit: usize,
     ring: RingBuffer,
-    position: Cell<usize>, // local producer position
-    lap_count: Cell<usize>,
+    position: usize, // local producer position
+    lap_count: usize,
 }
 
 impl From<RingBuffer> for Writer {
@@ -534,7 +532,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn claim(&self, len: usize, fin: bool) -> Claim<'_> {
+    pub fn claim(&mut self, len: usize, fin: bool) -> Claim<'_> {
         self.claim_with_user_defined(len, fin, USER_DEFINED_NULL_VALUE)
     }
 
@@ -545,7 +543,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn claim_with_user_defined(&self, len: usize, fin: bool, user_defined: u32) -> Claim<'_> {
+    pub fn claim_with_user_defined(&mut self, len: usize, fin: bool, user_defined: u32) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, user_defined, fin, false, false)
@@ -557,7 +555,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn publish<F>(&self, len: usize, fin: bool, write: F)
+    pub fn publish<F>(&mut self, len: usize, fin: bool, write: F)
     where
         F: FnOnce(&mut [u8]),
     {
@@ -569,7 +567,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn publish_with_user_defined<F>(&self, len: usize, fin: bool, user_defined: u32, write: F)
+    pub fn publish_with_user_defined<F>(&mut self, len: usize, fin: bool, user_defined: u32, write: F)
     where
         F: FnOnce(&mut [u8]),
     {
@@ -583,7 +581,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn try_publish<E, F>(&self, len: usize, fin: bool, write: F) -> std::result::Result<(), E>
+    pub fn try_publish<E, F>(&mut self, len: usize, fin: bool, write: F) -> std::result::Result<(), E>
     where
         F: FnOnce(&mut [u8]) -> std::result::Result<(), E>,
     {
@@ -597,7 +595,7 @@ impl Writer {
     /// When aligned message length is greater than the `MTU`.
     #[inline]
     pub fn try_publish_with_user_defined<E, F>(
-        &self,
+        &mut self,
         len: usize,
         fin: bool,
         user_defined: u32,
@@ -624,7 +622,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn send(&self, payload: &[u8], fin: bool) {
+    pub fn send(&mut self, payload: &[u8], fin: bool) {
         self.send_with_user_defined(payload, fin, USER_DEFINED_NULL_VALUE);
     }
 
@@ -633,7 +631,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn send_with_user_defined(&self, payload: &[u8], fin: bool, user_defined: u32) {
+    pub fn send_with_user_defined(&mut self, payload: &[u8], fin: bool, user_defined: u32) {
         self.publish_with_user_defined(payload.len(), fin, user_defined, |buffer| {
             buffer.copy_from_slice(payload);
         });
@@ -645,7 +643,7 @@ impl Writer {
     /// ## Panics
     /// When aligned message length is greater than the `MTU`.
     #[inline]
-    pub fn continuation(&self, len: usize, fin: bool) -> Claim<'_> {
+    pub fn continuation(&mut self, len: usize, fin: bool) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, fin, true, false)
@@ -654,21 +652,21 @@ impl Writer {
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication (zero payload,
     /// no user defined field and no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat(&self) -> Claim<'_> {
+    pub fn heartbeat(&mut self) -> Claim<'_> {
         Claim::new(self, 0, 0, USER_DEFINED_NULL_VALUE, true, false, true)
     }
 
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with user defined
     /// field (zero payload and no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat_with_user_defined(&self, user_defined: u32) -> Claim<'_> {
+    pub fn heartbeat_with_user_defined(&mut self, user_defined: u32) -> Claim<'_> {
         Claim::new(self, 0, 0, user_defined, true, false, true)
     }
 
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with payload (no
     /// user defined field and no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat_with_payload(&self, len: usize) -> Claim<'_> {
+    pub fn heartbeat_with_payload(&mut self, len: usize) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, true, false, true)
@@ -677,7 +675,7 @@ impl Writer {
     /// Claim part of the underlying `RingBuffer` for heartbeat frame publication with payload and
     /// user defined field (no fragmentation). This operation will always succeed.
     #[inline]
-    pub fn heartbeat_with_payload_and_user_defined(&self, len: usize, user_defined: u32) -> Claim<'_> {
+    pub fn heartbeat_with_payload_and_user_defined(&mut self, len: usize, user_defined: u32) -> Claim<'_> {
         let aligned_len = get_aligned_size(len);
         debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, user_defined, true, false, true)
@@ -694,7 +692,7 @@ impl Writer {
     /// Buffer index at which next write will happen.
     #[inline]
     const fn index(&self) -> usize {
-        self.position.get() & (self.ring.capacity - 1)
+        self.position & (self.ring.capacity - 1)
     }
 
     /// Number of bytes remaining in the buffer before it will wrap around.
@@ -712,21 +710,30 @@ impl Writer {
         }
     }
 
+    /// Get mutable reference to the next (unpublished) message frame header;
     #[inline]
-    fn write_padding_frame(&self, padding_len: usize) {
+    const fn frame_header_mut(&mut self) -> &mut FrameHeader {
+        unsafe {
+            let ptr = self.ring.header().data_ptr();
+            &mut *(ptr.add(self.index()) as *mut FrameHeader)
+        }
+    }
+
+    #[inline]
+    const fn write_padding_frame(&mut self, padding_len: usize) {
         let fields = pack_fields(true, false, true, false, padding_len as u32);
-        let header = self.frame_header();
+        let header = self.frame_header_mut();
         header.set(fields, USER_DEFINED_NULL_VALUE);
     }
 
     #[inline]
-    fn reserve_claimed_position(&self, claim_end: usize) {
-        if !is_position_after(claim_end, self.claimed_limit.get()) {
+    fn reserve_claimed_position(&mut self, claim_end: usize) {
+        if !is_position_after(claim_end, self.claimed_limit) {
             return;
         }
 
         let claimed_limit = claim_end.wrapping_add(self.claim_reserve);
-        self.claimed_limit.set(claimed_limit);
+        self.claimed_limit = claimed_limit;
         self.ring
             .header()
             .claimed_position
@@ -734,14 +741,14 @@ impl Writer {
     }
 
     #[inline]
-    fn update_lap_count(&self, frame_start: usize) {
+    fn update_lap_count(&mut self, frame_start: usize) {
         if frame_start & (self.ring.capacity - 1) != 0 {
             return;
         }
 
         let lap_count = frame_start / self.ring.capacity;
-        if lap_count != self.lap_count.get() {
-            self.lap_count.set(lap_count);
+        if lap_count != self.lap_count {
+            self.lap_count = lap_count;
             self.ring.header().lap_count.store(lap_count, Ordering::Relaxed);
         }
     }
@@ -750,20 +757,20 @@ impl Writer {
 /// Represents region of the `RingBuffer` we can publish message to.
 #[derive(Debug)]
 pub struct Claim<'a> {
-    writer: &'a Writer, // underlying writer
-    len: usize,         // frame header aligned payload length
-    limit: usize,       // actual payload length
-    user_defined: u32,  // user defined field
-    fin: bool,          // final message fragment
-    continuation: bool, // continuation frame
-    heartbeat: bool,    // heartbeat frame
+    writer: &'a mut Writer, // underlying writer
+    len: usize,             // frame header aligned payload length
+    limit: usize,           // actual payload length
+    user_defined: u32,      // user defined field
+    fin: bool,              // final message fragment
+    continuation: bool,     // continuation frame
+    heartbeat: bool,        // heartbeat frame
 }
 
 impl<'a> Claim<'a> {
     /// Create new claim.
     #[inline]
     fn new(
-        writer: &'a Writer,
+        writer: &'a mut Writer,
         len: usize,
         limit: usize,
         user_defined: u32,
@@ -772,18 +779,13 @@ impl<'a> Claim<'a> {
         heartbeat: bool,
     ) -> Self {
         #[cold]
-        fn insert_padding_frame(writer: &Writer, remaining: usize) {
+        fn insert_padding_frame(writer: &mut Writer, remaining: usize) {
             let padding_len = remaining - size_of::<FrameHeader>();
             writer.write_padding_frame(padding_len);
-            let _ = writer.position.replace(
-                writer
-                    .position
-                    .get()
-                    .wrapping_add(padding_len + size_of::<FrameHeader>()),
-            );
+            writer.position = writer.position.wrapping_add(padding_len + size_of::<FrameHeader>());
         }
 
-        let position = writer.position.get();
+        let position = writer.position;
         let frame_len = len + size_of::<FrameHeader>();
 
         // insert padding frame if required
@@ -822,7 +824,7 @@ impl<'a> Claim<'a> {
     /// Get next message payload as mutable byte slice.
     #[inline]
     pub const fn get_buffer_mut(&mut self) -> &mut [u8] {
-        let ptr = self.writer.frame_header().get_payload_ptr_mut();
+        let ptr = self.writer.frame_header_mut().get_payload_ptr_mut();
         unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, self.limit) }
     }
 
@@ -830,20 +832,16 @@ impl<'a> Claim<'a> {
     /// This consumes the claimed stream position and readers will skip it.
     #[inline]
     pub fn abort(self) {
-        ManuallyDrop::new(self).abort_impl();
+        let mut claim = ManuallyDrop::new(self);
+        claim.abort_impl();
     }
 
     #[inline]
-    fn abort_impl(&self) {
-        let frame_start = self.writer.position.get();
+    fn abort_impl(&mut self) {
+        let frame_start = self.writer.position;
         self.writer.write_padding_frame(self.len);
 
-        let _ = self.writer.position.replace(
-            self.writer
-                .position
-                .get()
-                .wrapping_add(self.len + size_of::<FrameHeader>()),
-        );
+        self.writer.position = self.writer.position.wrapping_add(self.len + size_of::<FrameHeader>());
 
         self.writer.update_lap_count(frame_start);
 
@@ -851,7 +849,7 @@ impl<'a> Claim<'a> {
             .ring
             .header()
             .producer_position
-            .store(self.writer.position.get(), Ordering::Release);
+            .store(self.writer.position, Ordering::Release);
     }
 
     /// Commit the message thus making it visible to other consumers. If this operation is not
@@ -859,25 +857,21 @@ impl<'a> Claim<'a> {
     #[inline]
     pub fn commit(self) {
         // we need to ensure the destructor will not be called in this case
-        ManuallyDrop::new(self).commit_impl();
+        let mut claim = ManuallyDrop::new(self);
+        claim.commit_impl();
     }
 
     #[inline]
-    fn commit_impl(&self) {
-        let frame_start = self.writer.position.get();
+    fn commit_impl(&mut self) {
+        let frame_start = self.writer.position;
 
         // update frame header
-        let header = self.writer.frame_header();
+        let header = self.writer.frame_header_mut();
         let fields = pack_fields(self.fin, self.continuation, false, self.heartbeat, self.limit as u32);
         header.set(fields, self.user_defined);
 
         // advance writer position
-        let _ = self.writer.position.replace(
-            self.writer
-                .position
-                .get()
-                .wrapping_add(self.len + size_of::<FrameHeader>()),
-        );
+        self.writer.position = self.writer.position.wrapping_add(self.len + size_of::<FrameHeader>());
 
         // update last lap count if required
         self.writer.update_lap_count(frame_start);
@@ -887,7 +881,7 @@ impl<'a> Claim<'a> {
             .ring
             .header()
             .producer_position
-            .store(self.writer.position.get(), Ordering::Release);
+            .store(self.writer.position, Ordering::Release);
     }
 }
 
@@ -1061,13 +1055,13 @@ impl Reader {
     }
 
     #[inline]
-    fn advance_position(&self, frame_len: usize) {
+    const fn advance_position(&self, frame_len: usize) {
         let position = self.position.get();
-        self.position.set(position.wrapping_add(frame_len));
+        self.position.replace(position.wrapping_add(frame_len));
     }
 
     #[inline]
-    fn skip_frame(&self, frame: Frame) {
+    const fn skip_frame(&self, frame: Frame) {
         self.advance_position(frame.frame_len);
     }
 
@@ -1408,13 +1402,13 @@ impl<'a, Policy> BulkIter<'a, Policy> {
 }
 
 #[inline]
-unsafe fn read_bulk_header_unaligned(ptr: *const u8) -> (u32, u32) {
+const unsafe fn read_bulk_header_unaligned(ptr: *const u8) -> (u32, u32) {
     let header = unsafe { read_unaligned(ptr as *const u64) };
     unpack_header(header)
 }
 
 #[inline]
-unsafe fn read_bulk_header_aligned(ptr: *const u8) -> (u32, u32) {
+const unsafe fn read_bulk_header_aligned(ptr: *const u8) -> (u32, u32) {
     let header = unsafe { &*(ptr as *const FrameHeader) };
     (header.fields(), header.user_defined())
 }
@@ -1483,7 +1477,7 @@ mod tests {
     #[test]
     fn should_read_messages_in_batch() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim(5, true);
@@ -1511,14 +1505,14 @@ mod tests {
 
         assert_eq!(32, reader.index());
         assert_eq!(32, reader.position.get());
-        assert_eq!(32, writer.position.get());
+        assert_eq!(32, writer.position);
         assert_eq!(32, writer.remaining());
 
         let claim = writer.claim(15, true);
         claim.commit();
 
         assert_eq!(56, writer.index());
-        assert_eq!(56, writer.position.get());
+        assert_eq!(56, writer.position);
 
         let mut claim = writer.claim(4, true);
         claim.get_buffer_mut().copy_from_slice(b"test");
@@ -1535,13 +1529,13 @@ mod tests {
         assert_batch_empty(&mut batch);
 
         assert_eq!(reader.index(), writer.index());
-        assert_eq!(reader.position.get(), writer.position.get());
+        assert_eq!(reader.position.get(), writer.position);
     }
 
     #[test]
     fn should_read_bulk() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         let mut claim = writer.claim(5, true);
@@ -1566,7 +1560,7 @@ mod tests {
     #[test]
     fn should_iterate_bulk_messages() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         let mut claim = writer.claim_with_user_defined(5, true, 100);
@@ -1606,7 +1600,7 @@ mod tests {
     #[test]
     fn should_iterate_bulk_messages_with_aligned_policy() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         let mut claim = writer.claim_with_user_defined(5, true, 100);
@@ -1640,7 +1634,7 @@ mod tests {
     #[test]
     fn should_iterate_bulk_messages_via_bulk() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         let mut claim = writer.claim_with_user_defined(5, true, 100);
@@ -1672,7 +1666,7 @@ mod tests {
     #[test]
     fn should_iterate_bulk_messages_via_bulk_with_aligned_policy() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         let mut claim = writer.claim_with_user_defined(5, true, 100);
@@ -1705,7 +1699,7 @@ mod tests {
     fn should_skip_padding_frames_in_bulk_iter() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let _ = RingBuffer::new(&bytes).into_writer();
-        let writer = RingBuffer::new(&bytes).into_writer_at(56);
+        let mut writer = RingBuffer::new(&bytes).into_writer_at(56);
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
 
         let mut claim = writer.claim_with_user_defined(4, true, 300);
@@ -1729,7 +1723,7 @@ mod tests {
     fn should_read_wrapped_bulk() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let _ = RingBuffer::new(&bytes).into_writer();
-        let writer = RingBuffer::new(&bytes).into_writer_at(56);
+        let mut writer = RingBuffer::new(&bytes).into_writer_at(56);
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
 
         let claim = writer.claim(0, true);
@@ -1757,7 +1751,7 @@ mod tests {
     #[test]
     fn should_overrun_read_bulk() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         writer.claim(16, true).commit();
@@ -1774,7 +1768,7 @@ mod tests {
     fn should_allow_bulk_reader_to_recover_from_initial_overrun_after_reset() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
         let _ = RingBuffer::new(&bytes).into_writer();
-        let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
+        let mut writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
         let reader = RingBuffer::new(&bytes)
             .into_reader()
             .with_initial_position(usize::MAX - 2047);
@@ -1793,23 +1787,23 @@ mod tests {
 
         reader.reset();
         assert!(reader.read_bulk().is_none());
-        assert_eq!(reader.position.get(), writer.position.get());
+        assert_eq!(reader.position.get(), writer.position);
 
-        let start_position = writer.position.get();
+        let start_position = writer.position;
         writer.claim_with_user_defined(1000, true, 104).commit();
 
         let bulk = reader.read_bulk().unwrap().unwrap();
         assert_eq!(start_position, bulk.start_position());
-        assert_eq!(writer.position.get(), bulk.end_position());
+        assert_eq!(writer.position, bulk.end_position());
         let mut dst = vec![0_u8; bulk.len()];
         assert_eq!(bulk.len(), bulk.copy_into(&mut dst).unwrap());
-        assert_eq!(writer.position.get(), reader.position.get());
+        assert_eq!(writer.position, reader.position.get());
     }
 
     #[test]
     fn should_error_if_bulk_overruns_during_copy() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         writer.claim(16, true).commit();
@@ -1830,7 +1824,7 @@ mod tests {
     #[test]
     fn should_allow_bulk_reader_to_recover_from_copy_overrun_after_reset() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         writer.claim_with_user_defined(16, true, 100).commit();
@@ -1849,24 +1843,24 @@ mod tests {
 
         reader.reset();
         assert!(reader.read_bulk().is_none());
-        assert_eq!(reader.position.get(), writer.position.get());
+        assert_eq!(reader.position.get(), writer.position);
 
-        let start_position = writer.position.get();
+        let start_position = writer.position;
         writer.claim_with_user_defined(16, true, 106).commit();
 
         let bulk = reader.read_bulk().unwrap().unwrap();
         assert_eq!(24, bulk.len());
         assert_eq!(start_position, bulk.start_position());
-        assert_eq!(writer.position.get(), bulk.end_position());
+        assert_eq!(writer.position, bulk.end_position());
         let mut dst = vec![0_u8; bulk.len()];
         assert_eq!(24, bulk.copy_into(&mut dst).unwrap());
-        assert_eq!(writer.position.get(), reader.position.get());
+        assert_eq!(writer.position, reader.position.get());
     }
 
     #[test]
     fn should_read_in_batch_with_limit() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim(1, true);
@@ -1903,7 +1897,7 @@ mod tests {
     #[test]
     fn should_cache_producer_position_until_reader_catches_up() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         writer.claim_with_user_defined(0, true, 100).commit();
         writer.claim_with_user_defined(0, true, 200).commit();
@@ -1928,7 +1922,7 @@ mod tests {
     #[test]
     fn should_read_batch_from_cached_producer_position_until_reader_catches_up() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         writer.claim_with_user_defined(0, true, 100).commit();
         writer.claim_with_user_defined(0, true, 200).commit();
@@ -1954,7 +1948,7 @@ mod tests {
     #[test]
     fn should_resume_batch_if_previous_not_consumed() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim_with_user_defined(0, true, 100).commit();
@@ -1976,7 +1970,7 @@ mod tests {
     #[test]
     fn should_read_next_message_if_batch_not_consumed() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim_with_user_defined(0, true, 100).commit();
@@ -1997,7 +1991,7 @@ mod tests {
     #[test]
     fn should_not_extend_batch_when_new_messages_arrive() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim_with_user_defined(0, true, 100).commit();
@@ -2021,7 +2015,7 @@ mod tests {
     #[test]
     fn should_read_next_message() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim(1, true);
@@ -2052,7 +2046,7 @@ mod tests {
     #[test]
     fn should_skip_next_message() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim_with_user_defined(1, true, 100).commit();
@@ -2074,7 +2068,7 @@ mod tests {
     fn should_skip_padding_when_skipping_next_message() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let _ = RingBuffer::new(&bytes).into_writer();
-        let writer = RingBuffer::new(&bytes).into_writer_at(56);
+        let mut writer = RingBuffer::new(&bytes).into_writer_at(56);
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
 
         let mut claim = writer.claim_with_user_defined(4, true, 123);
@@ -2089,7 +2083,7 @@ mod tests {
     #[test]
     fn should_receive_next_message_into_buffer() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim_with_user_defined(5, true, 123);
@@ -2113,7 +2107,7 @@ mod tests {
     #[test]
     fn should_return_error_if_receive_next_buffer_is_too_small() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim(5, true);
@@ -2135,7 +2129,7 @@ mod tests {
     fn should_skip_padding_when_receiving_next_message_into_buffer() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let _ = RingBuffer::new(&bytes).into_writer();
-        let writer = RingBuffer::new(&bytes).into_writer_at(56);
+        let mut writer = RingBuffer::new(&bytes).into_writer_at(56);
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
 
         let mut claim = writer.claim_with_user_defined(4, true, 123);
@@ -2155,7 +2149,7 @@ mod tests {
     #[test]
     fn should_receive_batch_message_into_buffer() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim_with_user_defined(5, true, 100);
@@ -2189,7 +2183,7 @@ mod tests {
     fn should_skip_padding_when_receiving_batch_message_into_buffer() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let _ = RingBuffer::new(&bytes).into_writer();
-        let writer = RingBuffer::new(&bytes).into_writer_at(56);
+        let mut writer = RingBuffer::new(&bytes).into_writer_at(56);
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(56);
 
         let mut claim = writer.claim_with_user_defined(4, true, 123);
@@ -2209,7 +2203,7 @@ mod tests {
     #[test]
     fn should_skip_remaining_batch() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim_with_user_defined(1, true, 100).commit();
@@ -2227,7 +2221,7 @@ mod tests {
     #[test]
     fn should_skip_remaining_after_partial_batch_read() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim_with_user_defined(1, true, 100).commit();
@@ -2249,7 +2243,7 @@ mod tests {
     #[test]
     fn should_return_error_if_batch_receive_next_buffer_is_too_small() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim(5, true);
@@ -2273,7 +2267,7 @@ mod tests {
     #[test]
     fn should_overrun_reader() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim(16, true).commit();
@@ -2289,7 +2283,7 @@ mod tests {
     #[test]
     fn should_overrun_skip_next() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim(16, true).commit();
@@ -2305,7 +2299,7 @@ mod tests {
     #[test]
     fn should_overrun_read_batch() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim(16, true).commit();
@@ -2321,7 +2315,7 @@ mod tests {
     #[test]
     fn should_overrun_batch_skip_remaining() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.claim(16, true).commit();
@@ -2339,7 +2333,7 @@ mod tests {
     #[should_panic(expected = "mtu exceeded")]
     fn should_error_if_mtu_exceeded() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         assert_eq!(24, writer.mtu());
         let _ = writer.claim(32, true);
     }
@@ -2347,23 +2341,23 @@ mod tests {
     #[test]
     fn should_start_read_from_last_producer_position() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         writer.claim(16, true).commit();
 
-        assert_eq!(24, writer.position.get());
+        assert_eq!(24, writer.position);
         assert_eq!(24, writer.index());
 
         let reader = RingBuffer::new(&bytes).into_reader();
 
-        assert_eq!(reader.position.get(), writer.position.get());
+        assert_eq!(reader.position.get(), writer.position);
         assert_eq!(reader.index(), writer.index());
     }
 
     #[test]
     fn should_not_start_reader_at_retained_window_start_unless_it_is_a_frame_boundary() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 1024 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         writer.claim(8, true).commit();
 
@@ -2375,7 +2369,7 @@ mod tests {
         writer.claim(464, true).commit();
         writer.claim_with_user_defined(16, true, 200).commit();
 
-        let retained_window_start = writer.position.get() - writer.ring.capacity;
+        let retained_window_start = writer.position - writer.ring.capacity;
         assert_eq!(24, retained_window_start);
         let first_valid_frame_position = 40;
 
@@ -2402,7 +2396,7 @@ mod tests {
     #[test]
     fn should_start_read_from_beginning_before_first_lap_completes() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         writer.claim_with_user_defined(16, true, 100).commit();
         writer.claim_with_user_defined(16, true, 101).commit();
@@ -2418,7 +2412,7 @@ mod tests {
     #[test]
     fn should_not_advance_last_lap_until_new_frame_starts_at_ring_beginning() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         writer.claim_with_user_defined(56, true, 100).commit();
         writer.claim_with_user_defined(56, true, 101).commit();
@@ -2442,7 +2436,7 @@ mod tests {
     #[test]
     fn should_start_read_from_last_lap_after_padding_wrap() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         writer.claim_with_user_defined(40, true, 100).commit();
         writer.claim_with_user_defined(40, true, 101).commit();
@@ -2458,7 +2452,7 @@ mod tests {
     #[test]
     fn should_start_read_from_last_lap_without_writer_config() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         writer.claim_with_user_defined(16, true, 100).commit();
 
@@ -2549,7 +2543,7 @@ mod tests {
     #[test]
     fn should_insert_padding() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         assert_eq!(0, writer.index());
 
@@ -2578,7 +2572,7 @@ mod tests {
     #[test]
     fn should_ensure_frame_alignment() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 1024 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
 
         let preamble_addr = addr_of!(writer.ring.header().preamble) as usize;
         let producer_position_addr = addr_of!(writer.ring.header().producer_position) as usize;
@@ -2598,6 +2592,9 @@ mod tests {
 
         let header_ptr = writer.ring.header() as *const Header;
         let data_ptr = writer.ring.header().data_ptr();
+        assert_eq!(HEADER_MAGIC, writer.ring.header().preamble.magic);
+        assert_eq!(HEADER_VERSION, writer.ring.header().preamble.version);
+        assert_eq!(0, writer.ring.header().preamble._flags);
 
         let claim = writer.claim(16, true);
         let buf_ptr_0 = claim.get_buffer().as_ptr();
@@ -2614,9 +2611,6 @@ mod tests {
         assert_eq!(8, align_of::<FrameHeader>());
         assert_eq!(size_of::<Header>(), frame_ptr_0 as usize - bytes.as_ptr() as usize);
         assert_eq!(8, size_of::<HeaderPreamble>());
-        assert_eq!(HEADER_MAGIC, writer.ring.header().preamble.magic);
-        assert_eq!(HEADER_VERSION, writer.ring.header().preamble.version);
-        assert_eq!(0, writer.ring.header().preamble._flags);
 
         claim.commit();
 
@@ -2668,35 +2662,35 @@ mod tests {
     #[test]
     fn should_reserve_claimed_position_in_configured_chunks() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 1024 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_ratio(0.25));
+        let mut writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_ratio(0.25));
 
         assert_eq!(256, writer.claim_reserve);
-        assert_eq!(0, writer.claimed_limit.get());
+        assert_eq!(0, writer.claimed_limit);
 
         writer.claim(16, true).commit();
-        assert_eq!(24, writer.position.get());
+        assert_eq!(24, writer.position);
         assert_eq!(24, writer.ring.header().producer_position.load(SeqCst));
-        assert_eq!(280, writer.claimed_limit.get());
+        assert_eq!(280, writer.claimed_limit);
         assert_eq!(280, writer.ring.header().claimed_position.load(SeqCst));
 
         for _ in 0..10 {
             writer.claim(16, true).commit();
         }
 
-        assert_eq!(264, writer.position.get());
-        assert_eq!(280, writer.claimed_limit.get());
+        assert_eq!(264, writer.position);
+        assert_eq!(280, writer.claimed_limit);
         assert_eq!(280, writer.ring.header().claimed_position.load(SeqCst));
 
         writer.claim(16, true).commit();
-        assert_eq!(288, writer.position.get());
-        assert_eq!(544, writer.claimed_limit.get());
+        assert_eq!(288, writer.position);
+        assert_eq!(544, writer.claimed_limit);
         assert_eq!(544, writer.ring.header().claimed_position.load(SeqCst));
     }
 
     #[test]
     fn should_allow_claim_reservation_to_reduce_readable_window() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_ratio(0.25));
+        let mut writer = RingBuffer::new(&bytes).into_writer_with_cfg(|config| config.claim_reserve_ratio(0.25));
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         writer.claim(24, true).commit();
@@ -2710,7 +2704,7 @@ mod tests {
     #[test]
     fn should_read_message_into_vec() {
         let bytes = avec![[128] | 0u8; HEADER_SIZE + 1024];
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let mut claim = writer.claim(11, true);
@@ -2726,7 +2720,7 @@ mod tests {
     #[test]
     fn should_publish_message_using_closure() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.publish_with_user_defined(11, true, 123, |payload| {
@@ -2743,7 +2737,7 @@ mod tests {
     #[test]
     fn should_send_message_from_payload_slice() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         writer.send_with_user_defined(b"hello world", false, 123);
@@ -2759,7 +2753,7 @@ mod tests {
     #[test]
     fn should_abort_try_publish_on_error() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         let result = writer.try_publish(16, true, |payload| {
@@ -2768,7 +2762,7 @@ mod tests {
         });
 
         assert_eq!(Err("write failed"), result);
-        assert_eq!(24, writer.position.get());
+        assert_eq!(24, writer.position);
         assert_eq!(24, writer.ring.header().producer_position.load(SeqCst));
         assert_no_message(&reader);
 
@@ -2783,7 +2777,7 @@ mod tests {
     #[test]
     fn should_send_zero_size_message() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let claim = writer.claim(0, true);
@@ -2795,7 +2789,7 @@ mod tests {
     #[test]
     fn should_send_heartbeat() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let claim = writer.heartbeat();
@@ -2811,13 +2805,13 @@ mod tests {
     #[test]
     fn should_abort_publication() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
-        assert_eq!(0, writer.position.get());
+        assert_eq!(0, writer.position);
 
         let claim = writer.claim(16, true);
         claim.abort();
-        assert_eq!(24, writer.position.get());
+        assert_eq!(24, writer.position);
         assert_eq!(24, writer.ring.header().producer_position.load(SeqCst));
         assert_eq!(24, writer.ring.header().claimed_position.load(SeqCst));
         assert_no_message(&reader);
@@ -2825,17 +2819,17 @@ mod tests {
 
         let claim = writer.claim(24, true);
         claim.commit();
-        assert_eq!(56, writer.position.get());
+        assert_eq!(56, writer.position);
         assert_eq!(24, receive_payload_len(&reader));
 
         let claim = writer.claim(8, true);
         claim.commit();
-        assert_eq!(80, writer.position.get());
+        assert_eq!(80, writer.position);
         assert_eq!(8, receive_payload_len(&reader));
 
         let claim = writer.claim(16, true);
         claim.abort();
-        assert_eq!(104, writer.position.get());
+        assert_eq!(104, writer.position);
         assert_no_message(&reader);
         assert_eq!(104, reader.position.get());
     }
@@ -2855,7 +2849,7 @@ mod tests {
     fn should_skip_padding_frame() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
         let mut buffer = [0u8; 1024];
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let claim = writer.claim_with_user_defined(24, true, 123);
@@ -2879,7 +2873,7 @@ mod tests {
     #[test]
     fn should_fragment_message() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 64 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader();
 
         let claim = writer.claim_with_user_defined(24, false, 123);
@@ -2913,7 +2907,7 @@ mod tests {
 
         // first writer will write from the beginning
         {
-            let writer = RingBuffer::new(&bytes).into_writer();
+            let mut writer = RingBuffer::new(&bytes).into_writer();
             writer.claim_with_user_defined(16, true, 100).commit();
             writer.claim_with_user_defined(16, true, 101).commit();
             writer.claim_with_user_defined(16, true, 102).commit();
@@ -2921,7 +2915,7 @@ mod tests {
 
         // second writer will pick up from the current position
         {
-            let writer = RingBuffer::new(&bytes).join_writer();
+            let mut writer = RingBuffer::new(&bytes).join_writer();
             writer.claim_with_user_defined(16, true, 103).commit();
             writer.claim_with_user_defined(16, true, 104).commit();
             writer.claim_with_user_defined(16, true, 105).commit();
@@ -2941,17 +2935,17 @@ mod tests {
     fn should_handle_position_wrap_around_if_no_overrun() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
         let _ = RingBuffer::new(&bytes).into_writer();
-        let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 1023);
+        let mut writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 1023);
         // last claim before wrap around
         writer.claim_with_user_defined(1000, true, 100).commit();
-        assert_eq!(usize::MAX - 15, writer.position.get());
+        assert_eq!(usize::MAX - 15, writer.position);
         // first claim after wrap around, will insert padding frame and
         // continue from position zero
         writer.claim_with_user_defined(128, true, 101).commit();
-        assert_eq!(136, writer.position.get());
+        assert_eq!(136, writer.position);
         // a normal claim after wrap around
         writer.claim_with_user_defined(16, true, 102).commit();
-        assert_eq!(160, writer.position.get());
+        assert_eq!(160, writer.position);
         // verify we got all the messages
         let reader = RingBuffer::new(&bytes)
             .into_reader()
@@ -2967,7 +2961,7 @@ mod tests {
     fn should_allow_reader_to_recover_from_overrun_when_position_wrapped_around() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
         let _ = RingBuffer::new(&bytes).into_writer();
-        let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
+        let mut writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
         let reader = RingBuffer::new(&bytes)
             .into_reader()
             .with_initial_position(usize::MAX - 2047);
@@ -2992,7 +2986,7 @@ mod tests {
         reader.reset();
         assert_no_message(&reader);
         // Continue writing and reading
-        assert_eq!(reader.position.get(), writer.position.get());
+        assert_eq!(reader.position.get(), writer.position);
 
         writer.claim_with_user_defined(1000, true, 104).commit();
 
@@ -3003,7 +2997,7 @@ mod tests {
     fn should_allow_batch_reader_to_recover_from_overrun_when_position_wrapped_around() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 2048 }>::new();
         let _ = RingBuffer::new(&bytes).into_writer();
-        let writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
+        let mut writer = RingBuffer::new(&bytes).into_writer_at(usize::MAX - 2047);
         let reader = RingBuffer::new(&bytes)
             .into_reader()
             .with_initial_position(usize::MAX - 2047);
@@ -3030,7 +3024,7 @@ mod tests {
         // Reset the reader and start over
         reader.reset();
         assert!(reader.read_batch().is_none());
-        assert_eq!(reader.position.get(), writer.position.get());
+        assert_eq!(reader.position.get(), writer.position);
 
         // Continue writing and reading through the batch API
         writer.claim_with_user_defined(1000, true, 104).commit();
@@ -3043,7 +3037,7 @@ mod tests {
     #[test]
     fn should_not_overrun_batch_when_reader_has_not_been_lapped() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         for i in 0..4_u32 {
@@ -3063,7 +3057,7 @@ mod tests {
     #[test]
     fn should_allow_receive_next_when_reader_has_not_been_lapped() {
         let bytes = AlignedBytes::<{ HEADER_SIZE + 128 }>::new();
-        let writer = RingBuffer::new(&bytes).into_writer();
+        let mut writer = RingBuffer::new(&bytes).into_writer();
         let reader = RingBuffer::new(&bytes).into_reader().with_initial_position(0);
 
         for i in 0..4_u32 {
@@ -3087,7 +3081,7 @@ mod tests {
         let bytes = AlignedBytes::<{ HEADER_SIZE + CAPACITY }>::new();
 
         let ring = RingBuffer::new(&bytes);
-        let writer = ring.clone().into_writer();
+        let mut writer = ring.clone().into_writer();
         let reader = ring.into_reader();
 
         {

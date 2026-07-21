@@ -170,7 +170,7 @@ impl<S: WriteStorage> Writer<S> {
     /// ```
     pub fn new_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(storage: S, config: F) -> Self {
         let config = config(WriterConfig::default());
-        let ring = RingBuffer::from_storage(&storage);
+        let mut ring = RingBuffer::from_storage(&storage);
         ring.init_header(0, config.metadata);
         Self::from_position(storage, ring, 0, config)
     }

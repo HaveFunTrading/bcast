@@ -158,7 +158,7 @@ impl<S> Reader<S> {
     /// let reader = storage.into_reader();
     /// assert_eq!(b"meta", &reader.metadata()[..4]);
     /// ```
-    pub fn metadata(&self) -> &'static [u8] {
+    pub fn metadata(&self) -> &[u8] {
         self.ring.header().metadata()
     }
 

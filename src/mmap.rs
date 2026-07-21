@@ -8,7 +8,7 @@
 //!   memory map from a file path.
 //!
 //! The mapped file size must be `HEADER_SIZE + capacity`, where `capacity` is a
-//! power of two.
+//! power of two and at least 16 bytes.
 //!
 //! `MappedWriter` also holds an exclusive sidecar lock at `<path>.lock` for its
 //! full lifetime. Writer construction fails with [`std::io::ErrorKind::WouldBlock`]
@@ -111,7 +111,8 @@ impl MmapMutStorage {
     ///
     /// If the path already exists it is removed first. Parent directories are
     /// created when needed. The size must be valid for bcast ring construction:
-    /// `HEADER_SIZE + capacity`, where `capacity` is a power of two.
+    /// `HEADER_SIZE + capacity`, where `capacity` is a power of two and at least
+    /// 16 bytes.
     ///
     /// # Example
     ///

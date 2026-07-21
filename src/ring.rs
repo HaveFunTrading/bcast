@@ -19,6 +19,8 @@ pub const HEADER_MAGIC: u32 = u32::from_le_bytes(*b"BCST");
 pub const HEADER_VERSION: u16 = 1;
 /// Maximum payload length encodable in the 28-bit frame length field.
 pub const MAX_PAYLOAD_LEN: usize = (1 << 28) - 1;
+/// Smallest data-section capacity that can produce a valid frame MTU.
+const MIN_CAPACITY: usize = 2 * size_of::<FrameHeader>();
 
 // mask to obtain message length from frame header
 const FRAME_HEADER_MSG_LEN_MASK: u32 = 0x0FFFFFFF;
@@ -298,7 +300,8 @@ impl RingBuffer {
     /// Build a ring view over storage.
     ///
     /// The storage pointer must be aligned for [`Header`]. The data section
-    /// length, excluding [`Header`], must be a power of two.
+    /// length, excluding [`Header`], must be a power of two and at least large
+    /// enough to hold two frame headers.
     ///
     /// # Panics
     ///
@@ -309,10 +312,11 @@ impl RingBuffer {
         let len = storage.len();
         assert_eq!(ptr.as_ptr() as usize % align_of::<Header>(), 0, "buffer must be header aligned");
         assert!(len > size_of::<Header>(), "insufficient size for the header");
-        assert!((len - size_of::<Header>()).is_power_of_two(), "buffer len must be power of two");
+        let capacity = len - size_of::<Header>();
+        assert!(capacity.is_power_of_two(), "buffer len must be power of two");
+        assert!(capacity >= MIN_CAPACITY, "buffer capacity must be at least two frame headers");
 
         let header = ptr.as_ptr() as *mut Header;
-        let capacity = len - size_of::<Header>();
         Self {
             ptr: NonNull::new(header).unwrap(),
             capacity,
@@ -322,8 +326,8 @@ impl RingBuffer {
 
     /// Return the shared ring header.
     #[inline]
-    pub const fn header(&self) -> &'static mut Header {
-        unsafe { &mut *self.ptr.as_ptr() }
+    pub const fn header(&self) -> &Header {
+        unsafe { &*self.ptr.as_ptr() }
     }
 
     /// Initialize the shared header for a newly created writer.
@@ -331,16 +335,17 @@ impl RingBuffer {
     /// The metadata callback runs while `ready` is false. Readers spin until
     /// `ready` becomes true and then validate the preamble.
     #[inline]
-    pub fn init_header<F: FnOnce(&mut [u8])>(&self, position: usize, metadata: F) {
-        self.header().ready.store(false, Ordering::SeqCst);
-        metadata(self.header().metadata_mut());
-        self.header().preamble.magic = HEADER_MAGIC;
-        self.header().preamble.version = HEADER_VERSION;
-        self.header().preamble._flags = 0;
-        self.header().producer_position.store(position, Ordering::SeqCst);
-        self.header().claimed_position.store(position, Ordering::SeqCst);
-        self.header().lap_count.store(0, Ordering::SeqCst);
-        self.header().ready.store(true, Ordering::SeqCst);
+    pub fn init_header<F: FnOnce(&mut [u8])>(&mut self, position: usize, metadata: F) {
+        let header = unsafe { &mut *self.ptr.as_ptr() };
+        header.ready.store(false, Ordering::SeqCst);
+        metadata(header.metadata_mut());
+        header.preamble.magic = HEADER_MAGIC;
+        header.preamble.version = HEADER_VERSION;
+        header.preamble._flags = 0;
+        header.producer_position.store(position, Ordering::SeqCst);
+        header.claimed_position.store(position, Ordering::SeqCst);
+        header.lap_count.store(0, Ordering::SeqCst);
+        header.ready.store(true, Ordering::SeqCst);
     }
 
     /// Wait until the header is ready and validate the shared-memory preamble.
@@ -358,6 +363,7 @@ impl RingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::LocalStorage;
 
     #[test]
     fn should_pack_and_unpack_fields() {
@@ -434,5 +440,12 @@ mod tests {
         assert!(frame.is_padding());
         assert!(!frame.is_heartbeat());
         assert_eq!(0, frame.payload_len());
+    }
+
+    #[test]
+    #[should_panic(expected = "buffer capacity must be at least two frame headers")]
+    fn should_reject_capacity_too_small_for_mtu() {
+        let storage = LocalStorage::with_capacity(size_of::<FrameHeader>());
+        let _ = RingBuffer::from_storage(&storage);
     }
 }

@@ -57,6 +57,9 @@ impl LocalStorage {
     }
 
     /// Allocate zeroed storage for a ring with `capacity` data bytes.
+    ///
+    /// Readers and writers require `capacity` to be a power of two and at least
+    /// 16 bytes.
     pub fn with_capacity(capacity: usize) -> Self {
         Self::new(size_of::<Header>() + capacity)
     }

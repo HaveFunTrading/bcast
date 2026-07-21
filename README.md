@@ -111,6 +111,11 @@ When the `mmap` feature is enabled, `MappedWriter` and `MappedReader` provide fi
 The lower-level `MmapMutStorage` and `MmapStorage` types are also available if you want to construct `Writer` and
 `Reader` directly.
 
+`MappedWriter` holds an exclusive sidecar lock at `<path>.lock` for its full lifetime and returns
+`std::io::ErrorKind::WouldBlock` if another writer already owns the channel. Readers do not take locks. The lower-level
+mmap storage adapters do not lock either, so use `MappedWriter` when you want the crate to enforce single-writer ownership
+for a file-backed channel.
+
 ```rust
 use bcast::{HEADER_SIZE, MappedReader, MappedWriter};
 

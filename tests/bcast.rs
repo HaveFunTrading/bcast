@@ -39,6 +39,13 @@ fn storage_bytes<S: Storage>(storage: &S) -> &[u8] {
     unsafe { std::slice::from_raw_parts(storage.ptr().as_ptr(), storage.len()) }
 }
 
+fn write_storage_bytes<S: Storage>(storage: &S, offset: usize, bytes: &[u8]) {
+    assert!(offset + bytes.len() <= storage.len());
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), storage.ptr().as_ptr().add(offset), bytes.len());
+    }
+}
+
 fn receive_user_defined<S>(reader: &Reader<S>) -> u32 {
     let mut payload = [0u8; 4096];
     reader.receive_next(&mut payload).unwrap().unwrap().user_defined
@@ -579,6 +586,29 @@ fn should_return_error_if_receive_next_buffer_is_too_small() {
     let mut payload = [0u8; 5];
     let msg = reader.receive_next(&mut payload).unwrap().unwrap();
     assert_eq!(b"hello", msg.payload);
+}
+
+#[test]
+fn should_return_error_if_frame_payload_overshoots_ring_buffer() {
+    let (storage, mut writer, reader) = storage_writer_and_reader::<64>();
+    let reader = reader.with_initial_position(0);
+
+    writer.send(b"hello", true);
+
+    let fields = 64_u64 | (1_u64 << 31);
+    write_storage_bytes(&storage, HEADER_SIZE, &fields.to_le_bytes());
+
+    let mut payload = [0u8; 128];
+    let err = reader.receive_next(&mut payload).unwrap().unwrap_err();
+    assert_eq!(
+        Error::CorruptFrame {
+            stream_position: 0,
+            payload_index: 8,
+            payload_len: 64,
+            capacity: 64,
+        },
+        err,
+    );
 }
 
 #[test]

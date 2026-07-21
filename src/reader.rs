@@ -9,7 +9,7 @@ use crate::ring::{
     FrameHeader, RingBuffer, get_aligned_size, is_overrun, is_position_after, is_position_at_or_after, unpack_fields,
     unpack_header,
 };
-use crate::storage::{LocalStorage, Storage};
+use crate::storage::Storage;
 use std::cell::Cell;
 use std::cmp::min;
 use std::mem::size_of;
@@ -45,7 +45,7 @@ use std::sync::atomic::Ordering;
 /// assert_eq!(b"hello", msg.payload);
 /// assert!(reader.receive_next(&mut payload).is_none());
 /// ```
-pub struct Reader<S = LocalStorage> {
+pub struct Reader<S> {
     _storage: S,
     ring: RingBuffer,
     position: Cell<usize>,          // next stream position this reader will consume
@@ -165,6 +165,26 @@ impl<S> Reader<S> {
     /// This is the intended recovery path after [`Error::Overrun`]. Messages
     /// between the old reader position and the current producer position are
     /// skipped.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use bcast::{Error, Reader};
+    ///
+    /// fn poll<S>(reader: &Reader<S>, payload: &mut [u8]) -> Result<(), Error> {
+    ///     match reader.receive_next(payload) {
+    ///         Some(Ok(msg)) => {
+    ///             let _ = msg.payload;
+    ///         }
+    ///         Some(Err(Error::Overrun(_))) => {
+    ///             reader.reset();
+    ///         }
+    ///         Some(Err(err)) => return Err(err),
+    ///         None => {}
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
     #[cold]
     #[inline(never)]
     pub fn reset(&self) {
@@ -321,7 +341,9 @@ impl<S> Reader<S> {
 
         let payload_start = reader_position.wrapping_add(size_of::<FrameHeader>());
         let payload_index = payload_start & (self.ring.capacity - 1);
-        debug_assert!(payload_index + frame.payload_len <= self.ring.capacity, "payload over shots ring buffer");
+        if payload_index + frame.payload_len > self.ring.capacity {
+            return Err(Error::corrupt_frame(reader_position, payload_index, frame.payload_len, self.ring.capacity));
+        }
 
         unsafe {
             copy_nonoverlapping(self.ring.header().data_ptr().add(payload_index), dst.as_mut_ptr(), frame.payload_len);
@@ -353,7 +375,8 @@ impl<S> Reader<S> {
     ///
     /// Returns [`Error::InsufficientBufferSize`] if `dst` is smaller than the
     /// next payload. Returns [`Error::Overrun`] if the writer has overwritten
-    /// the frame before it could be read safely.
+    /// the frame before it could be read safely. Returns [`Error::CorruptFrame`]
+    /// if the frame header describes payload bytes outside the ring.
     #[inline]
     pub fn receive_next<'a>(&self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
         loop {
@@ -436,7 +459,7 @@ pub struct Message<'a> {
 /// A batch captures the producer position observed by [`Reader::read_batch`].
 /// It can reduce repeated producer cursor loads when draining several messages
 /// together.
-pub struct Batch<'a, S = LocalStorage> {
+pub struct Batch<'a, S> {
     reader: &'a Reader<S>,
     remaining: usize, // remaining bytes to consume
 }
@@ -457,7 +480,8 @@ impl<S> Batch<'_, S> {
     ///
     /// Returns [`Error::InsufficientBufferSize`] if `dst` is smaller than the
     /// next payload. Returns [`Error::Overrun`] if the writer has overwritten
-    /// the frame before it could be read safely.
+    /// the frame before it could be read safely. Returns [`Error::CorruptFrame`]
+    /// if the frame header describes payload bytes outside the ring.
     #[inline]
     pub fn receive_next<'a>(&mut self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
         loop {

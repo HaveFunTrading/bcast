@@ -123,12 +123,17 @@ let reader = MappedReader::new(path)?;
 
 ## Backpressure (and the lack of it)
 `bcast` design is to allow producer to process and publish messages at full line rate and deliver the same latency irrespective
-of the number of consumers (in reality there is a tiny penalty associated with adding each additional consumer). Consumers can detect when they have been overrun by the producer and take appropriate action, such as resetting or crashing the application.
+of the number of consumers (in reality there is a tiny penalty associated with adding each additional consumer). Consumers can detect when they have been overrun by the producer and take appropriate action.
+
+If a consumer wants to continue after an overrun, call `reader.reset()`.
 
 ```rust
 match reader.receive_next(&mut payload) {
     Some(Ok(msg)) => { /* process msg.payload */ },
-    Some(Err(Error::Overrun(_))) => { /* handle overrun */ },
+    Some(Err(Error::Overrun(_))) => {
+        // skip unread data and move this reader to the producer's current position.
+        reader.reset();
+    },
     Some(Err(err)) => return Err(err.into()),
     None => { /* no message available */ },
 }

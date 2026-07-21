@@ -9,7 +9,7 @@ use crate::ring::{
     FrameHeader, RingBuffer, claim_reserve_bytes, get_aligned_size, is_position_after, is_position_at_or_after,
     pack_fields,
 };
-use crate::storage::{LocalStorage, WriteStorage};
+use crate::storage::WriteStorage;
 use std::mem::{ManuallyDrop, size_of};
 use std::sync::atomic::Ordering;
 
@@ -212,8 +212,7 @@ impl<S> Writer<S> {
     ///
     /// ## Panics
     ///
-    /// In debug builds, panics when the aligned payload length is greater than
-    /// [`Writer::mtu`].
+    /// Panics when the aligned payload length is greater than [`Writer::mtu`].
     #[inline]
     pub fn claim(&mut self, len: usize, fin: bool) -> Claim<'_, S> {
         self.claim_with_user_defined(len, fin, USER_DEFINED_NULL_VALUE)
@@ -224,12 +223,11 @@ impl<S> Writer<S> {
     ///
     /// ## Panics
     ///
-    /// In debug builds, panics when the aligned payload length is greater than
-    /// [`Writer::mtu`].
+    /// Panics when the aligned payload length is greater than [`Writer::mtu`].
     #[inline]
     pub fn claim_with_user_defined(&mut self, len: usize, fin: bool, user_defined: u32) -> Claim<'_, S> {
         let aligned_len = get_aligned_size(len);
-        debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, user_defined, fin, false, false)
     }
 
@@ -255,8 +253,7 @@ impl<S> Writer<S> {
     ///
     /// ## Panics
     ///
-    /// In debug builds, panics when the aligned payload length is greater than
-    /// [`Writer::mtu`].
+    /// Panics when the aligned payload length is greater than [`Writer::mtu`].
     #[inline]
     pub fn publish<F>(&mut self, len: usize, fin: bool, write: F)
     where
@@ -269,8 +266,7 @@ impl<S> Writer<S> {
     ///
     /// ## Panics
     ///
-    /// In debug builds, panics when the aligned payload length is greater than
-    /// [`Writer::mtu`].
+    /// Panics when the aligned payload length is greater than [`Writer::mtu`].
     #[inline]
     pub fn publish_with_user_defined<F>(&mut self, len: usize, fin: bool, user_defined: u32, write: F)
     where
@@ -289,8 +285,7 @@ impl<S> Writer<S> {
     ///
     /// ## Panics
     ///
-    /// In debug builds, panics when the aligned payload length is greater than
-    /// [`Writer::mtu`].
+    /// Panics when the aligned payload length is greater than [`Writer::mtu`].
     #[inline]
     pub fn send(&mut self, payload: &[u8], fin: bool) {
         self.send_with_user_defined(payload, fin, USER_DEFINED_NULL_VALUE);
@@ -301,8 +296,7 @@ impl<S> Writer<S> {
     ///
     /// ## Panics
     ///
-    /// In debug builds, panics when the aligned payload length is greater than
-    /// [`Writer::mtu`].
+    /// Panics when the aligned payload length is greater than [`Writer::mtu`].
     #[inline]
     pub fn send_with_user_defined(&mut self, payload: &[u8], fin: bool, user_defined: u32) {
         self.publish_with_user_defined(payload.len(), fin, user_defined, |buffer| {
@@ -317,12 +311,11 @@ impl<S> Writer<S> {
     ///
     /// ## Panics
     ///
-    /// In debug builds, panics when the aligned payload length is greater than
-    /// [`Writer::mtu`].
+    /// Panics when the aligned payload length is greater than [`Writer::mtu`].
     #[inline]
     pub fn continuation(&mut self, len: usize, fin: bool) -> Claim<'_, S> {
         let aligned_len = get_aligned_size(len);
-        debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, fin, true, false)
     }
 
@@ -345,12 +338,11 @@ impl<S> Writer<S> {
     ///
     /// ## Panics
     ///
-    /// In debug builds, panics when the aligned payload length is greater than
-    /// [`Writer::mtu`].
+    /// Panics when the aligned payload length is greater than [`Writer::mtu`].
     #[inline]
     pub fn heartbeat_with_payload(&mut self, len: usize) -> Claim<'_, S> {
         let aligned_len = get_aligned_size(len);
-        debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, USER_DEFINED_NULL_VALUE, true, false, true)
     }
 
@@ -358,12 +350,11 @@ impl<S> Writer<S> {
     ///
     /// ## Panics
     ///
-    /// In debug builds, panics when the aligned payload length is greater than
-    /// [`Writer::mtu`].
+    /// Panics when the aligned payload length is greater than [`Writer::mtu`].
     #[inline]
     pub fn heartbeat_with_payload_and_user_defined(&mut self, len: usize, user_defined: u32) -> Claim<'_, S> {
         let aligned_len = get_aligned_size(len);
-        debug_assert!(aligned_len <= self.mtu(), "mtu exceeded");
+        assert!(aligned_len <= self.mtu(), "mtu exceeded");
         Claim::new(self, aligned_len, len, user_defined, true, false, true)
     }
 
@@ -448,7 +439,7 @@ impl<S> Writer<S> {
 /// Because a claim holds `&mut Writer`, the type system prevents multiple open
 /// claims from the same writer.
 #[derive(Debug)]
-pub struct Claim<'a, S = LocalStorage> {
+pub struct Claim<'a, S> {
     writer: &'a mut Writer<S>, // underlying writer
     len: usize,                // frame header aligned payload length
     limit: usize,              // actual payload length

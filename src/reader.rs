@@ -484,11 +484,11 @@ impl<S> Reader<S> {
 
         loop {
             let reader_position = self.position;
-            if is_position_at_or_after(reader_position, end_position) {
+            if reader_position == end_position {
                 if refresh_after_padding && skipped_padding {
                     end_position = self.readable_limit();
                     skipped_padding = false;
-                    if !is_position_at_or_after(reader_position, end_position) {
+                    if reader_position != end_position {
                         continue;
                     }
                 }
@@ -609,12 +609,7 @@ impl<S> Batch<'_, S> {
     /// ```
     #[inline]
     pub const fn remaining(&self) -> usize {
-        let reader_position = self.reader.position;
-        if is_position_at_or_after(reader_position, self.end_position) {
-            0
-        } else {
-            self.end_position.wrapping_sub(reader_position)
-        }
+        self.end_position.wrapping_sub(self.reader.position)
     }
 
     /// Receive the next non-padding message from this batch, copying its

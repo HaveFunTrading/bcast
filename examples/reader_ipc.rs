@@ -17,8 +17,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let reader_handle = bcast::MappedReader::new("test.dat")?;
-    reader(&reader_handle)?;
+    let mut reader_handle = bcast::MappedReader::new("test.dat")?;
+    reader(&mut reader_handle)?;
 
     Ok(())
 }

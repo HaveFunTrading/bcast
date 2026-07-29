@@ -10,7 +10,6 @@ use crate::ring::{
     unpack_header,
 };
 use crate::storage::Storage;
-use std::cell::Cell;
 use std::cmp::min;
 use std::mem::size_of;
 use std::ptr::{copy_nonoverlapping, read_unaligned};
@@ -36,7 +35,7 @@ use std::sync::atomic::Ordering;
 ///
 /// let storage = LocalStorage::with_capacity(1024).into_shared();
 /// let mut writer = storage.clone().into_writer();
-/// let reader = storage.into_reader();
+/// let mut reader = storage.into_reader();
 ///
 /// writer.send(b"hello", true);
 ///
@@ -48,9 +47,9 @@ use std::sync::atomic::Ordering;
 pub struct Reader<S> {
     _storage: S,
     ring: RingBuffer,
-    position: Cell<usize>,          // next stream position this reader will consume
-    producer_position: Cell<usize>, // cached committed/readable limit observed from producer
-    claimed_position: Cell<usize>,  // cached overwrite frontier observed from producer
+    position: usize,          // next stream position this reader will consume
+    producer_position: usize, // cached committed/readable limit observed from producer
+    claimed_position: usize,  // cached overwrite frontier observed from producer
 }
 
 impl<S: Storage> Reader<S> {
@@ -73,7 +72,7 @@ impl<S: Storage> Reader<S> {
     ///
     /// writer.send(b"before-reader", true);
     ///
-    /// let reader = Reader::new(storage);
+    /// let mut reader = Reader::new(storage);
     /// let mut payload = [0u8; 32];
     /// assert!(reader.receive_next(&mut payload).is_none());
     ///
@@ -103,7 +102,7 @@ impl<S: Storage> Reader<S> {
     /// let mut writer = storage.clone().into_writer();
     /// writer.send(b"retained", true);
     ///
-    /// let reader = Reader::new_at_last_lap(storage);
+    /// let mut reader = Reader::new_at_last_lap(storage);
     /// let mut payload = [0u8; 16];
     /// assert_eq!(b"retained", reader.receive_next(&mut payload).unwrap().unwrap().payload);
     /// ```
@@ -122,9 +121,9 @@ impl<S: Storage> Reader<S> {
         Self {
             _storage: storage,
             ring,
-            position: Cell::new(position),
-            producer_position: Cell::new(producer_position),
-            claimed_position: Cell::new(claimed_position),
+            position,
+            producer_position,
+            claimed_position,
         }
     }
 
@@ -135,9 +134,9 @@ impl<S: Storage> Reader<S> {
         Self {
             _storage: storage,
             ring,
-            position: Cell::new(producer_position),
-            producer_position: Cell::new(producer_position),
-            claimed_position: Cell::new(claimed_position),
+            position: producer_position,
+            producer_position,
+            claimed_position,
         }
     }
 }
@@ -181,19 +180,19 @@ impl<S> Reader<S> {
     /// let mut writer = storage.clone().into_writer();
     /// writer.send(b"hello", true);
     ///
-    /// let reader = Reader::new(storage).with_initial_position(0);
+    /// let mut reader = Reader::new(storage).with_initial_position(0);
     /// let mut payload = [0u8; 16];
     /// assert_eq!(b"hello", reader.receive_next(&mut payload).unwrap().unwrap().payload);
     /// ```
     pub fn with_initial_position(self, position: usize) -> Self {
         assert_eq!(get_aligned_size(position), position, "position must be aligned");
-        let cached_producer_position = self.producer_position.get();
+        let cached_producer_position = self.producer_position;
         let producer_position = if is_position_at_or_after(cached_producer_position, position) {
             cached_producer_position
         } else {
             position
         };
-        let cached_claimed_position = self.claimed_position.get();
+        let cached_claimed_position = self.claimed_position;
         let claimed_position = if is_position_at_or_after(cached_claimed_position, position) {
             cached_claimed_position
         } else {
@@ -202,9 +201,9 @@ impl<S> Reader<S> {
         Self {
             _storage: self._storage,
             ring: self.ring,
-            position: Cell::new(position),
-            producer_position: Cell::new(producer_position),
-            claimed_position: Cell::new(claimed_position),
+            position,
+            producer_position,
+            claimed_position,
         }
     }
 
@@ -217,7 +216,7 @@ impl<S> Reader<S> {
     /// Buffer index at which read will happen.
     #[inline]
     const fn index(&self) -> usize {
-        self.position.get() & (self.ring.capacity - 1)
+        self.position & (self.ring.capacity - 1)
     }
 
     /// Reset this reader to the producer's current committed position.
@@ -231,7 +230,7 @@ impl<S> Reader<S> {
     /// ```no_run
     /// use bcast::{Error, Reader};
     ///
-    /// fn poll<S>(reader: &Reader<S>, payload: &mut [u8]) -> Result<(), Error> {
+    /// fn poll<S>(reader: &mut Reader<S>, payload: &mut [u8]) -> Result<(), Error> {
     ///     match reader.receive_next(payload) {
     ///         Some(Ok(msg)) => {
     ///             let _ = msg.payload;
@@ -247,25 +246,25 @@ impl<S> Reader<S> {
     /// ```
     #[cold]
     #[inline(never)]
-    pub fn reset(&self) {
+    pub fn reset(&mut self) {
         let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
         let claimed_position = self.ring.header().claimed_position.load(Ordering::Acquire);
-        let _ = self.position.replace(producer_position);
-        self.producer_position.set(producer_position);
-        self.claimed_position.set(claimed_position);
+        self.position = producer_position;
+        self.producer_position = producer_position;
+        self.claimed_position = claimed_position;
     }
 
     #[inline]
-    fn refresh_producer_position(&self) -> usize {
+    fn refresh_producer_position(&mut self) -> usize {
         let producer_position = self.ring.header().producer_position.load(Ordering::Acquire);
-        self.producer_position.set(producer_position);
+        self.producer_position = producer_position;
         producer_position
     }
 
     #[inline]
-    fn readable_limit(&self) -> usize {
-        let reader_position = self.position.get();
-        let producer_position = self.producer_position.get();
+    fn readable_limit(&mut self) -> usize {
+        let reader_position = self.position;
+        let producer_position = self.producer_position;
         if is_position_after(producer_position, reader_position) {
             return producer_position;
         }
@@ -274,15 +273,15 @@ impl<S> Reader<S> {
         if is_position_at_or_after(producer_position, reader_position) {
             producer_position
         } else {
-            self.producer_position.set(reader_position);
+            self.producer_position = reader_position;
             reader_position
         }
     }
 
     #[inline]
-    fn refresh_claimed_position(&self) -> usize {
+    fn refresh_claimed_position(&mut self) -> usize {
         let claimed_position = self.ring.header().claimed_position.load(Ordering::Acquire);
-        self.claimed_position.set(claimed_position);
+        self.claimed_position = claimed_position;
         claimed_position
     }
 
@@ -300,7 +299,7 @@ impl<S> Reader<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.send(b"one", true);
     /// writer.send(b"two", true);
@@ -312,15 +311,15 @@ impl<S> Reader<S> {
     /// assert!(batch.receive_next(&mut payload).is_none());
     /// ```
     #[inline]
-    pub fn read_batch(&self) -> Option<Batch<'_, S>> {
+    pub fn read_batch(&mut self) -> Option<Batch<'_, S>> {
         let producer_position = self.readable_limit();
-        let limit = producer_position.wrapping_sub(self.position.get());
+        let limit = producer_position.wrapping_sub(self.position);
         if limit == 0 {
             return None;
         }
         Some(Batch {
             reader: self,
-            remaining: limit,
+            end_position: producer_position,
         })
     }
 
@@ -339,7 +338,7 @@ impl<S> Reader<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     ///
     /// writer.send(b"hello", true);
     ///
@@ -347,8 +346,8 @@ impl<S> Reader<S> {
     /// assert!(bulk.len() >= b"hello".len());
     /// ```
     #[inline]
-    pub fn read_bulk(&self) -> Option<Result<Bulk<'_, S>>> {
-        let start_position = self.position.get();
+    pub fn read_bulk(&mut self) -> Option<Result<Bulk<'_, S>>> {
+        let start_position = self.position;
         let end_position = self.readable_limit();
         let len = end_position.wrapping_sub(start_position);
         if len == 0 {
@@ -367,8 +366,8 @@ impl<S> Reader<S> {
     }
 
     #[inline]
-    fn read_frame(&self, reader_position: usize) -> Result<Frame> {
-        let claimed_position_before = self.claimed_position.get();
+    fn read_frame(&mut self, reader_position: usize) -> Result<Frame> {
+        let claimed_position_before = self.claimed_position;
         if is_overrun(reader_position, claimed_position_before, self.ring.capacity) {
             return Err(Error::overrun(reader_position));
         }
@@ -398,18 +397,17 @@ impl<S> Reader<S> {
     }
 
     #[inline]
-    const fn advance_position(&self, frame_len: usize) {
-        let position = self.position.get();
-        self.position.replace(position.wrapping_add(frame_len));
+    const fn advance_position(&mut self, frame_len: usize) {
+        self.position = self.position.wrapping_add(frame_len);
     }
 
     #[inline]
-    const fn skip_frame(&self, frame: Frame) {
+    const fn skip_frame(&mut self, frame: Frame) {
         self.advance_position(frame.frame_len);
     }
 
     #[inline]
-    fn copy_frame_into<'a>(&self, reader_position: usize, frame: Frame, dst: &'a mut [u8]) -> Result<Message<'a>> {
+    fn copy_frame_into<'a>(&mut self, reader_position: usize, frame: Frame, dst: &'a mut [u8]) -> Result<Message<'a>> {
         if frame.payload_len > dst.len() {
             return Err(Error::insufficient_buffer_size(dst.len(), frame.payload_len));
         }
@@ -460,7 +458,7 @@ impl<S> Reader<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     ///
     /// writer.send(b"hello", true);
     ///
@@ -470,15 +468,33 @@ impl<S> Reader<S> {
     /// assert!(reader.receive_next(&mut payload).is_none());
     /// ```
     #[inline]
-    pub fn receive_next<'a>(&self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
+    pub fn receive_next<'a>(&mut self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
+        let end_position = self.readable_limit();
+        self.receive_next_until(end_position, true, dst)
+    }
+
+    #[inline]
+    fn receive_next_until<'a>(
+        &mut self,
+        mut end_position: usize,
+        refresh_after_padding: bool,
+        dst: &'a mut [u8],
+    ) -> Option<Result<Message<'a>>> {
+        let mut skipped_padding = false;
+
         loop {
-            let producer_position_before = self.readable_limit();
-            // no new messages
-            if producer_position_before.wrapping_sub(self.position.get()) == 0 {
+            let reader_position = self.position;
+            if is_position_at_or_after(reader_position, end_position) {
+                if refresh_after_padding && skipped_padding {
+                    end_position = self.readable_limit();
+                    skipped_padding = false;
+                    if !is_position_at_or_after(reader_position, end_position) {
+                        continue;
+                    }
+                }
                 return None;
             }
 
-            let reader_position = self.position.get();
             let frame = match self.read_frame(reader_position) {
                 Ok(frame) => frame,
                 Err(err) => return Some(Err(err)),
@@ -486,6 +502,7 @@ impl<S> Reader<S> {
 
             if frame.is_padding {
                 self.advance_position(frame.frame_len);
+                skipped_padding = true;
                 continue;
             }
 
@@ -505,7 +522,7 @@ impl<S> Reader<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     ///
     /// writer.send(b"skip", true);
     /// writer.send(b"read", true);
@@ -516,15 +533,15 @@ impl<S> Reader<S> {
     /// assert_eq!(b"read", reader.receive_next(&mut payload).unwrap().unwrap().payload);
     /// ```
     #[inline]
-    pub fn skip_next(&self) -> Option<Result<()>> {
+    pub fn skip_next(&mut self) -> Option<Result<()>> {
         loop {
             let producer_position_before = self.readable_limit();
             // no new messages
-            if producer_position_before.wrapping_sub(self.position.get()) == 0 {
+            if producer_position_before.wrapping_sub(self.position) == 0 {
                 return None;
             }
 
-            let frame = match self.read_frame(self.position.get()) {
+            let frame = match self.read_frame(self.position) {
                 Ok(frame) => frame,
                 Err(err) => return Some(Err(err)),
             };
@@ -570,8 +587,8 @@ pub struct Message<'a> {
 /// It can reduce repeated producer cursor loads when draining several messages
 /// together.
 pub struct Batch<'a, S> {
-    reader: &'a Reader<S>,
-    remaining: usize, // remaining bytes to consume
+    reader: &'a mut Reader<S>,
+    end_position: usize,
 }
 
 impl<S> Batch<'_, S> {
@@ -584,7 +601,7 @@ impl<S> Batch<'_, S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     /// writer.send(b"hello", true);
     ///
     /// let batch = reader.read_batch().unwrap();
@@ -592,7 +609,12 @@ impl<S> Batch<'_, S> {
     /// ```
     #[inline]
     pub const fn remaining(&self) -> usize {
-        self.remaining
+        let reader_position = self.reader.position;
+        if is_position_at_or_after(reader_position, self.end_position) {
+            0
+        } else {
+            self.end_position.wrapping_sub(reader_position)
+        }
     }
 
     /// Receive the next non-padding message from this batch, copying its
@@ -614,7 +636,7 @@ impl<S> Batch<'_, S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     ///
     /// writer.send(b"hello", true);
     ///
@@ -625,32 +647,44 @@ impl<S> Batch<'_, S> {
     /// ```
     #[inline]
     pub fn receive_next<'a>(&mut self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
-        loop {
-            // we reached end of batch
-            if self.remaining == 0 {
-                return None;
-            }
+        self.reader.receive_next_until(self.end_position, false, dst)
+    }
 
-            let reader_position = self.reader.position.get();
-            let frame = match self.reader.read_frame(reader_position) {
-                Ok(frame) => frame,
-                Err(err) => return Some(Err(err)),
-            };
-
-            if frame.is_padding {
-                self.remaining -= frame.frame_len;
-                self.reader.advance_position(frame.frame_len);
-                continue;
-            }
-
-            return match self.reader.copy_frame_into(reader_position, frame, dst) {
-                Ok(msg) => {
-                    self.remaining -= frame.frame_len;
-                    Some(Ok(msg))
-                }
-                Err(err) => Some(Err(err)),
-            };
-        }
+    /// Consume this batch and reset the underlying reader to the producer's
+    /// current committed position.
+    ///
+    /// This is the intended recovery path when [`Batch::receive_next`] returns
+    /// [`Error::Overrun`]. Consuming the batch releases its exclusive borrow of
+    /// the reader so the caller can open another batch.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use bcast::{Error, Reader};
+    ///
+    /// fn poll<S>(reader: &mut Reader<S>, payload: &mut [u8]) -> Result<(), Error> {
+    ///     let Some(mut batch) = reader.read_batch() else {
+    ///         return Ok(());
+    ///     };
+    ///
+    ///     while let Some(result) = batch.receive_next(payload) {
+    ///         match result {
+    ///             Ok(message) => {
+    ///                 let _ = message.payload;
+    ///             }
+    ///             Err(Error::Overrun(_)) => {
+    ///                 batch.reset();
+    ///                 return Ok(());
+    ///             }
+    ///             Err(error) => return Err(error),
+    ///         }
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    #[inline]
+    pub fn reset(self) {
+        self.reader.reset();
     }
 
     /// Skip all remaining frames in this batch.
@@ -664,7 +698,7 @@ impl<S> Batch<'_, S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     ///
     /// writer.send(b"old", true);
     /// reader.read_batch().unwrap().skip_remaining().unwrap();
@@ -675,19 +709,20 @@ impl<S> Batch<'_, S> {
     /// ```
     #[inline]
     pub fn skip_remaining(self) -> Result<()> {
-        if self.remaining == 0 {
+        let remaining = self.remaining();
+        if remaining == 0 {
             return Ok(());
         }
 
-        let start_position = self.reader.position.get();
+        let start_position = self.reader.position;
         let claimed_position = self.reader.refresh_claimed_position();
-        if self.remaining > self.reader.ring.capacity
+        if remaining > self.reader.ring.capacity
             || is_overrun(start_position, claimed_position, self.reader.ring.capacity)
         {
             return Err(Error::overrun(start_position));
         }
 
-        self.reader.position.set(start_position.wrapping_add(self.remaining));
+        self.reader.position = self.end_position;
         Ok(())
     }
 }
@@ -698,7 +733,7 @@ impl<S> Batch<'_, S> {
 /// can parse them afterwards with [`BulkIter`]. This is useful when consumers
 /// want to amortize ring access and overrun checks across many frames.
 pub struct Bulk<'a, S> {
-    reader: &'a Reader<S>,
+    reader: &'a mut Reader<S>,
     start_position: usize,
     end_position: usize,
     len: usize,
@@ -715,7 +750,7 @@ impl<S> Bulk<'_, S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     /// writer.send(b"hello", true);
     ///
     /// let bulk = reader.read_bulk().unwrap().unwrap();
@@ -735,7 +770,7 @@ impl<S> Bulk<'_, S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     /// writer.send(b"hello", true);
     ///
     /// let bulk = reader.read_bulk().unwrap().unwrap();
@@ -755,7 +790,7 @@ impl<S> Bulk<'_, S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     /// writer.send(b"hello", true);
     ///
     /// let bulk = reader.read_bulk().unwrap().unwrap();
@@ -787,7 +822,7 @@ impl<S> Bulk<'_, S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     /// writer.send(b"hello", true);
     ///
     /// let bulk = reader.read_bulk().unwrap().unwrap();
@@ -803,7 +838,7 @@ impl<S> Bulk<'_, S> {
         let start_index = self.start_position & (self.reader.ring.capacity - 1);
         let first_len = min(self.len, self.reader.ring.capacity - start_index);
         let data_ptr = self.reader.ring.header().data_ptr();
-        let claimed_position_before = self.reader.claimed_position.get();
+        let claimed_position_before = self.reader.claimed_position;
 
         if is_overrun(self.start_position, claimed_position_before, self.reader.ring.capacity) {
             return Err(Error::overrun(self.start_position));
@@ -821,7 +856,7 @@ impl<S> Bulk<'_, S> {
             return Err(Error::overrun(self.start_position));
         }
 
-        self.reader.position.set(self.end_position);
+        self.reader.position = self.end_position;
         Ok(self.len)
     }
 
@@ -835,7 +870,7 @@ impl<S> Bulk<'_, S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.send(b"hello", true);
     ///
@@ -878,7 +913,7 @@ impl<'a> BulkIter<'a> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     /// writer.send(b"hello", true);
     ///
     /// let bulk = reader.read_bulk().unwrap().unwrap();

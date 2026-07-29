@@ -25,7 +25,7 @@
 //! let size = HEADER_SIZE + 1024;
 //!
 //! let mut writer = MappedWriter::new(&path, size)?;
-//! let reader = MappedReader::new(&path)?;
+//! let mut reader = MappedReader::new(&path)?;
 //!
 //! writer.send(b"hello", true);
 //!
@@ -368,7 +368,7 @@ fn writer_lock_path(path: &Path) -> std::io::Result<PathBuf> {
 /// let mut writer = MappedWriter::new(&path, HEADER_SIZE + 1024)?;
 /// writer.send(b"hello", true);
 ///
-/// let reader = MappedReader::new_with_position(&path, 0)?;
+/// let mut reader = MappedReader::new_with_position(&path, 0)?;
 /// let mut payload = [0u8; 16];
 /// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
 /// assert_eq!(b"hello", msg.payload);
@@ -460,7 +460,7 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
 
         let mut writer = MappedWriter::new(&file, RING_BUFFER_SIZE).unwrap();
-        let reader = MappedReader::new(&file).unwrap();
+        let mut reader = MappedReader::new(&file).unwrap();
 
         writer.claim_with_user_defined(32, true, 100).commit();
         writer.claim_with_user_defined(32, true, 101).commit();
@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(101, batch.receive_next(&mut payload).unwrap().unwrap().user_defined);
 
         // attach another (late) reader
-        let late_reader = MappedReader::new_with_position(&file, 0).unwrap();
+        let mut late_reader = MappedReader::new_with_position(&file, 0).unwrap();
         let mut batch = late_reader.read_batch().unwrap();
         assert_eq!(100, batch.receive_next(&mut payload).unwrap().unwrap().user_defined);
         assert_eq!(101, batch.receive_next(&mut payload).unwrap().unwrap().user_defined);
@@ -492,7 +492,7 @@ mod tests {
         let mut writer = MappedWriter::join(&file).unwrap();
         writer.claim_with_user_defined(32, true, 102).commit();
 
-        let reader = MappedReader::new_with_position(&file, 0).unwrap();
+        let mut reader = MappedReader::new_with_position(&file, 0).unwrap();
         let mut batch = reader.read_batch().unwrap();
         let mut payload = [0u8; 32];
         assert_eq!(100, batch.receive_next(&mut payload).unwrap().unwrap().user_defined);
@@ -512,7 +512,7 @@ mod tests {
         writer.claim_with_user_defined(504, true, 101).commit();
         writer.claim_with_user_defined(16, true, 102).commit();
 
-        let reader = MappedReader::new_at_last_lap(&file).unwrap();
+        let mut reader = MappedReader::new_at_last_lap(&file).unwrap();
         let mut payload = [0u8; 16];
         assert_eq!(102, reader.receive_next(&mut payload).unwrap().unwrap().user_defined);
         assert!(reader.receive_next(&mut payload).is_none());

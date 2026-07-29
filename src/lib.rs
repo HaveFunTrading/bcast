@@ -24,7 +24,7 @@
 //! use bcast::{LocalStorage, StorageExt};
 //!
 //! let storage = LocalStorage::with_capacity(1024);
-//! let reader = storage.into_reader();
+//! let mut reader = storage.into_reader();
 //! let mut batch = reader.read_batch().unwrap();
 //! let mut payload = [0u8; 1024];
 //!

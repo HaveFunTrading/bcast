@@ -13,7 +13,7 @@ fn main() -> anyhow::Result<()> {
 
     let receiver_storage = storage.clone();
     let receiver = std::thread::spawn(move || {
-        let rx = receiver_storage.into_reader_at(0);
+        let mut rx = receiver_storage.into_reader_at(0);
 
         let mut payload = [0u8; 8];
 

@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
         publish(&mut writer, "lap-1-message-0-------------------------", 2);
     }
 
-    let reader = storage.into_reader_at_last_lap();
+    let mut reader = storage.into_reader_at_last_lap();
     let mut payload = unsafe { MaybeUninit::new([0u8; RING_CAPACITY]).assume_init() };
 
     while let Some(msg) = reader.receive_next(&mut payload) {

@@ -51,6 +51,12 @@ name = "throughput"
 harness = false
 path = "benches/throughput.rs"
 
+[[bench]]
+name = "mmap_fanout"
+harness = false
+path = "benches/mmap_fanout.rs"
+required-features = ["mmap"]
+
 [[example]]
 name = "reader_ipc"
 required-features = ["mmap"]

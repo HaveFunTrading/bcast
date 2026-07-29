@@ -17,7 +17,7 @@ fn main() -> anyhow::Result<()> {
     let inbound_for_receiver = inbound.clone();
     let receiver = std::thread::spawn(move || {
         let mut tx = inbound_for_receiver.into_writer();
-        let rx = outbound_for_receiver.into_reader_at(0);
+        let mut rx = outbound_for_receiver.into_reader_at(0);
         let mut payload = [0u8; 8];
 
         'outer: loop {
@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
 
     let sender = std::thread::spawn(move || {
         let mut tx = outbound.into_writer();
-        let rx = inbound.into_reader_at(0);
+        let mut rx = inbound.into_reader_at(0);
 
         let mut payload = [0u8; 8];
         let mut msg_count: usize = 0;

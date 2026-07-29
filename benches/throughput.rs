@@ -135,6 +135,7 @@ fn reader_loop(
 }
 
 fn receive_next_loop<S>(reader: Reader<S>, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> ReaderStats {
+    let mut reader = reader;
     let mut payload = [0u8; MESSAGE_SIZE];
     let mut messages = 0;
     let mut overruns = 0;
@@ -142,13 +143,14 @@ fn receive_next_loop<S>(reader: Reader<S>, stop: Arc<AtomicBool>, barrier: Arc<B
     barrier.wait();
 
     while !stop.load(Ordering::Acquire) {
-        receive_next(&reader, &mut payload, &mut messages, &mut overruns);
+        receive_next(&mut reader, &mut payload, &mut messages, &mut overruns);
     }
 
     ReaderStats { messages, overruns }
 }
 
 fn read_batch_loop<S>(reader: Reader<S>, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> ReaderStats {
+    let mut reader = reader;
     let mut payload = [0u8; MESSAGE_SIZE];
     let mut messages = 0;
     let mut overruns = 0;
@@ -156,13 +158,14 @@ fn read_batch_loop<S>(reader: Reader<S>, stop: Arc<AtomicBool>, barrier: Arc<Bar
     barrier.wait();
 
     while !stop.load(Ordering::Acquire) {
-        read_batch(&reader, &mut payload, &mut messages, &mut overruns);
+        read_batch(&mut reader, &mut payload, &mut messages, &mut overruns);
     }
 
     ReaderStats { messages, overruns }
 }
 
 fn read_bulk_loop<S>(reader: Reader<S>, stop: Arc<AtomicBool>, barrier: Arc<Barrier>) -> ReaderStats {
+    let mut reader = reader;
     let mut bulk = vec![0u8; CAPACITY];
     let mut messages = 0;
     let mut overruns = 0;
@@ -170,13 +173,13 @@ fn read_bulk_loop<S>(reader: Reader<S>, stop: Arc<AtomicBool>, barrier: Arc<Barr
     barrier.wait();
 
     while !stop.load(Ordering::Acquire) {
-        read_bulk(&reader, &mut bulk, &mut messages, &mut overruns);
+        read_bulk(&mut reader, &mut bulk, &mut messages, &mut overruns);
     }
 
     ReaderStats { messages, overruns }
 }
 
-fn receive_next<S>(reader: &Reader<S>, payload: &mut [u8], messages: &mut usize, overruns: &mut usize) {
+fn receive_next<S>(reader: &mut Reader<S>, payload: &mut [u8], messages: &mut usize, overruns: &mut usize) {
     match reader.receive_next(payload) {
         Some(Ok(msg)) => {
             *messages += 1;
@@ -190,7 +193,7 @@ fn receive_next<S>(reader: &Reader<S>, payload: &mut [u8], messages: &mut usize,
     }
 }
 
-fn read_batch<S>(reader: &Reader<S>, payload: &mut [u8], messages: &mut usize, overruns: &mut usize) {
+fn read_batch<S>(reader: &mut Reader<S>, payload: &mut [u8], messages: &mut usize, overruns: &mut usize) {
     let Some(mut batch) = reader.read_batch() else {
         std::hint::spin_loop();
         return;
@@ -204,14 +207,14 @@ fn read_batch<S>(reader: &Reader<S>, payload: &mut [u8], messages: &mut usize, o
             }
             Err(_) => {
                 *overruns += 1;
-                reader.reset();
+                batch.reset();
                 break;
             }
         }
     }
 }
 
-fn read_bulk<S>(reader: &Reader<S>, bulk_bytes: &mut [u8], messages: &mut usize, overruns: &mut usize) {
+fn read_bulk<S>(reader: &mut Reader<S>, bulk_bytes: &mut [u8], messages: &mut usize, overruns: &mut usize) {
     let Some(bulk) = reader.read_bulk() else {
         std::hint::spin_loop();
         return;

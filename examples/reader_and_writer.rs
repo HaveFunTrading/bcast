@@ -18,8 +18,8 @@ fn main() -> anyhow::Result<()> {
     let reader_task = std::thread::spawn(move || {
         // delay for a bit so that we are not joining from position 0
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let reader_handle = storage.into_reader();
-        reader(&reader_handle).unwrap();
+        let mut reader_handle = storage.into_reader();
+        reader(&mut reader_handle).unwrap();
     });
 
     writer_task.join().unwrap();

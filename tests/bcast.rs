@@ -46,22 +46,22 @@ fn write_storage_bytes<S: Storage>(storage: &S, offset: usize, bytes: &[u8]) {
     }
 }
 
-fn receive_user_defined<S>(reader: &Reader<S>) -> u32 {
+fn receive_user_defined<S>(reader: &mut Reader<S>) -> u32 {
     let mut payload = [0u8; 4096];
     reader.receive_next(&mut payload).unwrap().unwrap().user_defined
 }
 
-fn receive_payload_len<S>(reader: &Reader<S>) -> usize {
+fn receive_payload_len<S>(reader: &mut Reader<S>) -> usize {
     let mut payload = [0u8; 4096];
     reader.receive_next(&mut payload).unwrap().unwrap().payload.len()
 }
 
-fn receive_error<S>(reader: &Reader<S>) -> Error {
+fn receive_error<S>(reader: &mut Reader<S>) -> Error {
     let mut payload = [0u8; 4096];
     reader.receive_next(&mut payload).unwrap().unwrap_err()
 }
 
-fn assert_no_message<S>(reader: &Reader<S>) {
+fn assert_no_message<S>(reader: &mut Reader<S>) {
     let mut payload = [0u8; 4096];
     assert!(reader.receive_next(&mut payload).is_none());
 }
@@ -83,7 +83,7 @@ fn assert_batch_empty<S>(batch: &mut Batch<'_, S>) {
 
 #[test]
 fn should_read_messages_in_batch() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     let mut claim = writer.claim(5, true);
     claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -125,7 +125,7 @@ fn should_read_messages_in_batch() {
 #[test]
 fn should_read_bulk() {
     let (storage, mut writer, reader) = storage_writer_and_reader::<64>();
-    let reader = reader.with_initial_position(0);
+    let mut reader = reader.with_initial_position(0);
 
     let mut claim = writer.claim(5, true);
     claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -148,7 +148,7 @@ fn should_read_bulk() {
 #[test]
 fn should_iterate_bulk_messages() {
     let (mut writer, reader) = writer_and_reader::<64>();
-    let reader = reader.with_initial_position(0);
+    let mut reader = reader.with_initial_position(0);
 
     let mut claim = writer.claim_with_user_defined(5, true, 100);
     claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -187,7 +187,7 @@ fn should_iterate_bulk_messages() {
 #[test]
 fn should_iterate_bulk_messages_via_bulk() {
     let (mut writer, reader) = writer_and_reader::<64>();
-    let reader = reader.with_initial_position(0);
+    let mut reader = reader.with_initial_position(0);
 
     let mut claim = writer.claim_with_user_defined(5, true, 100);
     claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -216,7 +216,7 @@ fn should_iterate_bulk_messages_via_bulk() {
 
 #[test]
 fn should_skip_padding_frames_in_bulk_iter() {
-    let (mut writer, reader) = writer_and_reader_at::<64>(56);
+    let (mut writer, mut reader) = writer_and_reader_at::<64>(56);
 
     let mut claim = writer.claim_with_user_defined(4, true, 300);
     claim.get_buffer_mut().copy_from_slice(b"test");
@@ -240,7 +240,7 @@ fn should_read_wrapped_bulk() {
     let storage = shared_storage::<64>();
     let _ = storage.clone().into_writer();
     let mut writer = storage.clone().join_writer_at(56);
-    let reader = storage.clone().into_reader_at(56);
+    let mut reader = storage.clone().into_reader_at(56);
 
     let claim = writer.claim(0, true);
     claim.commit();
@@ -266,7 +266,7 @@ fn should_read_wrapped_bulk() {
 #[test]
 fn should_overrun_read_bulk() {
     let (mut writer, reader) = writer_and_reader::<64>();
-    let reader = reader.with_initial_position(0);
+    let mut reader = reader.with_initial_position(0);
 
     writer.claim(16, true).commit();
     writer.claim(16, true).commit();
@@ -279,10 +279,10 @@ fn should_overrun_read_bulk() {
 
 #[test]
 fn should_allow_bulk_reader_to_recover_from_initial_overrun_after_reset() {
-    let (mut writer, reader) = writer_and_reader_at::<2048>(usize::MAX - 2047);
+    let (mut writer, mut reader) = writer_and_reader_at::<2048>(usize::MAX - 2047);
 
     writer.claim_with_user_defined(1000, true, 100).commit();
-    assert_eq!(100, receive_user_defined(&reader));
+    assert_eq!(100, receive_user_defined(&mut reader));
 
     writer.claim_with_user_defined(1000, true, 101).commit();
     writer.claim_with_user_defined(512, true, 102).commit();
@@ -306,7 +306,7 @@ fn should_allow_bulk_reader_to_recover_from_initial_overrun_after_reset() {
 #[test]
 fn should_error_if_bulk_overruns_during_copy() {
     let (mut writer, reader) = writer_and_reader::<128>();
-    let reader = reader.with_initial_position(0);
+    let mut reader = reader.with_initial_position(0);
 
     writer.claim(16, true).commit();
     writer.claim(16, true).commit();
@@ -325,7 +325,7 @@ fn should_error_if_bulk_overruns_during_copy() {
 #[test]
 fn should_allow_bulk_reader_to_recover_from_copy_overrun_after_reset() {
     let (mut writer, reader) = writer_and_reader::<128>();
-    let reader = reader.with_initial_position(0);
+    let mut reader = reader.with_initial_position(0);
 
     writer.claim_with_user_defined(16, true, 100).commit();
     writer.claim_with_user_defined(16, true, 101).commit();
@@ -353,7 +353,7 @@ fn should_allow_bulk_reader_to_recover_from_copy_overrun_after_reset() {
 
 #[test]
 fn should_read_in_batch_with_limit() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     let mut claim = writer.claim(1, true);
     claim.get_buffer_mut().copy_from_slice(b"a");
@@ -394,15 +394,15 @@ fn should_cache_producer_position_until_reader_catches_up() {
     writer.claim_with_user_defined(0, true, 100).commit();
     writer.claim_with_user_defined(0, true, 200).commit();
 
-    let reader = storage.into_reader_at(0);
+    let mut reader = storage.into_reader_at(0);
 
     writer.claim_with_user_defined(0, true, 300).commit();
 
-    assert_eq!(100, receive_user_defined(&reader));
+    assert_eq!(100, receive_user_defined(&mut reader));
 
-    assert_eq!(200, receive_user_defined(&reader));
+    assert_eq!(200, receive_user_defined(&mut reader));
 
-    assert_eq!(300, receive_user_defined(&reader));
+    assert_eq!(300, receive_user_defined(&mut reader));
 }
 
 #[test]
@@ -413,7 +413,7 @@ fn should_read_batch_from_cached_producer_position_until_reader_catches_up() {
     writer.claim_with_user_defined(0, true, 100).commit();
     writer.claim_with_user_defined(0, true, 200).commit();
 
-    let reader = storage.into_reader_at(0);
+    let mut reader = storage.into_reader_at(0);
 
     writer.claim_with_user_defined(0, true, 300).commit();
 
@@ -431,7 +431,7 @@ fn should_read_batch_from_cached_producer_position_until_reader_catches_up() {
 
 #[test]
 fn should_resume_batch_if_previous_not_consumed() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.claim_with_user_defined(0, true, 100).commit();
     writer.claim_with_user_defined(0, true, 200).commit();
@@ -451,7 +451,7 @@ fn should_resume_batch_if_previous_not_consumed() {
 
 #[test]
 fn should_read_next_message_if_batch_not_consumed() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.claim_with_user_defined(0, true, 100).commit();
     writer.claim_with_user_defined(0, true, 200).commit();
@@ -464,13 +464,13 @@ fn should_read_next_message_if_batch_not_consumed() {
     assert_eq!(200, receive_batch_user_defined(&mut batch));
     assert_eq!(300, receive_batch_user_defined(&mut batch));
 
-    assert_eq!(400, receive_user_defined(&reader));
-    assert_no_message(&reader);
+    assert_eq!(400, receive_user_defined(&mut reader));
+    assert_no_message(&mut reader);
 }
 
 #[test]
 fn should_not_extend_batch_when_new_messages_arrive() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.claim_with_user_defined(0, true, 100).commit();
     writer.claim_with_user_defined(0, true, 200).commit();
@@ -492,7 +492,7 @@ fn should_not_extend_batch_when_new_messages_arrive() {
 
 #[test]
 fn should_read_next_message() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     let mut claim = writer.claim(1, true);
     claim.get_buffer_mut().copy_from_slice(b"a");
@@ -516,12 +516,12 @@ fn should_read_next_message() {
     let msg = reader.receive_next(&mut payload).unwrap().unwrap();
     assert_eq!(b"c", msg.payload);
 
-    assert_no_message(&reader);
+    assert_no_message(&mut reader);
 }
 
 #[test]
 fn should_skip_next_message() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.claim_with_user_defined(1, true, 100).commit();
     writer.claim_with_user_defined(1, true, 200).commit();
@@ -535,12 +535,12 @@ fn should_skip_next_message() {
 
     assert_eq!(Some(Ok(())), reader.skip_next());
     assert!(reader.skip_next().is_none());
-    assert_no_message(&reader);
+    assert_no_message(&mut reader);
 }
 
 #[test]
 fn should_skip_padding_when_skipping_next_message() {
-    let (mut writer, reader) = writer_and_reader_at::<64>(56);
+    let (mut writer, mut reader) = writer_and_reader_at::<64>(56);
 
     let mut claim = writer.claim_with_user_defined(4, true, 123);
     claim.get_buffer_mut().copy_from_slice(b"test");
@@ -552,7 +552,7 @@ fn should_skip_padding_when_skipping_next_message() {
 
 #[test]
 fn should_receive_next_message_into_buffer() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     let mut claim = writer.claim_with_user_defined(5, true, 123);
     claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -573,7 +573,7 @@ fn should_receive_next_message_into_buffer() {
 
 #[test]
 fn should_return_error_if_receive_next_buffer_is_too_small() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     let mut claim = writer.claim(5, true);
     claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -591,7 +591,7 @@ fn should_return_error_if_receive_next_buffer_is_too_small() {
 #[test]
 fn should_return_error_if_frame_payload_overshoots_ring_buffer() {
     let (storage, mut writer, reader) = storage_writer_and_reader::<64>();
-    let reader = reader.with_initial_position(0);
+    let mut reader = reader.with_initial_position(0);
 
     writer.send(b"hello", true);
 
@@ -613,7 +613,7 @@ fn should_return_error_if_frame_payload_overshoots_ring_buffer() {
 
 #[test]
 fn should_skip_padding_when_receiving_next_message_into_buffer() {
-    let (mut writer, reader) = writer_and_reader_at::<64>(56);
+    let (mut writer, mut reader) = writer_and_reader_at::<64>(56);
 
     let mut claim = writer.claim_with_user_defined(4, true, 123);
     claim.get_buffer_mut().copy_from_slice(b"test");
@@ -631,7 +631,7 @@ fn should_skip_padding_when_receiving_next_message_into_buffer() {
 
 #[test]
 fn should_receive_batch_message_into_buffer() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     let mut claim = writer.claim_with_user_defined(5, true, 100);
     claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -661,7 +661,7 @@ fn should_receive_batch_message_into_buffer() {
 
 #[test]
 fn should_skip_padding_when_receiving_batch_message_into_buffer() {
-    let (mut writer, reader) = writer_and_reader_at::<64>(56);
+    let (mut writer, mut reader) = writer_and_reader_at::<64>(56);
 
     let mut claim = writer.claim_with_user_defined(4, true, 123);
     claim.get_buffer_mut().copy_from_slice(b"test");
@@ -678,7 +678,7 @@ fn should_skip_padding_when_receiving_batch_message_into_buffer() {
 
 #[test]
 fn should_skip_remaining_batch() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.claim_with_user_defined(1, true, 100).commit();
     writer.claim_with_user_defined(1, true, 200).commit();
@@ -688,12 +688,12 @@ fn should_skip_remaining_batch() {
     assert_eq!(48, batch.remaining());
     batch.skip_remaining().unwrap();
 
-    assert_no_message(&reader);
+    assert_no_message(&mut reader);
 }
 
 #[test]
 fn should_skip_remaining_after_partial_batch_read() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.claim_with_user_defined(1, true, 100).commit();
     writer.claim_with_user_defined(1, true, 200).commit();
@@ -707,12 +707,12 @@ fn should_skip_remaining_after_partial_batch_read() {
 
     batch.skip_remaining().unwrap();
 
-    assert_no_message(&reader);
+    assert_no_message(&mut reader);
 }
 
 #[test]
 fn should_return_error_if_batch_receive_next_buffer_is_too_small() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     let mut claim = writer.claim(5, true);
     claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -732,7 +732,7 @@ fn should_return_error_if_batch_receive_next_buffer_is_too_small() {
 
 #[test]
 fn should_overrun_reader() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.claim(16, true).commit();
     writer.claim(16, true).commit();
@@ -746,7 +746,7 @@ fn should_overrun_reader() {
 
 #[test]
 fn should_overrun_skip_next() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.claim(16, true).commit();
     writer.claim(16, true).commit();
@@ -758,8 +758,8 @@ fn should_overrun_skip_next() {
 }
 
 #[test]
-fn should_overrun_read_batch() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+fn should_reset_reader_through_batch_after_overrun() {
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.claim(16, true).commit();
     writer.claim(16, true).commit();
@@ -769,11 +769,16 @@ fn should_overrun_read_batch() {
     let mut batch = reader.read_batch().unwrap();
     let err = receive_batch_error(&mut batch);
     assert!(matches!(err, Error::Overrun(_)));
+    batch.reset();
+    assert_no_message(&mut reader);
+
+    writer.claim_with_user_defined(16, true, 100).commit();
+    assert_eq!(100, receive_user_defined(&mut reader));
 }
 
 #[test]
 fn should_overrun_batch_skip_remaining() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.claim(16, true).commit();
     writer.claim(16, true).commit();
@@ -801,8 +806,8 @@ fn should_start_read_from_last_producer_position() {
 
     writer.claim(16, true).commit();
 
-    let reader = storage.into_reader();
-    assert_no_message(&reader);
+    let mut reader = storage.into_reader();
+    assert_no_message(&mut reader);
 }
 
 #[test]
@@ -824,7 +829,7 @@ fn should_not_start_reader_at_retained_window_start_unless_it_is_a_frame_boundar
     assert_eq!(24, retained_window_start);
     let first_valid_frame_position = 40;
 
-    let reader = storage.clone().into_reader_at(retained_window_start);
+    let mut reader = storage.clone().into_reader_at(retained_window_start);
 
     let mut payload = [0u8; 1024];
     let msg = reader.receive_next(&mut payload).unwrap().unwrap();
@@ -832,7 +837,7 @@ fn should_not_start_reader_at_retained_window_start_unless_it_is_a_frame_boundar
     assert_eq!(0, msg.payload.len());
     assert_eq!(0, msg.user_defined);
 
-    let reader = storage.into_reader_at(first_valid_frame_position);
+    let mut reader = storage.into_reader_at(first_valid_frame_position);
 
     let msg = reader.receive_next(&mut payload).unwrap().unwrap();
     assert_eq!(first_valid_frame_position, msg.stream_position);
@@ -848,11 +853,11 @@ fn should_start_read_from_beginning_before_first_lap_completes() {
     writer.claim_with_user_defined(16, true, 100).commit();
     writer.claim_with_user_defined(16, true, 101).commit();
 
-    let reader = storage.into_reader_at_last_lap();
+    let mut reader = storage.into_reader_at_last_lap();
 
-    assert_eq!(100, receive_user_defined(&reader));
-    assert_eq!(101, receive_user_defined(&reader));
-    assert_no_message(&reader);
+    assert_eq!(100, receive_user_defined(&mut reader));
+    assert_eq!(101, receive_user_defined(&mut reader));
+    assert_no_message(&mut reader);
 }
 
 #[test]
@@ -863,18 +868,18 @@ fn should_not_advance_last_lap_until_new_frame_starts_at_ring_beginning() {
     writer.claim_with_user_defined(56, true, 100).commit();
     writer.claim_with_user_defined(56, true, 101).commit();
 
-    let reader = storage.clone().into_reader_at_last_lap();
+    let mut reader = storage.clone().into_reader_at_last_lap();
 
-    assert_eq!(100, receive_user_defined(&reader));
-    assert_eq!(101, receive_user_defined(&reader));
-    assert_no_message(&reader);
+    assert_eq!(100, receive_user_defined(&mut reader));
+    assert_eq!(101, receive_user_defined(&mut reader));
+    assert_no_message(&mut reader);
 
     writer.claim_with_user_defined(16, true, 102).commit();
 
-    let reader = storage.into_reader_at_last_lap();
+    let mut reader = storage.into_reader_at_last_lap();
 
-    assert_eq!(102, receive_user_defined(&reader));
-    assert_no_message(&reader);
+    assert_eq!(102, receive_user_defined(&mut reader));
+    assert_no_message(&mut reader);
 }
 
 #[test]
@@ -886,10 +891,10 @@ fn should_start_read_from_last_lap_after_padding_wrap() {
     writer.claim_with_user_defined(40, true, 101).commit();
     writer.claim_with_user_defined(40, true, 102).commit();
 
-    let reader = storage.into_reader_at_last_lap();
+    let mut reader = storage.into_reader_at_last_lap();
 
-    assert_eq!(102, receive_user_defined(&reader));
-    assert_no_message(&reader);
+    assert_eq!(102, receive_user_defined(&mut reader));
+    assert_no_message(&mut reader);
 }
 
 #[test]
@@ -899,10 +904,10 @@ fn should_start_read_from_last_lap_without_writer_config() {
 
     writer.claim_with_user_defined(16, true, 100).commit();
 
-    let reader = storage.into_reader_at_last_lap();
+    let mut reader = storage.into_reader_at_last_lap();
 
-    assert_eq!(100, receive_user_defined(&reader));
-    assert_no_message(&reader);
+    assert_eq!(100, receive_user_defined(&mut reader));
+    assert_no_message(&mut reader);
 }
 
 #[test]
@@ -917,17 +922,17 @@ fn should_allow_claim_reservation_to_reduce_readable_window() {
     let mut writer = storage
         .clone()
         .into_writer_with_cfg(|config| config.claim_reserve_ratio(0.25));
-    let reader = storage.into_reader_at(0);
+    let mut reader = storage.into_reader_at(0);
 
     writer.claim(24, true).commit();
     writer.claim(24, true).commit();
 
-    assert!(matches!(receive_error(&reader), Error::Overrun(0)));
+    assert!(matches!(receive_error(&mut reader), Error::Overrun(0)));
 }
 
 #[test]
 fn should_read_message_into_vec() {
-    let (mut writer, reader) = writer_and_reader::<1024>();
+    let (mut writer, mut reader) = writer_and_reader::<1024>();
 
     let mut claim = writer.claim(11, true);
     claim.get_buffer_mut().copy_from_slice(b"hello world");
@@ -941,7 +946,7 @@ fn should_read_message_into_vec() {
 
 #[test]
 fn should_publish_message_using_closure() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.publish_with_user_defined(11, true, 123, |payload| {
         payload.copy_from_slice(b"hello world");
@@ -956,7 +961,7 @@ fn should_publish_message_using_closure() {
 
 #[test]
 fn should_send_message_from_payload_slice() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     writer.send_with_user_defined(b"hello world", false, 123);
 
@@ -970,17 +975,17 @@ fn should_send_message_from_payload_slice() {
 
 #[test]
 fn should_send_zero_size_message() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     let claim = writer.claim(0, true);
     claim.commit();
 
-    assert_eq!(0, receive_payload_len(&reader));
+    assert_eq!(0, receive_payload_len(&mut reader));
 }
 
 #[test]
 fn should_send_heartbeat() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     let claim = writer.heartbeat();
     claim.commit();
@@ -995,23 +1000,23 @@ fn should_send_heartbeat() {
 #[test]
 fn should_abort_publication() {
     let (mut writer, reader) = writer_and_reader::<64>();
-    let reader = reader.with_initial_position(0);
+    let mut reader = reader.with_initial_position(0);
 
     let claim = writer.claim(16, true);
     claim.abort();
-    assert_no_message(&reader);
+    assert_no_message(&mut reader);
 
     let claim = writer.claim(24, true);
     claim.commit();
-    assert_eq!(24, receive_payload_len(&reader));
+    assert_eq!(24, receive_payload_len(&mut reader));
 
     let claim = writer.claim(8, true);
     claim.commit();
-    assert_eq!(8, receive_payload_len(&reader));
+    assert_eq!(8, receive_payload_len(&mut reader));
 
     let claim = writer.claim(16, true);
     claim.abort();
-    assert_no_message(&reader);
+    assert_no_message(&mut reader);
 }
 
 #[test]
@@ -1029,7 +1034,7 @@ fn should_attach_metadata() {
 
 #[test]
 fn should_skip_padding_frame() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
     let mut buffer = [0u8; 1024];
 
     let claim = writer.claim_with_user_defined(24, true, 123);
@@ -1052,7 +1057,7 @@ fn should_skip_padding_frame() {
 
 #[test]
 fn should_fragment_message() {
-    let (mut writer, reader) = writer_and_reader::<64>();
+    let (mut writer, mut reader) = writer_and_reader::<64>();
 
     let claim = writer.claim_with_user_defined(24, false, 123);
     claim.commit();
@@ -1100,18 +1105,18 @@ fn should_join_writer() {
     }
 
     // verify we got all the messages
-    let reader = storage.into_reader_at(0);
-    assert_eq!(100, receive_user_defined(&reader));
-    assert_eq!(101, receive_user_defined(&reader));
-    assert_eq!(102, receive_user_defined(&reader));
-    assert_eq!(103, receive_user_defined(&reader));
-    assert_eq!(104, receive_user_defined(&reader));
-    assert_eq!(105, receive_user_defined(&reader));
+    let mut reader = storage.into_reader_at(0);
+    assert_eq!(100, receive_user_defined(&mut reader));
+    assert_eq!(101, receive_user_defined(&mut reader));
+    assert_eq!(102, receive_user_defined(&mut reader));
+    assert_eq!(103, receive_user_defined(&mut reader));
+    assert_eq!(104, receive_user_defined(&mut reader));
+    assert_eq!(105, receive_user_defined(&mut reader));
 }
 
 #[test]
 fn should_handle_position_wrap_around_if_no_overrun() {
-    let (mut writer, reader) = writer_and_reader_at::<2048>(usize::MAX - 1023);
+    let (mut writer, mut reader) = writer_and_reader_at::<2048>(usize::MAX - 1023);
     // last claim before wrap around
     writer.claim_with_user_defined(1000, true, 100).commit();
     // first claim after wrap around, will insert padding frame and
@@ -1120,19 +1125,19 @@ fn should_handle_position_wrap_around_if_no_overrun() {
     // a normal claim after wrap around
     writer.claim_with_user_defined(16, true, 102).commit();
     // verify we got all the messages
-    assert_eq!(100, receive_user_defined(&reader));
-    assert_eq!(101, receive_user_defined(&reader));
-    assert_eq!(102, receive_user_defined(&reader));
+    assert_eq!(100, receive_user_defined(&mut reader));
+    assert_eq!(101, receive_user_defined(&mut reader));
+    assert_eq!(102, receive_user_defined(&mut reader));
     // and are still in sync
 }
 
 #[test]
 fn should_allow_reader_to_recover_from_overrun_when_position_wrapped_around() {
-    let (mut writer, reader) = writer_and_reader_at::<2048>(usize::MAX - 2047);
+    let (mut writer, mut reader) = writer_and_reader_at::<2048>(usize::MAX - 2047);
 
     // First claim and read
     writer.claim_with_user_defined(1000, true, 100).commit();
-    assert_eq!(100, receive_user_defined(&reader));
+    assert_eq!(100, receive_user_defined(&mut reader));
 
     // Last claim before wrap around
     writer.claim_with_user_defined(1000, true, 101).commit();
@@ -1145,20 +1150,20 @@ fn should_allow_reader_to_recover_from_overrun_when_position_wrapped_around() {
     thread_rng().fill(claim.get_buffer_mut());
     claim.commit();
 
-    assert!(matches!(receive_error(&reader), Error::Overrun(_)));
+    assert!(matches!(receive_error(&mut reader), Error::Overrun(_)));
     // Reset the reader and start over
     reader.reset();
-    assert_no_message(&reader);
+    assert_no_message(&mut reader);
     // Continue writing and reading
 
     writer.claim_with_user_defined(1000, true, 104).commit();
 
-    assert_eq!(104, receive_user_defined(&reader));
+    assert_eq!(104, receive_user_defined(&mut reader));
 }
 
 #[test]
 fn should_allow_batch_reader_to_recover_from_overrun_when_position_wrapped_around() {
-    let (mut writer, reader) = writer_and_reader_at::<2048>(usize::MAX - 2047);
+    let (mut writer, mut reader) = writer_and_reader_at::<2048>(usize::MAX - 2047);
 
     // First claim and read
     writer.claim_with_user_defined(1000, true, 100).commit();
@@ -1194,7 +1199,7 @@ fn should_allow_batch_reader_to_recover_from_overrun_when_position_wrapped_aroun
 #[test]
 fn should_not_overrun_batch_when_reader_has_not_been_lapped() {
     let (mut writer, reader) = writer_and_reader::<128>();
-    let reader = reader.with_initial_position(0);
+    let mut reader = reader.with_initial_position(0);
 
     for i in 0..4_u32 {
         writer.claim_with_user_defined(16, true, i).commit();
@@ -1213,19 +1218,19 @@ fn should_not_overrun_batch_when_reader_has_not_been_lapped() {
 #[test]
 fn should_allow_receive_next_when_reader_has_not_been_lapped() {
     let (mut writer, reader) = writer_and_reader::<128>();
-    let reader = reader.with_initial_position(0);
+    let mut reader = reader.with_initial_position(0);
 
     for i in 0..4_u32 {
         writer.claim_with_user_defined(16, true, i).commit();
     }
 
-    assert_eq!(0, receive_user_defined(&reader));
+    assert_eq!(0, receive_user_defined(&mut reader));
 
     writer.claim_with_user_defined(16, true, 100).commit();
     writer.claim_with_user_defined(16, true, 101).commit();
 
     // This is the control case for the batch repro above.
-    assert_eq!(1, receive_user_defined(&reader));
+    assert_eq!(1, receive_user_defined(&mut reader));
 }
 
 #[test]
@@ -1233,7 +1238,7 @@ fn should_not_return_uncommitted_claim_as_committed_payload() {
     const CAPACITY: usize = 64;
     const PAYLOAD_LEN: usize = 24;
 
-    let (mut writer, reader) = writer_and_reader::<CAPACITY>();
+    let (mut writer, mut reader) = writer_and_reader::<CAPACITY>();
 
     {
         let mut claim = writer.claim(PAYLOAD_LEN, true);

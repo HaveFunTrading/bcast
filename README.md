@@ -22,6 +22,7 @@ Relative to the latest non-RC release, `0.0.29`, the 1.0 line makes the reader A
 - writer claim reservation is configured as a capacity ratio, for example `claim_reserve_ratio(0.05)` for 5%
 - writers can publish via scoped `publish(...)` closures or copy caller-owned payloads via `send(...)`, in addition to the lower-level `claim(...)` API
 - writer publication APIs now require mutable writer access, so the type system prevents multiple open claims from the same writer
+- cursor-advancing reader APIs require mutable reader access; batches and bulk windows borrow the reader exclusively so its cursor cannot advance independently while either is active
 
 ## Supported Platforms
 The crate has been developed and tested exclusively on `x86_64-linux`. It should also work (but it's by 
@@ -38,7 +39,7 @@ use bcast::{LocalStorage, StorageExt};
 
 let storage = LocalStorage::with_capacity(1024).into_shared();
 let mut writer = storage.clone().into_writer();
-let reader = storage.clone().into_reader_at(0);
+let mut reader = storage.clone().into_reader_at(0);
 ```
 
 The simplest write API copies a caller-owned payload into the ring and commits it as a single message:
@@ -71,15 +72,15 @@ Readers own independent cursors. `into_reader()` starts at the writer's current 
 new messages. Use `into_reader_at(position)` when resuming from a known stream position.
 
 ```rust
-let live_reader = storage.clone().into_reader();
-let replay_from_start = storage.clone().into_reader_at(0);
+let mut live_reader = storage.clone().into_reader();
+let mut replay_from_start = storage.clone().into_reader_at(0);
 ```
 
 Late readers can also replay up to one lap of retained data from the most recent physical ring
 lap. The writer updates this marker only when a new frame starts at the beginning of the ring:
 
 ```rust
-let reader = storage.clone().into_reader_at_last_lap();
+let mut reader = storage.clone().into_reader_at_last_lap();
 ```
 
 The `Reader` is batch aware (it knows how far behind a producer it is) and can copy pending messages into a caller-provided buffer.
@@ -123,7 +124,7 @@ let path = "channel.bcast";
 let size = HEADER_SIZE + 1024;
 
 let mut writer = MappedWriter::join_or_create(path, size)?;
-let reader = MappedReader::new(path)?;
+let mut reader = MappedReader::new(path)?;
 ```
 
 ## Backpressure (and the lack of it)
@@ -145,3 +146,21 @@ match reader.receive_next(&mut payload) {
 ```
 
 If a message or batch should be discarded, use `Reader::skip_next()` or `Batch::skip_remaining()` to advance without copying payload bytes.
+
+When a batch detects an overrun, `Batch::reset(self)` consumes the batch and
+resets its underlying reader to the producer's current committed position:
+
+```rust
+if let Some(mut batch) = reader.read_batch() {
+    while let Some(result) = batch.receive_next(&mut payload) {
+        match result {
+            Ok(message) => process(message),
+            Err(Error::Overrun(_)) => {
+                batch.reset();
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+```

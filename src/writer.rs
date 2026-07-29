@@ -108,7 +108,7 @@ impl WriterConfig {
 ///
 /// let storage = LocalStorage::with_capacity(1024).into_shared();
 /// let mut writer = storage.clone().into_writer();
-/// let reader = storage.into_reader();
+/// let mut reader = storage.into_reader();
 ///
 /// writer.send(b"hello", true);
 ///
@@ -139,7 +139,7 @@ impl<S: WriteStorage> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = Writer::new(storage.clone());
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.send(b"hello", true);
     ///
@@ -193,7 +193,7 @@ impl<S: WriteStorage> Writer<S> {
     /// }
     ///
     /// let mut writer = Writer::join(storage.clone());
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     /// writer.send(b"two", true);
     ///
     /// let mut payload = [0u8; 16];
@@ -224,7 +224,7 @@ impl<S: WriteStorage> Writer<S> {
     /// let mut writer = Writer::join_with_cfg(storage.clone(), |config| {
     ///     config.claim_reserve_ratio(0.25)
     /// });
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     /// writer.send(b"two", true);
     ///
     /// let mut payload = [0u8; 16];
@@ -259,7 +259,7 @@ impl<S: WriteStorage> Writer<S> {
     /// }
     ///
     /// let mut writer = Writer::join_at(storage.clone(), 0);
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     /// writer.send(b"hello", true);
     ///
     /// let mut payload = [0u8; 16];
@@ -289,7 +289,7 @@ impl<S: WriteStorage> Writer<S> {
     /// let mut writer = Writer::join_at_with_cfg(storage.clone(), 0, |config| {
     ///     config.claim_reserve_ratio(0.25)
     /// });
-    /// let reader = storage.into_reader_at(0);
+    /// let mut reader = storage.into_reader_at(0);
     /// writer.send(b"hello", true);
     ///
     /// let mut payload = [0u8; 16];
@@ -336,7 +336,7 @@ impl<S> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// let mut claim = writer.claim(5, true);
     /// claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -364,7 +364,7 @@ impl<S> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// let mut claim = writer.claim_with_user_defined(5, true, 123);
     /// claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -398,7 +398,7 @@ impl<S> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.publish(5, true, |payload| payload.copy_from_slice(b"hello"));
     ///
@@ -426,7 +426,7 @@ impl<S> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.publish_with_user_defined(5, true, 123, |payload| {
     ///     payload.copy_from_slice(b"hello");
@@ -464,7 +464,7 @@ impl<S> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.send(b"hello", true);
     ///
@@ -490,7 +490,7 @@ impl<S> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.send_with_user_defined(b"hello", true, 123);
     ///
@@ -522,7 +522,7 @@ impl<S> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.claim(5, false).commit();
     /// let mut continuation = writer.continuation(5, true);
@@ -562,7 +562,7 @@ impl<S> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.heartbeat().commit();
     ///
@@ -585,7 +585,7 @@ impl<S> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.heartbeat_with_user_defined(123).commit();
     ///
@@ -608,7 +608,7 @@ impl<S> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// let mut heartbeat = writer.heartbeat_with_payload(5);
     /// heartbeat.get_buffer_mut().copy_from_slice(b"hello");
@@ -639,7 +639,7 @@ impl<S> Writer<S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// let mut heartbeat = writer.heartbeat_with_payload_and_user_defined(5, 123);
     /// heartbeat.get_buffer_mut().copy_from_slice(b"hello");
@@ -760,7 +760,7 @@ impl<S> Writer<S> {
 ///
 /// let storage = LocalStorage::with_capacity(1024).into_shared();
 /// let mut writer = storage.clone().into_writer();
-/// let reader = storage.into_reader();
+/// let mut reader = storage.into_reader();
 ///
 /// let mut claim = writer.claim(5, true);
 /// claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -856,7 +856,7 @@ impl<'a, S> Claim<'a, S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// let mut claim = writer.claim(5, true);
     /// claim.get_buffer_mut().copy_from_slice(b"hello");
@@ -883,7 +883,7 @@ impl<'a, S> Claim<'a, S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.claim(5, true).abort();
     ///
@@ -924,7 +924,7 @@ impl<'a, S> Claim<'a, S> {
     ///
     /// let storage = LocalStorage::with_capacity(1024).into_shared();
     /// let mut writer = storage.clone().into_writer();
-    /// let reader = storage.into_reader();
+    /// let mut reader = storage.into_reader();
     ///
     /// writer.claim(0, true).commit();
     ///

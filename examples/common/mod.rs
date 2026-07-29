@@ -21,9 +21,9 @@ pub fn writer<S>(writer: &mut Writer<S>) {
 /// defined field set by the writer) and sleep for 10 milliseconds in order to process messages
 /// in a batch.
 #[allow(dead_code)]
-pub fn reader<S>(reader: &Reader<S>) -> anyhow::Result<()> {
+pub fn reader<S>(reader: &mut Reader<S>) -> anyhow::Result<()> {
     let mut payload = unsafe { MaybeUninit::new([0u8; 1024]).assume_init() };
-    loop {
+    'poll: loop {
         #[cfg(debug_assertions)]
         let mut count = 0;
         if let Some(mut batch) = reader.read_batch() {
@@ -32,8 +32,8 @@ pub fn reader<S>(reader: &Reader<S>) -> anyhow::Result<()> {
                     Ok(msg) => msg,
                     Err(Error::Overrun(position)) => {
                         println!("overrun for {} bytes, resetting reader", position);
-                        reader.reset();
-                        break;
+                        batch.reset();
+                        continue 'poll;
                     }
                     Err(e) => {
                         return Err(anyhow!(e));
@@ -62,7 +62,7 @@ pub fn reader<S>(reader: &Reader<S>) -> anyhow::Result<()> {
 /// validation as `reader`, but copies the full bulk window first and then iterates over it
 /// off-ring.
 #[allow(dead_code)]
-pub fn bulk_reader<S>(reader: &Reader<S>) -> anyhow::Result<()> {
+pub fn bulk_reader<S>(reader: &mut Reader<S>) -> anyhow::Result<()> {
     let mut bulk_bytes = Vec::new();
 
     loop {

@@ -572,6 +572,33 @@ fn should_receive_next_message_into_buffer() {
 }
 
 #[test]
+fn should_receive_next_message_with_filter() {
+    let (mut writer, mut reader) = writer_and_reader::<64>();
+
+    writer.send_with_user_defined(b"too-large", true, 100);
+    writer.send_with_user_defined(b"x", true, 200);
+
+    let mut observed = Vec::new();
+    let mut payload = [0u8; 1];
+    let msg = reader
+        .receive_next_with_filter(&mut payload, |user_defined| {
+            observed.push(user_defined);
+            user_defined == 200
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!([100, 200], observed.as_slice());
+    assert_eq!(200, msg.user_defined);
+    assert_eq!(b"x", msg.payload);
+    assert!(
+        reader
+            .receive_next_with_filter(&mut payload, |user_defined| user_defined == 200)
+            .is_none()
+    );
+}
+
+#[test]
 fn should_return_error_if_receive_next_buffer_is_too_small() {
     let (mut writer, mut reader) = writer_and_reader::<64>();
 
@@ -609,6 +636,24 @@ fn should_return_error_if_frame_payload_overshoots_ring_buffer() {
         },
         err,
     );
+}
+
+#[test]
+fn should_not_filter_out_corrupt_frame() {
+    let (storage, mut writer, reader) = storage_writer_and_reader::<64>();
+    let mut reader = reader.with_initial_position(0);
+
+    writer.send_with_user_defined(b"hello", true, 100);
+
+    let fields = 64_u64 | (1_u64 << 31);
+    write_storage_bytes(&storage, HEADER_SIZE, &fields.to_le_bytes());
+
+    let mut payload = [0u8; 1];
+    let err = reader
+        .receive_next_with_filter(&mut payload, |_| false)
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(err, Error::CorruptFrame { .. }));
 }
 
 #[test]
@@ -657,6 +702,100 @@ fn should_receive_batch_message_into_buffer() {
     }
 
     assert!(batch.receive_next(&mut payload).is_none());
+}
+
+#[test]
+fn should_read_fixed_batch_with_stateful_filter() {
+    let (mut writer, mut reader) = writer_and_reader::<64>();
+
+    writer.claim_with_user_defined(0, true, 100).commit();
+    writer.claim_with_user_defined(0, true, 200).commit();
+    writer.claim_with_user_defined(0, true, 300).commit();
+
+    let mut evaluations = 0;
+    let mut payload = [];
+    {
+        let mut batch = reader
+            .read_batch_with_filter(|user_defined| {
+                evaluations += 1;
+                user_defined == 200
+            })
+            .unwrap();
+
+        writer.claim_with_user_defined(0, true, 200).commit();
+
+        let msg = batch.receive_next(&mut payload).unwrap().unwrap();
+        assert_eq!(200, msg.user_defined);
+        assert_eq!(8, batch.remaining());
+        assert!(batch.receive_next(&mut payload).is_none());
+        assert_eq!(0, batch.remaining());
+    }
+    assert_eq!(3, evaluations);
+
+    let mut batch = reader
+        .read_batch_with_filter(|user_defined| user_defined == 200)
+        .unwrap();
+    assert_eq!(200, batch.receive_next(&mut payload).unwrap().unwrap().user_defined);
+    assert!(batch.receive_next(&mut payload).is_none());
+}
+
+#[test]
+fn should_attach_filter_to_existing_batch_and_skip_padding() {
+    let (mut writer, mut reader) = writer_and_reader_at::<64>(56);
+
+    let mut claim = writer.claim_with_user_defined(4, true, 123);
+    claim.get_buffer_mut().copy_from_slice(b"test");
+    claim.commit();
+
+    let mut evaluations = 0;
+    {
+        let batch = reader.read_batch().unwrap();
+        let mut batch = batch.with_filter(|user_defined| {
+            evaluations += 1;
+            user_defined == 123
+        });
+
+        let mut payload = [0u8; 4];
+        let msg = batch.receive_next(&mut payload).unwrap().unwrap();
+        assert_eq!(123, msg.user_defined);
+        assert_eq!(b"test", msg.payload);
+        assert!(batch.receive_next(&mut payload).is_none());
+    }
+
+    assert_eq!(1, evaluations);
+}
+
+#[test]
+fn should_skip_remaining_filtered_batch() {
+    let (mut writer, mut reader) = writer_and_reader::<64>();
+
+    writer.claim_with_user_defined(1, true, 100).commit();
+    writer.claim_with_user_defined(1, true, 200).commit();
+    writer.claim_with_user_defined(1, true, 300).commit();
+
+    let batch = reader.read_batch_with_filter(|_| false).unwrap();
+    assert_eq!(48, batch.remaining());
+    batch.skip_remaining().unwrap();
+
+    assert_no_message(&mut reader);
+}
+
+#[test]
+fn should_reset_reader_through_filtered_batch_after_overrun() {
+    let (mut writer, mut reader) = writer_and_reader::<64>();
+
+    writer.claim(16, true).commit();
+    writer.claim(16, true).commit();
+    writer.claim(16, true).commit();
+    writer.claim(16, true).commit();
+
+    let mut batch = reader.read_batch_with_filter(|_| true).unwrap();
+    let mut payload = [0u8; 16];
+    let err = batch.receive_next(&mut payload).unwrap().unwrap_err();
+    assert!(matches!(err, Error::Overrun(_)));
+    batch.reset();
+
+    assert_no_message(&mut reader);
 }
 
 #[test]

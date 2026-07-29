@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use bcast::{HEADER_SIZE, MmapMutStorage, MmapStorage, StorageExt, Writer};
 use hdrhistogram::Histogram;
+use std::cell::Cell;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
@@ -30,6 +31,21 @@ impl Topology {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ReaderApi {
+    Batch,
+    Direct,
+}
+
+impl ReaderApi {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Batch => "read_batch_with_filter",
+            Self::Direct => "receive_next_with_filter",
+        }
+    }
+}
+
 struct ProducerStats {
     started_at: Instant,
     elapsed: Duration,
@@ -45,6 +61,7 @@ struct ConsumerStats {
 
 struct CaseResult {
     topology: Topology,
+    reader_api: ReaderApi,
     producer: ProducerStats,
     consumers: Vec<ConsumerStats>,
     end_to_end: Duration,
@@ -62,17 +79,33 @@ fn main() -> Result<()> {
     println!("messages per consumer: {messages_per_consumer}");
     println!("total messages published per case: {total_messages}");
     println!("writer claim reserve: {:.1}%", CLAIM_RESERVE_RATIO * 100.0);
-    println!("reader API: read_batch");
+    println!("reader APIs: read_batch_with_filter, receive_next_with_filter");
     println!("mmap directory: {SHM_DIRECTORY}");
     println!();
 
-    let shared = run_shared_channel(messages_per_consumer)?;
-    print_result(&shared, total_messages);
+    let batch_shared = run_shared_channel(messages_per_consumer, ReaderApi::Batch)?;
+    print_result(&batch_shared, total_messages);
 
-    let distinct = run_distinct_channels(messages_per_consumer)?;
-    print_result(&distinct, total_messages);
+    let batch_distinct = run_distinct_channels(messages_per_consumer, ReaderApi::Batch)?;
+    print_result(&batch_distinct, total_messages);
 
-    println!("comparison (distinct / shared)");
+    print_topology_comparison(&batch_shared, &batch_distinct, total_messages);
+
+    let direct_shared = run_shared_channel(messages_per_consumer, ReaderApi::Direct)?;
+    print_result(&direct_shared, total_messages);
+
+    let direct_distinct = run_distinct_channels(messages_per_consumer, ReaderApi::Direct)?;
+    print_result(&direct_distinct, total_messages);
+
+    print_topology_comparison(&direct_shared, &direct_distinct, total_messages);
+    print_reader_api_comparison(&batch_shared, &direct_shared, total_messages);
+    print_reader_api_comparison(&batch_distinct, &direct_distinct, total_messages);
+
+    Ok(())
+}
+
+fn print_topology_comparison(shared: &CaseResult, distinct: &CaseResult, total_messages: usize) {
+    println!("{}: distinct / shared", shared.reader_api.name());
     println!(
         "  producer throughput: {:.3}x",
         messages_per_second(total_messages, distinct.producer.elapsed)
@@ -91,8 +124,29 @@ fn main() -> Result<()> {
         "  p99 latency: {:.3}x",
         ratio(distinct.latencies.value_at_percentile(99.0), shared.latencies.value_at_percentile(99.0),)
     );
+    println!();
+}
 
-    Ok(())
+fn print_reader_api_comparison(batch: &CaseResult, direct: &CaseResult, total_messages: usize) {
+    println!("{}: direct / batch", batch.topology.name());
+    println!(
+        "  producer throughput: {:.3}x",
+        messages_per_second(total_messages, direct.producer.elapsed)
+            / messages_per_second(total_messages, batch.producer.elapsed)
+    );
+    println!(
+        "  end-to-end throughput: {:.3}x",
+        messages_per_second(total_messages, direct.end_to_end) / messages_per_second(total_messages, batch.end_to_end)
+    );
+    println!(
+        "  p50 latency: {:.3}x",
+        ratio(direct.latencies.value_at_percentile(50.0), batch.latencies.value_at_percentile(50.0),)
+    );
+    println!(
+        "  p99 latency: {:.3}x",
+        ratio(direct.latencies.value_at_percentile(99.0), batch.latencies.value_at_percentile(99.0),)
+    );
+    println!();
 }
 
 fn messages_per_consumer() -> Result<usize> {
@@ -107,7 +161,7 @@ fn messages_per_consumer() -> Result<usize> {
     Ok(count)
 }
 
-fn run_shared_channel(messages_per_consumer: usize) -> Result<CaseResult> {
+fn run_shared_channel(messages_per_consumer: usize, reader_api: ReaderApi) -> Result<CaseResult> {
     let total_messages = messages_per_consumer
         .checked_mul(CONSUMER_COUNT)
         .context("total message count overflowed usize")?;
@@ -122,6 +176,7 @@ fn run_shared_channel(messages_per_consumer: usize) -> Result<CaseResult> {
 
     let consumers = spawn_consumers(
         Topology::Shared,
+        reader_api,
         std::slice::from_ref(&path),
         messages_per_consumer,
         total_messages,
@@ -151,10 +206,10 @@ fn run_shared_channel(messages_per_consumer: usize) -> Result<CaseResult> {
         })
         .context("spawn shared-channel producer")?;
 
-    collect_case(Topology::Shared, producer, consumers)
+    collect_case(Topology::Shared, reader_api, producer, consumers)
 }
 
-fn run_distinct_channels(messages_per_consumer: usize) -> Result<CaseResult> {
+fn run_distinct_channels(messages_per_consumer: usize, reader_api: ReaderApi) -> Result<CaseResult> {
     let capacity = ring_capacity(messages_per_consumer)?;
     let directory =
         tempfile::tempdir_in(SHM_DIRECTORY).context("create distinct-channel benchmark directory in /dev/shm")?;
@@ -173,6 +228,7 @@ fn run_distinct_channels(messages_per_consumer: usize) -> Result<CaseResult> {
 
     let consumers = spawn_consumers(
         Topology::Distinct,
+        reader_api,
         &paths,
         messages_per_consumer,
         messages_per_consumer,
@@ -205,11 +261,12 @@ fn run_distinct_channels(messages_per_consumer: usize) -> Result<CaseResult> {
         })
         .context("spawn distinct-channel producer")?;
 
-    collect_case(Topology::Distinct, producer, consumers)
+    collect_case(Topology::Distinct, reader_api, producer, consumers)
 }
 
 fn spawn_consumers(
     topology: Topology,
+    reader_api: ReaderApi,
     paths: &[PathBuf],
     messages_per_consumer: usize,
     frames_to_poll: usize,
@@ -228,7 +285,9 @@ fn spawn_consumers(
 
             thread::Builder::new()
                 .name(format!("mmap-consumer-{}", index + 1))
-                .spawn(move || consume(&path, expected_type, messages_per_consumer, frames_to_poll, barrier, clock))
+                .spawn(move || {
+                    consume(&path, reader_api, expected_type, messages_per_consumer, frames_to_poll, barrier, clock)
+                })
                 .expect("spawn consumer")
         })
         .collect()
@@ -236,6 +295,7 @@ fn spawn_consumers(
 
 fn consume(
     path: &Path,
+    reader_api: ReaderApi,
     expected_type: u32,
     expected_matches: usize,
     frames_to_poll: usize,
@@ -247,44 +307,59 @@ fn consume(
         .into_reader_at(0);
     let mut payload = [0u8; PAYLOAD_SIZE];
     let mut latencies = Histogram::<u64>::new(3).context("create latency histogram")?;
-    let mut polled = 0;
+    let polled = Cell::new(0);
     let mut matched = 0;
 
     barrier.wait();
 
-    while polled < frames_to_poll {
-        let Some(mut batch) = reader.read_batch() else {
-            std::hint::spin_loop();
-            continue;
-        };
+    match reader_api {
+        ReaderApi::Batch => {
+            while polled.get() < frames_to_poll {
+                let Some(mut batch) = reader.read_batch_with_filter(|user_defined| {
+                    polled.set(polled.get() + 1);
+                    user_defined == expected_type
+                }) else {
+                    std::hint::spin_loop();
+                    continue;
+                };
 
-        while polled < frames_to_poll {
-            let Some(message) = batch.receive_next(&mut payload) else {
-                break;
-            };
-            let message = message.map_err(|error| {
-                anyhow!("consumer {expected_type} was overrun after {polled}/{frames_to_poll} frames: {error}")
-            })?;
-            polled += 1;
-
-            if message.user_defined != expected_type {
-                continue;
+                while polled.get() < frames_to_poll {
+                    let Some(message) = batch.receive_next(&mut payload) else {
+                        break;
+                    };
+                    let message = message.map_err(|error| {
+                        anyhow!(
+                            "consumer {expected_type} was overrun after {}/{frames_to_poll} frames: {error}",
+                            polled.get()
+                        )
+                    })?;
+                    record_latency(message.payload, &clock, &mut latencies)?;
+                    matched += 1;
+                }
             }
-
-            let timestamp = u64::from_le_bytes(
-                message.payload[..TIMESTAMP_SIZE]
-                    .try_into()
-                    .expect("timestamp has eight bytes"),
-            );
-            let latency = now_nanos(&clock).saturating_sub(timestamp);
-            latencies
-                .record(latency)
-                .with_context(|| format!("record latency of {latency}ns"))?;
-            matched += 1;
-            black_box(message.payload[TIMESTAMP_SIZE]);
+        }
+        ReaderApi::Direct => {
+            while polled.get() < frames_to_poll {
+                let Some(message) = reader.receive_next_with_filter(&mut payload, |user_defined| {
+                    polled.set(polled.get() + 1);
+                    user_defined == expected_type
+                }) else {
+                    std::hint::spin_loop();
+                    continue;
+                };
+                let message = message.map_err(|error| {
+                    anyhow!(
+                        "consumer {expected_type} was overrun after {}/{frames_to_poll} frames: {error}",
+                        polled.get()
+                    )
+                })?;
+                record_latency(message.payload, &clock, &mut latencies)?;
+                matched += 1;
+            }
         }
     }
 
+    let polled = polled.get();
     ensure!(
         matched == expected_matches,
         "consumer {expected_type} matched {matched} messages; expected {expected_matches}"
@@ -299,6 +374,16 @@ fn consume(
     })
 }
 
+fn record_latency(payload: &[u8], clock: &Instant, latencies: &mut Histogram<u64>) -> Result<()> {
+    let timestamp = u64::from_le_bytes(payload[..TIMESTAMP_SIZE].try_into().expect("timestamp has eight bytes"));
+    let latency = now_nanos(clock).saturating_sub(timestamp);
+    latencies
+        .record(latency)
+        .with_context(|| format!("record latency of {latency}ns"))?;
+    black_box(payload[TIMESTAMP_SIZE]);
+    Ok(())
+}
+
 fn publish<S>(writer: &mut Writer<S>, message_type: u32, sequence: usize, clock: &Instant) {
     let mut claim = writer.claim_with_user_defined(PAYLOAD_SIZE, true, message_type);
     let payload = claim.get_buffer_mut();
@@ -310,6 +395,7 @@ fn publish<S>(writer: &mut Writer<S>, message_type: u32, sequence: usize, clock:
 
 fn collect_case(
     topology: Topology,
+    reader_api: ReaderApi,
     producer: thread::JoinHandle<ProducerStats>,
     consumers: Vec<thread::JoinHandle<Result<ConsumerStats>>>,
 ) -> Result<CaseResult> {
@@ -333,6 +419,7 @@ fn collect_case(
 
     Ok(CaseResult {
         topology,
+        reader_api,
         producer,
         consumers,
         end_to_end,
@@ -369,7 +456,7 @@ fn print_result(result: &CaseResult, total_messages: usize) {
     let polled = result.consumers.iter().map(|consumer| consumer.polled).sum::<usize>();
     let matched = result.consumers.iter().map(|consumer| consumer.matched).sum::<usize>();
 
-    println!("{}", result.topology.name());
+    println!("{} / {}", result.topology.name(), result.reader_api.name());
     println!(
         "  producer: {:>10.3} ms, {:>12.0} published msg/s",
         result.producer.elapsed.as_secs_f64() * 1_000.0,

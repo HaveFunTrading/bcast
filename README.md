@@ -96,6 +96,18 @@ if let Some(mut batch) = reader.read_batch() {
 }
 ```
 
+Use `read_batch_with_filter` when a consumer only handles selected `user_defined` values. Rejected frames advance the
+reader without copying their payloads:
+
+```rust
+if let Some(mut batch) = reader.read_batch_with_filter(|user_defined| user_defined == 42) {
+    while let Some(msg) = batch.receive_next(&mut payload) {
+        let msg = msg?;
+        println!("{}", String::from_utf8_lossy(msg.payload));
+    }
+}
+```
+
 If you want to copy a bounded raw window out of the ring first and parse it off-ring, use the bulk API:
 
 ```rust

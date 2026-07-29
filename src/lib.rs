@@ -51,7 +51,7 @@ mod writer;
 mod mmap;
 
 pub use error::{Error, Result};
-pub use reader::{Batch, Bulk, BulkIter, Message, Reader};
+pub use reader::{Batch, Bulk, BulkIter, FilteredBatch, Message, Reader};
 pub use storage::{LocalStorage, SharedStorage, Storage, StorageExt, WriteStorage};
 pub use writer::{Claim, Writer, WriterConfig};
 

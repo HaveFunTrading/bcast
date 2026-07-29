@@ -323,6 +323,43 @@ impl<S> Reader<S> {
         })
     }
 
+    /// Open a bounded batch that delivers only messages accepted by `filter`.
+    ///
+    /// The filter receives each non-padding frame's `user_defined` value.
+    /// Returning `true` delivers that message; returning `false` consumes and
+    /// skips it without copying its payload. The filter is retained for the
+    /// lifetime of the returned batch and may keep mutable state.
+    ///
+    /// Like [`Reader::read_batch`], the batch limit is fixed when this method is
+    /// called. Messages published afterwards are not part of the batch.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let mut reader = storage.into_reader();
+    ///
+    /// writer.send_with_user_defined(b"skip", true, 1);
+    /// writer.send_with_user_defined(b"keep", true, 2);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let mut batch = reader
+    ///     .read_batch_with_filter(|user_defined| user_defined == 2)
+    ///     .unwrap();
+    /// assert_eq!(b"keep", batch.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// assert!(batch.receive_next(&mut payload).is_none());
+    /// ```
+    #[inline]
+    pub fn read_batch_with_filter<F>(&mut self, filter: F) -> Option<FilteredBatch<'_, S, F>>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        self.read_batch().map(|batch| batch.with_filter(filter))
+    }
+
     /// Open a bounded raw byte window from this reader's current position to the
     /// last observed producer position.
     ///
@@ -385,8 +422,15 @@ impl<S> Reader<S> {
         }
 
         let payload_len = length as usize;
+        let payload_start = reader_position.wrapping_add(size_of::<FrameHeader>());
+        let payload_index = payload_start & (self.ring.capacity - 1);
+        if payload_index + payload_len > self.ring.capacity {
+            return Err(Error::corrupt_frame(reader_position, payload_index, payload_len, self.ring.capacity));
+        }
+
         Ok(Frame {
             payload_len,
+            payload_index,
             frame_len: get_aligned_size(payload_len) + size_of::<FrameHeader>(),
             user_defined,
             is_fin,
@@ -412,16 +456,15 @@ impl<S> Reader<S> {
             return Err(Error::insufficient_buffer_size(dst.len(), frame.payload_len));
         }
 
-        let payload_start = reader_position.wrapping_add(size_of::<FrameHeader>());
-        let payload_index = payload_start & (self.ring.capacity - 1);
-        if payload_index + frame.payload_len > self.ring.capacity {
-            return Err(Error::corrupt_frame(reader_position, payload_index, frame.payload_len, self.ring.capacity));
-        }
-
         unsafe {
-            copy_nonoverlapping(self.ring.header().data_ptr().add(payload_index), dst.as_mut_ptr(), frame.payload_len);
+            copy_nonoverlapping(
+                self.ring.header().data_ptr().add(frame.payload_index),
+                dst.as_mut_ptr(),
+                frame.payload_len,
+            );
         }
 
+        let payload_start = reader_position.wrapping_add(size_of::<FrameHeader>());
         let claimed_position_after = self.refresh_claimed_position();
         if is_overrun(payload_start, claimed_position_after, self.ring.capacity) {
             return Err(Error::overrun(payload_start));
@@ -470,16 +513,66 @@ impl<S> Reader<S> {
     #[inline]
     pub fn receive_next<'a>(&mut self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
         let end_position = self.readable_limit();
-        self.receive_next_until(end_position, true, dst)
+        self.receive_next_until(end_position, true, dst, |_| true)
+    }
+
+    /// Receive the next pending non-padding message accepted by `filter`.
+    ///
+    /// The filter receives each frame's `user_defined` value. Returning `true`
+    /// delivers that message; returning `false` consumes and skips it without
+    /// copying its payload. Padding frames are skipped without invoking the
+    /// filter.
+    ///
+    /// This call scans only the committed range observed when it begins and
+    /// returns `None` if that range contains no matching message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InsufficientBufferSize`] if `dst` is smaller than the
+    /// next accepted payload. Returns [`Error::Overrun`] if the writer has
+    /// overwritten a frame before it could be read safely. Returns
+    /// [`Error::CorruptFrame`] if a frame header describes payload bytes outside
+    /// the ring.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let mut reader = storage.into_reader();
+    ///
+    /// writer.send_with_user_defined(b"skip", true, 1);
+    /// writer.send_with_user_defined(b"keep", true, 2);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let msg = reader
+    ///     .receive_next_with_filter(&mut payload, |user_defined| user_defined == 2)
+    ///     .unwrap()
+    ///     .unwrap();
+    /// assert_eq!(b"keep", msg.payload);
+    /// ```
+    #[inline]
+    pub fn receive_next_with_filter<'a, F>(&mut self, dst: &'a mut [u8], filter: F) -> Option<Result<Message<'a>>>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        let end_position = self.readable_limit();
+        self.receive_next_until(end_position, false, dst, filter)
     }
 
     #[inline]
-    fn receive_next_until<'a>(
+    fn receive_next_until<'a, F>(
         &mut self,
         mut end_position: usize,
         refresh_after_padding: bool,
         dst: &'a mut [u8],
-    ) -> Option<Result<Message<'a>>> {
+        mut filter: F,
+    ) -> Option<Result<Message<'a>>>
+    where
+        F: FnMut(u32) -> bool,
+    {
         let mut skipped_padding = false;
 
         loop {
@@ -503,6 +596,11 @@ impl<S> Reader<S> {
             if frame.is_padding {
                 self.advance_position(frame.frame_len);
                 skipped_padding = true;
+                continue;
+            }
+
+            if !filter(frame.user_defined) {
+                self.advance_position(frame.frame_len);
                 continue;
             }
 
@@ -562,8 +660,9 @@ impl<S> Reader<S> {
 ///
 /// The payload slice always points into caller-owned memory:
 ///
-/// - for [`Reader::receive_next`] and [`Batch::receive_next`], it points into
-///   the destination buffer passed by the caller.
+/// - for [`Reader::receive_next`], [`Reader::receive_next_with_filter`],
+///   [`Batch::receive_next`], and [`FilteredBatch::receive_next`], it points
+///   into the destination buffer passed by the caller.
 /// - for [`BulkIter`], it points into the copied bulk buffer being iterated.
 #[derive(Debug, Clone, Copy)]
 pub struct Message<'a> {
@@ -591,7 +690,7 @@ pub struct Batch<'a, S> {
     end_position: usize,
 }
 
-impl<S> Batch<'_, S> {
+impl<'batch, S> Batch<'batch, S> {
     /// Return the number of raw frame bytes remaining in this batch.
     ///
     /// # Example
@@ -642,7 +741,41 @@ impl<S> Batch<'_, S> {
     /// ```
     #[inline]
     pub fn receive_next<'a>(&mut self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
-        self.reader.receive_next_until(self.end_position, false, dst)
+        self.reader.receive_next_until(self.end_position, false, dst, |_| true)
+    }
+
+    /// Consume this batch and attach a `user_defined` filter.
+    ///
+    /// The returned [`FilteredBatch`] has the same fixed endpoint as this
+    /// batch. Its filter is evaluated lazily by
+    /// [`FilteredBatch::receive_next`]. Returning `true` from the filter
+    /// delivers a message; returning `false` consumes and skips it without
+    /// copying its payload.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let mut reader = storage.into_reader();
+    ///
+    /// writer.send_with_user_defined(b"skip", true, 1);
+    /// writer.send_with_user_defined(b"keep", true, 2);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let batch = reader.read_batch().unwrap();
+    /// let mut batch = batch.with_filter(|user_defined| user_defined == 2);
+    /// assert_eq!(b"keep", batch.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// assert!(batch.receive_next(&mut payload).is_none());
+    /// ```
+    #[inline]
+    pub fn with_filter<F>(self, filter: F) -> FilteredBatch<'batch, S, F>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        FilteredBatch { batch: self, filter }
     }
 
     /// Consume this batch and reset the underlying reader to the producer's
@@ -719,6 +852,154 @@ impl<S> Batch<'_, S> {
 
         self.reader.position = self.end_position;
         Ok(())
+    }
+}
+
+/// Bounded batch that delivers messages accepted by a `user_defined` filter.
+///
+/// Create one with [`Reader::read_batch_with_filter`] or
+/// [`Batch::with_filter`]. Rejected messages are consumed without copying their
+/// payloads, while accepted messages are returned through
+/// [`FilteredBatch::receive_next`].
+pub struct FilteredBatch<'a, S, F> {
+    batch: Batch<'a, S>,
+    filter: F,
+}
+
+impl<S, F> FilteredBatch<'_, S, F> {
+    /// Return the number of raw frame bytes remaining in this batch.
+    ///
+    /// This includes both matching and rejected frames that have not yet been
+    /// examined.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let mut reader = storage.into_reader();
+    /// writer.send_with_user_defined(b"hello", true, 1);
+    ///
+    /// let batch = reader
+    ///     .read_batch_with_filter(|user_defined| user_defined == 1)
+    ///     .unwrap();
+    /// assert!(batch.remaining() >= b"hello".len());
+    /// ```
+    #[inline]
+    pub const fn remaining(&self) -> usize {
+        self.batch.remaining()
+    }
+
+    /// Consume this filtered batch and reset the underlying reader to the
+    /// producer's current committed position.
+    ///
+    /// This is the intended recovery path when
+    /// [`FilteredBatch::receive_next`] returns [`Error::Overrun`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use bcast::{Error, Reader};
+    ///
+    /// fn poll<S>(reader: &mut Reader<S>, payload: &mut [u8]) -> Result<(), Error> {
+    ///     let Some(mut batch) = reader.read_batch_with_filter(|kind| kind == 1) else {
+    ///         return Ok(());
+    ///     };
+    ///
+    ///     while let Some(result) = batch.receive_next(payload) {
+    ///         match result {
+    ///             Ok(message) => {
+    ///                 let _ = message.payload;
+    ///             }
+    ///             Err(Error::Overrun(_)) => {
+    ///                 batch.reset();
+    ///                 return Ok(());
+    ///             }
+    ///             Err(error) => return Err(error),
+    ///         }
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    #[inline]
+    pub fn reset(self) {
+        self.batch.reset();
+    }
+
+    /// Skip all frames remaining in this filtered batch.
+    ///
+    /// On success the underlying reader advances to the fixed endpoint captured
+    /// when the batch was created.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let mut reader = storage.into_reader();
+    /// writer.send_with_user_defined(b"old", true, 1);
+    ///
+    /// reader
+    ///     .read_batch_with_filter(|kind| kind == 1)
+    ///     .unwrap()
+    ///     .skip_remaining()
+    ///     .unwrap();
+    ///
+    /// writer.send_with_user_defined(b"new", true, 1);
+    /// let mut payload = [0u8; 16];
+    /// assert_eq!(b"new", reader.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// ```
+    #[inline]
+    pub fn skip_remaining(self) -> Result<()> {
+        self.batch.skip_remaining()
+    }
+}
+
+impl<S, F> FilteredBatch<'_, S, F>
+where
+    F: FnMut(u32) -> bool,
+{
+    /// Receive the next message accepted by this batch's filter.
+    ///
+    /// Rejected non-padding frames are consumed without copying their payloads.
+    /// Returns `None` when the batch's fixed range has been fully examined.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InsufficientBufferSize`] if `dst` is smaller than the
+    /// next accepted payload. Returns [`Error::Overrun`] if the writer has
+    /// overwritten a frame before it could be read safely. Returns
+    /// [`Error::CorruptFrame`] if a frame header describes payload bytes outside
+    /// the ring.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bcast::{LocalStorage, StorageExt};
+    ///
+    /// let storage = LocalStorage::with_capacity(1024).into_shared();
+    /// let mut writer = storage.clone().into_writer();
+    /// let mut reader = storage.into_reader();
+    ///
+    /// writer.send_with_user_defined(b"skip", true, 1);
+    /// writer.send_with_user_defined(b"keep", true, 2);
+    ///
+    /// let mut payload = [0u8; 16];
+    /// let mut batch = reader
+    ///     .read_batch_with_filter(|user_defined| user_defined == 2)
+    ///     .unwrap();
+    /// assert_eq!(b"keep", batch.receive_next(&mut payload).unwrap().unwrap().payload);
+    /// assert!(batch.receive_next(&mut payload).is_none());
+    /// ```
+    #[inline]
+    pub fn receive_next<'a>(&mut self, dst: &'a mut [u8]) -> Option<Result<Message<'a>>> {
+        self.batch
+            .reader
+            .receive_next_until(self.batch.end_position, false, dst, &mut self.filter)
     }
 }
 
@@ -986,6 +1267,7 @@ impl<'a> Iterator for BulkIter<'a> {
 #[derive(Clone, Copy)]
 struct Frame {
     payload_len: usize,
+    payload_index: usize,
     frame_len: usize,
     user_defined: u32,
     is_fin: bool,

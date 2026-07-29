@@ -4,8 +4,8 @@
 //!
 //! - [`MmapStorage`] and [`MmapMutStorage`] are storage adapters for the generic
 //!   [`Reader`] and [`Writer`] types.
-//! - [`MappedReader`] and [`MappedWriter`] are convenience wrappers that open the
-//!   memory map from a file path.
+//! - [`MappedReader`] is a convenience wrapper for opening a reader from a file
+//!   path, while [`MappedWriter`] is an alias for `Writer<MmapMutStorage>`.
 //!
 //! The mapped file size must be `HEADER_SIZE + capacity`, where `capacity` is a
 //! power of two and at least 16 bytes.
@@ -15,21 +15,21 @@
 //! mappings are also locked into RAM for their full lifetime; construction
 //! fails if the operating system refuses to lock the complete mapping.
 //!
-//! `MappedWriter` also holds an exclusive sidecar lock at `<path>.lock` for its
-//! full lifetime. Writer construction fails with [`std::io::ErrorKind::WouldBlock`]
-//! if another process already owns the writer lock. Readers do not take file
-//! locks.
+//! Every [`MmapMutStorage`] holds an exclusive sidecar lock at `<path>.lock` for
+//! its full lifetime. Writable storage construction fails with
+//! [`std::io::ErrorKind::WouldBlock`] if another independently opened writable
+//! mapping already owns the writer lock. Readers do not take file locks.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use bcast::{HEADER_SIZE, MappedReader, MappedWriter};
+//! use bcast::{HEADER_SIZE, MappedReader, MappedWriter, MmapMutStorage, StorageExt};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! let path = std::env::temp_dir().join("bcast-example.mmap");
 //! let size = HEADER_SIZE + 1024;
 //!
-//! let mut writer = MappedWriter::new(&path, size)?;
+//! let mut writer: MappedWriter = MmapMutStorage::new(&path, size)?.into_writer();
 //! let mut reader = MappedReader::new(&path)?;
 //!
 //! writer.send(b"hello", true);
@@ -42,7 +42,7 @@
 //! # }
 //! ```
 
-use crate::{Reader, Storage, StorageExt, WriteStorage, Writer, WriterConfig};
+use crate::{Reader, Storage, StorageExt, WriteStorage, Writer};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -110,32 +110,31 @@ unsafe impl Storage for MmapStorage {
 
 /// Writable memory mapped ring storage.
 ///
-/// This adapter owns a writable [`MmapMut`] and can be used with [`Writer`]. Use
-/// it when you want the generic writer API rather than the [`MappedWriter`]
-/// convenience wrapper.
-///
-/// This low-level storage adapter does not take a writer lock. Use
-/// [`MappedWriter`] when opening by path and you want the crate to enforce
-/// single-writer ownership with a sidecar `<path>.lock` file.
+/// This adapter owns a writable [`MmapMut`] and an exclusive sidecar writer lock
+/// at `<path>.lock`. Convert it into [`MappedWriter`] with the methods on
+/// [`StorageExt`].
 pub struct MmapMutStorage {
     mmap: MmapMut,
+    _writer_lock: File,
 }
 
 impl MmapMutStorage {
     /// Create a new writable mapped file of `size` bytes.
     ///
-    /// If the path already exists it is removed first. Parent directories are
-    /// created when needed. The size must be valid for bcast ring construction:
-    /// `HEADER_SIZE + capacity`, where `capacity` is a power of two and at least
-    /// 16 bytes.
+    /// The writer lock at `<path>.lock` is acquired before an existing mapped
+    /// file is replaced. If the path already exists it is removed first. Parent
+    /// directories are created when needed. The size must be valid for bcast
+    /// ring construction: `HEADER_SIZE + capacity`, where `capacity` is a power
+    /// of two and at least 16 bytes.
     ///
     /// The mapping is populated during construction and, on Unix, locked into
     /// RAM for its full lifetime.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the file cannot be created, sized, mapped, or
-    /// locked into RAM.
+    /// Returns an I/O error if the writer lock cannot be acquired, the file
+    /// cannot be created, sized or mapped, or the mapping cannot be locked into
+    /// RAM.
     ///
     /// # Example
     ///
@@ -153,11 +152,14 @@ impl MmapMutStorage {
     /// # }
     /// ```
     pub fn new(path: impl AsRef<Path>, size: usize) -> std::io::Result<Self> {
-        if path.as_ref().exists() {
-            std::fs::remove_file(path.as_ref())?;
+        let path = path.as_ref();
+        let writer_lock = acquire_writer_lock(path)?;
+
+        if path.exists() {
+            std::fs::remove_file(path)?;
         }
 
-        if let Some(parent) = path.as_ref().parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
 
@@ -173,7 +175,10 @@ impl MmapMutStorage {
         let mmap = unsafe { MmapOptions::new().populate().map_mut(&file)? };
         #[cfg(unix)]
         mmap.lock()?;
-        Ok(Self { mmap })
+        Ok(Self {
+            mmap,
+            _writer_lock: writer_lock,
+        })
     }
 
     /// Open an existing file as writable ring storage.
@@ -185,19 +190,25 @@ impl MmapMutStorage {
     /// The mapping is populated during construction and, on Unix, locked into
     /// RAM for its full lifetime.
     ///
-    /// This does not take a writer lock. Use [`MappedWriter::join`] if the
-    /// writer should be protected by the standard sidecar lock.
+    /// The writer lock at `<path>.lock` is acquired before the mapped file is
+    /// opened.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the file cannot be opened or mapped, or if the
-    /// operating system refuses to lock the complete mapping into RAM.
+    /// Returns an I/O error if the writer lock cannot be acquired, the file
+    /// cannot be opened or mapped, or the operating system refuses to lock the
+    /// complete mapping into RAM.
     pub fn attach(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let path = path.as_ref();
+        let writer_lock = acquire_writer_lock(path)?;
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
         let mmap = unsafe { MmapOptions::new().populate().map_mut(&file)? };
         #[cfg(unix)]
         mmap.lock()?;
-        Ok(Self { mmap })
+        Ok(Self {
+            mmap,
+            _writer_lock: writer_lock,
+        })
     }
 }
 
@@ -217,21 +228,20 @@ unsafe impl WriteStorage for MmapMutStorage {}
 
 /// Writer backed by a writable memory mapped file.
 ///
-/// `MappedWriter` dereferences to [`Writer<MmapMutStorage>`], so the normal
-/// writer API is available directly.
-///
-/// The writer owns an exclusive sidecar lock at `<path>.lock` for its full
-/// lifetime. Creating or joining a writer fails with
-/// [`std::io::ErrorKind::WouldBlock`] if another writer already holds that lock.
+/// Construct the writable storage with [`MmapMutStorage::new`] and initialize
+/// it with [`StorageExt::into_writer`], or attach it with
+/// [`MmapMutStorage::attach`] and continue from the existing producer position
+/// with [`StorageExt::join_writer`].
 ///
 /// # Example
 ///
 /// ```no_run
-/// use bcast::{HEADER_SIZE, MappedWriter};
+/// use bcast::{HEADER_SIZE, MappedWriter, MmapMutStorage, StorageExt};
 ///
 /// # fn main() -> std::io::Result<()> {
 /// let path = std::env::temp_dir().join("bcast-writer-example.mmap");
-/// let mut writer = MappedWriter::new(&path, HEADER_SIZE + 1024)?;
+/// let storage = MmapMutStorage::new(&path, HEADER_SIZE + 1024)?;
+/// let mut writer: MappedWriter = storage.into_writer();
 ///
 /// writer.publish(5, true, |payload| payload.copy_from_slice(b"hello"));
 /// writer.send_with_user_defined(b"world", true, 42);
@@ -239,129 +249,7 @@ unsafe impl WriteStorage for MmapMutStorage {}
 /// # Ok(())
 /// # }
 /// ```
-pub struct MappedWriter {
-    _writer_lock: File,
-    writer: Writer<MmapMutStorage>,
-}
-
-impl Deref for MappedWriter {
-    type Target = Writer<MmapMutStorage>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.writer
-    }
-}
-
-impl DerefMut for MappedWriter {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.writer
-    }
-}
-
-impl MappedWriter {
-    /// Create a writer backed by a new memory mapped file of `size` bytes.
-    ///
-    /// If the file already exists it is removed. To continue writing to an
-    /// existing file, use [`MappedWriter::join`] instead. The writer lock at
-    /// `<path>.lock` is acquired before the mapped file is replaced.
-    pub fn new(path: impl AsRef<Path>, size: usize) -> std::io::Result<Self> {
-        Self::new_with_cfg(path, size, |config| config)
-    }
-
-    /// Create a writer backed by a new memory mapped file using custom writer
-    /// configuration.
-    ///
-    /// If the file already exists it is removed. The writer lock at
-    /// `<path>.lock` is acquired before the mapped file is replaced.
-    pub fn new_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(
-        path: impl AsRef<Path>,
-        size: usize,
-        config: F,
-    ) -> std::io::Result<Self> {
-        let writer_lock = acquire_writer_lock(path.as_ref())?;
-        Self::new_with_cfg_locked(path, size, config, writer_lock)
-    }
-
-    fn new_with_cfg_locked<F: FnOnce(WriterConfig) -> WriterConfig>(
-        path: impl AsRef<Path>,
-        size: usize,
-        config: F,
-        writer_lock: File,
-    ) -> std::io::Result<Self> {
-        Ok(Self {
-            _writer_lock: writer_lock,
-            writer: MmapMutStorage::new(path, size)?.into_writer_with_cfg(config),
-        })
-    }
-
-    /// Open an existing mapped file and continue writing from the most recent
-    /// producer position.
-    ///
-    /// The writer lock at `<path>.lock` is acquired before the mapped file is
-    /// opened.
-    pub fn join(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        Self::join_with_cfg(path, |config| config)
-    }
-
-    /// Open an existing mapped file with custom writer configuration and continue
-    /// writing from the most recent producer position.
-    ///
-    /// The writer lock at `<path>.lock` is acquired before the mapped file is
-    /// opened.
-    pub fn join_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(
-        path: impl AsRef<Path>,
-        config: F,
-    ) -> std::io::Result<Self> {
-        let writer_lock = acquire_writer_lock(path.as_ref())?;
-        Self::join_with_cfg_locked(path, config, writer_lock)
-    }
-
-    fn join_with_cfg_locked<F: FnOnce(WriterConfig) -> WriterConfig>(
-        path: impl AsRef<Path>,
-        config: F,
-        writer_lock: File,
-    ) -> std::io::Result<Self> {
-        Ok(Self {
-            _writer_lock: writer_lock,
-            writer: MmapMutStorage::attach(path)?.join_writer_with_cfg(config),
-        })
-    }
-
-    /// Join an existing mapped file when it exists with `size` bytes, otherwise
-    /// create a new mapped writer.
-    ///
-    /// If the path exists with a different size, the file is replaced. The
-    /// writer lock at `<path>.lock` is acquired before the existing file is
-    /// inspected or replaced.
-    pub fn join_or_create(path: impl AsRef<Path>, size: usize) -> std::io::Result<Self> {
-        Self::join_or_create_with_cfg(path, size, |config| config)
-    }
-
-    /// Join an existing mapped file with custom writer configuration when it
-    /// exists with `size` bytes, otherwise create a new mapped writer.
-    ///
-    /// If the path exists with a different size, the file is replaced. The
-    /// writer lock at `<path>.lock` is acquired before the existing file is
-    /// inspected or replaced.
-    pub fn join_or_create_with_cfg<F: FnOnce(WriterConfig) -> WriterConfig>(
-        path: impl AsRef<Path>,
-        size: usize,
-        config: F,
-    ) -> std::io::Result<Self> {
-        let path = path.as_ref();
-        let writer_lock = acquire_writer_lock(path)?;
-        match path.exists() {
-            true => {
-                let file_len = path.metadata()?.len() as usize;
-                match file_len == size {
-                    true => Self::join_with_cfg_locked(path, config, writer_lock),
-                    false => Self::new_with_cfg_locked(path, size, config, writer_lock),
-                }
-            }
-            false => Self::new_with_cfg_locked(path, size, config, writer_lock),
-        }
-    }
-}
+pub type MappedWriter = Writer<MmapMutStorage>;
 
 fn acquire_writer_lock(path: &Path) -> std::io::Result<File> {
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
@@ -396,11 +284,11 @@ fn writer_lock_path(path: &Path) -> std::io::Result<PathBuf> {
 /// # Example
 ///
 /// ```no_run
-/// use bcast::{HEADER_SIZE, MappedReader, MappedWriter};
+/// use bcast::{HEADER_SIZE, MappedReader, MmapMutStorage, StorageExt};
 ///
 /// # fn main() -> std::io::Result<()> {
 /// let path = std::env::temp_dir().join("bcast-reader-example.mmap");
-/// let mut writer = MappedWriter::new(&path, HEADER_SIZE + 1024)?;
+/// let mut writer = MmapMutStorage::new(&path, HEADER_SIZE + 1024)?.into_writer();
 /// writer.send(b"hello", true);
 ///
 /// let mut reader = MappedReader::new_with_position(&path, 0)?;
@@ -483,8 +371,8 @@ impl MappedReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::HEADER_SIZE;
-    use crate::mmap::{MappedReader, MappedWriter, writer_lock_path};
+    use crate::mmap::{MappedReader, MappedWriter, MmapMutStorage, writer_lock_path};
+    use crate::{HEADER_SIZE, StorageExt};
     use std::io::ErrorKind;
     use tempfile::NamedTempFile;
 
@@ -494,7 +382,7 @@ mod tests {
 
         let file = NamedTempFile::new().unwrap();
 
-        let mut writer = MappedWriter::new(&file, RING_BUFFER_SIZE).unwrap();
+        let mut writer: MappedWriter = MmapMutStorage::new(&file, RING_BUFFER_SIZE).unwrap().into_writer();
         let mut reader = MappedReader::new(&file).unwrap();
 
         writer.claim_with_user_defined(32, true, 100).commit();
@@ -519,12 +407,12 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
 
         {
-            let mut writer = MappedWriter::new(&file, RING_BUFFER_SIZE).unwrap();
+            let mut writer: MappedWriter = MmapMutStorage::new(&file, RING_BUFFER_SIZE).unwrap().into_writer();
             writer.claim_with_user_defined(32, true, 100).commit();
             writer.claim_with_user_defined(32, true, 101).commit();
         }
 
-        let mut writer = MappedWriter::join(&file).unwrap();
+        let mut writer: MappedWriter = MmapMutStorage::attach(&file).unwrap().join_writer();
         writer.claim_with_user_defined(32, true, 102).commit();
 
         let mut reader = MappedReader::new_with_position(&file, 0).unwrap();
@@ -542,7 +430,7 @@ mod tests {
 
         let file = NamedTempFile::new().unwrap();
 
-        let mut writer = MappedWriter::new(&file, RING_BUFFER_SIZE).unwrap();
+        let mut writer: MappedWriter = MmapMutStorage::new(&file, RING_BUFFER_SIZE).unwrap().into_writer();
         writer.claim_with_user_defined(504, true, 100).commit();
         writer.claim_with_user_defined(504, true, 101).commit();
         writer.claim_with_user_defined(16, true, 102).commit();
@@ -560,14 +448,14 @@ mod tests {
     }
 
     #[test]
-    fn should_reject_second_mapped_writer_while_lock_is_held() {
+    fn should_reject_second_writable_mapping_while_lock_is_held() {
         const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024;
 
         let file = NamedTempFile::new().unwrap();
 
-        let _writer = MappedWriter::new(&file, RING_BUFFER_SIZE).unwrap();
-        let err = match MappedWriter::join(&file) {
-            Ok(_) => panic!("second mapped writer unexpectedly acquired the writer lock"),
+        let _writer: MappedWriter = MmapMutStorage::new(&file, RING_BUFFER_SIZE).unwrap().into_writer();
+        let err = match MmapMutStorage::attach(&file) {
+            Ok(_) => panic!("second writable mapping unexpectedly acquired the writer lock"),
             Err(err) => err,
         };
 

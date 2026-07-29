@@ -1,5 +1,5 @@
 use crate::common::writer;
-use bcast::HEADER_SIZE;
+use bcast::{HEADER_SIZE, MmapMutStorage, StorageExt};
 use std::path::Path;
 
 mod common;
@@ -9,7 +9,7 @@ mod common;
 /// loss and act accordingly.
 fn main() -> anyhow::Result<()> {
     let path = Path::new("test.dat");
-    let mut writer_handle = bcast::MappedWriter::join_or_create(path, HEADER_SIZE + 1024)?;
+    let mut writer_handle = MmapMutStorage::new(path, HEADER_SIZE + 1024)?.into_writer();
     writer(&mut writer_handle);
 
     Ok(())

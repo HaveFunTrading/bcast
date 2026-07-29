@@ -14,6 +14,9 @@ Relative to the latest non-RC release, `0.0.29`, the 1.0 line makes the reader A
 
 - readers and writers are constructed from storage handles: `storage.into_writer()`, `storage.join_writer()`, `storage.into_reader()`, `storage.into_reader_at(position)` and `storage.into_reader_at_last_lap()`
 - the lazy `Message::read(...)` API is removed; `Reader::receive_next(&mut payload)` and `Batch::receive_next(&mut payload)` now copy directly into caller-provided storage and return a `Message` view over that buffer
+- readers can filter on `user_defined` with `Reader::receive_next_with_filter(...)`, `Reader::read_batch_with_filter(...)` or `Batch::with_filter(...)`; filters may keep mutable state, and rejected messages advance the reader without copying their payloads
+- batches capture a fixed producer endpoint when they are created and borrow their reader exclusively; `Batch::receive_next(...)` and filtered batches use the same receive path as direct reader calls without extending the batch when newer messages arrive
+- `Batch::reset(self)` and `FilteredBatch::reset(self)` provide an overrun recovery path while a batch owns the reader, consuming the batch before resetting the underlying cursor
 - `BulkIter` now yields the same `Message` type as direct receives, so message metadata has one shape across the reader APIs
 - readers can discard without copying via `Reader::skip_next()` and `Batch::skip_remaining()`
 - readers and writers are now generic over owned storage handles; `LocalStorage`, mmap-backed storage and `SharedStorage` cover in-process and file-backed use cases
@@ -23,6 +26,8 @@ Relative to the latest non-RC release, `0.0.29`, the 1.0 line makes the reader A
 - writers can publish via scoped `publish(...)` closures or copy caller-owned payloads via `send(...)`, in addition to the lower-level `claim(...)` API
 - writer publication APIs now require mutable writer access, so the type system prevents multiple open claims from the same writer
 - cursor-advancing reader APIs require mutable reader access; batches and bulk windows borrow the reader exclusively so its cursor cannot advance independently while either is active
+- mmap mappings are populated during construction and, on Unix, locked into RAM for their full lifetime; creating or attaching a mapping fails if the complete mapping cannot be locked, including when `RLIMIT_MEMLOCK` is too small
+- every `MmapMutStorage` owns an exclusive `<path>.lock` sidecar lock for its lifetime, so `StorageExt` writer conversions retain the same single-writer protection; `MappedWriter` is now a type alias for `Writer<MmapMutStorage>`
 
 ## Supported Platforms
 The crate has been developed and tested exclusively on `x86_64-linux`. It should also work (but it's by 
@@ -120,25 +125,25 @@ if let Some(bulk) = reader.read_bulk() {
 }
 ```
 
-When the `mmap` feature is enabled, `MappedWriter` and `MappedReader` provide file-backed wrappers over the same API for IPC-style usage.
-The lower-level `MmapMutStorage` and `MmapStorage` types are also available if you want to construct `Writer` and
-`Reader` directly.
+When the `mmap` feature is enabled, `MmapMutStorage` and `MmapStorage` provide writable and read-only file-backed
+storage. `MappedWriter` is a type alias for `Writer<MmapMutStorage>`, while `MappedReader` remains a convenience wrapper
+for opening a reader directly from a path.
 
-`MappedWriter` holds an exclusive sidecar lock at `<path>.lock` for its full lifetime and returns
-`std::io::ErrorKind::WouldBlock` if another writer already owns the channel. Readers do not take locks. The lower-level
-mmap storage adapters do not take this writer-ownership lock, so use `MappedWriter` when you want the crate to enforce
-single-writer ownership for a file-backed channel.
+Every `MmapMutStorage` holds an exclusive sidecar lock at `<path>.lock` for its full lifetime and returns
+`std::io::ErrorKind::WouldBlock` if another writable mapping already owns the channel. The lock therefore remains in
+effect when the storage is converted through `StorageExt`. Read-only `MmapStorage` and `MappedReader` handles do not
+take writer locks.
 
 All mappings are populated during construction. On Unix they are also locked into RAM for their full lifetime, so
 construction fails when the process's memory-lock limit is too small for the complete mapping.
 
 ```rust
-use bcast::{HEADER_SIZE, MappedReader, MappedWriter};
+use bcast::{HEADER_SIZE, MappedReader, MappedWriter, MmapMutStorage, StorageExt};
 
 let path = "channel.bcast";
 let size = HEADER_SIZE + 1024;
 
-let mut writer = MappedWriter::join_or_create(path, size)?;
+let mut writer: MappedWriter = MmapMutStorage::new(path, size)?.into_writer();
 let mut reader = MappedReader::new(path)?;
 ```
 

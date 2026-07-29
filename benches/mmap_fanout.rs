@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 const CONSUMER_COUNT: usize = 5;
 const DEFAULT_MESSAGES_PER_CONSUMER: usize = 200_000;
+const CLAIM_RESERVE_RATIO: f64 = 0.01;
 const PAYLOAD_SIZE: usize = 73;
 const TIMESTAMP_SIZE: usize = size_of::<u64>();
 const FRAME_SIZE: usize = size_of::<u64>() + PAYLOAD_SIZE.next_multiple_of(size_of::<u64>());
@@ -60,6 +61,7 @@ fn main() -> Result<()> {
     println!("payload: {PAYLOAD_SIZE} bytes ({TIMESTAMP_SIZE}-byte timestamp + 65 data bytes)");
     println!("messages per consumer: {messages_per_consumer}");
     println!("total messages published per case: {total_messages}");
+    println!("writer claim reserve: {:.1}%", CLAIM_RESERVE_RATIO * 100.0);
     println!("reader API: read_batch");
     println!("mmap directory: {SHM_DIRECTORY}");
     println!();
@@ -132,7 +134,8 @@ fn run_shared_channel(messages_per_consumer: usize) -> Result<CaseResult> {
     let producer = thread::Builder::new()
         .name("mmap-shared-producer".into())
         .spawn(move || {
-            let mut writer = writer_storage.into_writer();
+            let mut writer =
+                writer_storage.into_writer_with_cfg(|config| config.claim_reserve_ratio(CLAIM_RESERVE_RATIO));
             producer_barrier.wait();
             let started_at = Instant::now();
 
@@ -184,7 +187,7 @@ fn run_distinct_channels(messages_per_consumer: usize) -> Result<CaseResult> {
         .spawn(move || {
             let mut writers = writer_storages
                 .into_iter()
-                .map(StorageExt::into_writer)
+                .map(|storage| storage.into_writer_with_cfg(|config| config.claim_reserve_ratio(CLAIM_RESERVE_RATIO)))
                 .collect::<Vec<_>>();
             producer_barrier.wait();
             let started_at = Instant::now();

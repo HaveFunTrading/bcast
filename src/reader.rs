@@ -404,11 +404,6 @@ impl<S> Reader<S> {
 
     #[inline]
     fn read_frame(&mut self, reader_position: usize) -> Result<Frame> {
-        let claimed_position_before = self.claimed_position;
-        if is_overrun(reader_position, claimed_position_before, self.ring.capacity) {
-            return Err(Error::overrun(reader_position));
-        }
-
         // extract frame header fields
         let frame_header = self.as_frame_header();
         let (is_fin, is_continuation, is_padding, is_heartbeat, length) = frame_header.unpack_fields();
@@ -1114,11 +1109,6 @@ impl<S> Bulk<'_, S> {
         let start_index = self.start_position & (self.reader.ring.capacity - 1);
         let first_len = min(self.len, self.reader.ring.capacity - start_index);
         let data_ptr = self.reader.ring.header().data_ptr();
-        let claimed_position_before = self.reader.claimed_position;
-
-        if is_overrun(self.start_position, claimed_position_before, self.reader.ring.capacity) {
-            return Err(Error::overrun(self.start_position));
-        }
 
         unsafe {
             copy_nonoverlapping(data_ptr.add(start_index), dst.as_mut_ptr(), first_len);

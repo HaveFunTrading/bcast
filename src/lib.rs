@@ -73,7 +73,7 @@ pub use storage::{LocalStorage, SharedStorage, Storage, StorageExt, WriteStorage
 pub use writer::{Claim, Writer, WriterConfig};
 
 #[cfg(feature = "mmap")]
-pub use mmap::{MappedReader, MappedWriter, MmapMutStorage, MmapStorage};
+pub use mmap::{MappedReader, MappedWriter, MmapMutStorage, MmapStorage, OpenedMmap};
 
 /// Ring buffer header size in bytes.
 pub const HEADER_SIZE: usize = std::mem::size_of::<ring::Header>();

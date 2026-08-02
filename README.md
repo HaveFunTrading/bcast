@@ -154,9 +154,12 @@ use bcast::{HEADER_SIZE, MappedReader, MappedWriter, MmapMutStorage, MmapStorage
 let path = "channel.bcast";
 let size = HEADER_SIZE + 1024;
 
-let mut writer: MappedWriter = MmapMutStorage::new(path, size)?.into_writer();
+let mut writer: MappedWriter = MmapMutStorage::open_or_create(path, size)?.into_writer();
 let mut reader: MappedReader = MmapStorage::attach(path)?.into_reader();
 ```
+
+`open_or_create` joins a valid existing channel or creates a channel only when the path is missing. It returns an
+error rather than replacing an existing file whose size or channel header is invalid.
 
 ## Backpressure (and the lack of it)
 `bcast` design is to allow producer to process and publish messages at full line rate and deliver the same latency irrespective

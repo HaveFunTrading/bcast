@@ -1,6 +1,23 @@
 //! Low latency, single producer & many consumer (SPMC) ring buffer that works with shared memory.
 //! Natively supports variable message sizes.
 //!
+//! ## Platform scope
+//!
+//! `bcast` is optimized for and supported on 64-bit x86 Linux with ordinary cache-coherent,
+//! write-back memory. The single-writer publication and overrun protocol relies on aligned
+//! 64-bit loads and stores, x86 cache coherence, and x86 memory ordering.
+//!
+//! A reader samples the writer's claimed overwrite frontier before and after accessing a
+//! frame. If the writer laps the reader during that access, the result is discarded and
+//! [`Error::Overrun`] is returned. Callers must either propagate that error or call
+//! [`Reader::reset`] to discard missed data and resume at the producer's current committed
+//! position.
+//!
+//! This is a deliberate x86-64 hardware-level protocol, not a portability guarantee for
+//! overlapping non-atomic payload access under Rust's abstract memory model. Other operating
+//! systems and architectures, especially weakly ordered architectures, are unsupported until
+//! separately validated.
+//!
 //! ## Examples
 //! Create `Writer` and use `claim` to publish a message.
 //! ```no_run

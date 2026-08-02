@@ -14,6 +14,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Eq, PartialEq)]
 pub enum Error {
     /// Consumer is unable to keep up with the producer.
+    ///
+    /// The in-progress read is discarded and no payload from that read is
+    /// returned. Propagate this error when data loss is fatal, or call
+    /// [`crate::Reader::reset`] to discard missed data and resume at the
+    /// producer's current committed position.
     Overrun(usize),
     /// The buffer used to read the message is too small.
     InsufficientBufferSize(usize, usize),

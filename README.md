@@ -29,10 +29,21 @@ Relative to the latest non-RC release, `0.0.29`, the 1.0 line makes the reader A
 - mmap mappings are populated during construction and, on Unix, locked into RAM for their full lifetime; creating or attaching a mapping fails if the complete mapping cannot be locked, including when `RLIMIT_MEMLOCK` is too small
 - every `MmapMutStorage` owns an exclusive `<path>.lock` sidecar lock for its lifetime, so `StorageExt` writer conversions retain the same single-writer protection; `MappedReader` and `MappedWriter` are type aliases for their storage-backed generic types
 
-## Supported Platforms
-The crate has been developed and tested exclusively on `x86_64-linux`. It should also work (but it's by 
-no means guaranteed) on CPU architectures with weaker memory ordering semantics. If you want a particular platform
-to be properly supported feel free to contribute and submit a pull request.
+## Platform scope
+
+`bcast` is intentionally optimized for and supported on 64-bit x86 Linux (`x86_64-unknown-linux-*`) using ordinary
+cache-coherent, write-back memory. Its publication and overrun protocol relies on the behaviour of aligned 64-bit
+loads and stores, x86 cache coherence and x86 memory ordering. A channel must have exactly one active writer.
+
+Readers sample the writer's claimed overwrite frontier before and after accessing a frame. If the writer laps a reader
+during that access, the reader discards the result and returns `Error::Overrun`; it never returns that payload as a
+successful message. The caller must then either propagate the error or call `reset()` to discard missed data and resume
+at the producer's current committed position.
+
+This is a deliberate x86-64 hardware-level protocol. It is not a claim that overlapping non-atomic payload access is
+formally portable under Rust's abstract memory model. Other operating systems and CPU architectures, particularly
+architectures with weaker memory ordering, are currently unsupported and require a separate correctness and
+performance validation before use.
 
 ## Example
 

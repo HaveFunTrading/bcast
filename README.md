@@ -184,3 +184,21 @@ if let Some(mut batch) = reader.read_batch() {
     }
 }
 ```
+
+## Benchmarking
+
+The latency benchmarks use monotonic timestamps, discard a warm-up phase and verify that every measured sample was
+received. For stable results, pin benchmark roles to distinct physical cores by listing logical CPU IDs with the
+producer first:
+
+```console
+BCAST_BENCH_CPUS=8,10 RUSTFLAGS="-C target-cpu=native" cargo bench --bench rtt
+BCAST_BENCH_CPUS=8,10 BCAST_RX_INTERVAL_NS=1000 RUSTFLAGS="-C target-cpu=native" cargo bench --bench rx
+BCAST_BENCH_CPUS=8,10,0,2,4,6,12,14,16 RUSTFLAGS="-C target-cpu=native" cargo bench --features mmap --bench throughput
+```
+
+`BCAST_BENCH_WARMUP` controls the RTT and RX warm-up message count. `BCAST_RX_INTERVAL_NS` controls the one-way
+benchmark's offered interval; set it to `0` for an explicit saturation run. The throughput benchmark reports publisher
+time, time until all readers settle, delivery percentage and overruns separately. Its affinity list needs one logical
+CPU for the producer followed by one for each reader in the largest case. It uses independently attached mappings in
+`/dev/shm`; the memory-lock limit must cover the writer mapping plus every reader mapping.

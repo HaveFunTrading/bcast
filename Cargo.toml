@@ -24,6 +24,7 @@ anyhow = "1.0.93"
 rand = "0.8.5"
 memmap2 = "0.9.5"
 hdrhistogram = "7.5.4"
+libc = "0.2.172"
 tempfile = "3.20.0"
 
 [profile.release]
@@ -50,6 +51,7 @@ path = "benches/rx.rs"
 name = "throughput"
 harness = false
 path = "benches/throughput.rs"
+required-features = ["mmap"]
 
 [[bench]]
 name = "mmap_fanout"

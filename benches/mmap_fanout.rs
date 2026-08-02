@@ -1,5 +1,8 @@
+mod common;
+
 use anyhow::{Context, Result, anyhow, ensure};
 use bcast::{HEADER_SIZE, MmapMutStorage, MmapStorage, StorageExt, Writer};
+use common::CpuAffinity;
 use hdrhistogram::Histogram;
 use std::cell::Cell;
 use std::hint::black_box;
@@ -10,6 +13,7 @@ use std::time::{Duration, Instant};
 
 const CONSUMER_COUNT: usize = 5;
 const DEFAULT_MESSAGES_PER_CONSUMER: usize = 200_000;
+const MAX_WARMUP_MESSAGES_PER_CONSUMER: usize = 10_000;
 const CLAIM_RESERVE_RATIO: f64 = 0.01;
 const PAYLOAD_SIZE: usize = 73;
 const TIMESTAMP_SIZE: usize = size_of::<u64>();
@@ -46,6 +50,15 @@ impl ReaderApi {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ConsumerPlan {
+    reader_api: ReaderApi,
+    expected_matches: usize,
+    frames_to_poll: usize,
+    warmup_expected_matches: usize,
+    warmup_frames_to_poll: usize,
+}
+
 struct ProducerStats {
     started_at: Instant,
     elapsed: Duration,
@@ -70,31 +83,39 @@ struct CaseResult {
 
 fn main() -> Result<()> {
     let messages_per_consumer = messages_per_consumer()?;
+    let warmup_messages_per_consumer = messages_per_consumer.min(MAX_WARMUP_MESSAGES_PER_CONSUMER);
     let total_messages = messages_per_consumer
         .checked_mul(CONSUMER_COUNT)
         .context("total message count overflowed usize")?;
+    let affinity = CpuAffinity::from_env(CONSUMER_COUNT + 1)?;
 
     println!("mmap single-producer / five-consumer benchmark");
     println!("payload: {PAYLOAD_SIZE} bytes ({TIMESTAMP_SIZE}-byte timestamp + 65 data bytes)");
     println!("messages per consumer: {messages_per_consumer}");
+    println!("warm-up messages per consumer: {warmup_messages_per_consumer}");
     println!("total messages published per case: {total_messages}");
     println!("writer claim reserve: {:.1}%", CLAIM_RESERVE_RATIO * 100.0);
     println!("reader APIs: read_batch_with_filter, receive_next_with_filter");
     println!("mmap directory: {SHM_DIRECTORY}");
+    affinity.print();
     println!();
 
-    let batch_shared = run_shared_channel(messages_per_consumer, ReaderApi::Batch)?;
+    let batch_shared =
+        run_shared_channel(messages_per_consumer, warmup_messages_per_consumer, ReaderApi::Batch, &affinity)?;
     print_result(&batch_shared, total_messages);
 
-    let batch_distinct = run_distinct_channels(messages_per_consumer, ReaderApi::Batch)?;
+    let batch_distinct =
+        run_distinct_channels(messages_per_consumer, warmup_messages_per_consumer, ReaderApi::Batch, &affinity)?;
     print_result(&batch_distinct, total_messages);
 
     print_topology_comparison(&batch_shared, &batch_distinct, total_messages);
 
-    let direct_shared = run_shared_channel(messages_per_consumer, ReaderApi::Direct)?;
+    let direct_shared =
+        run_shared_channel(messages_per_consumer, warmup_messages_per_consumer, ReaderApi::Direct, &affinity)?;
     print_result(&direct_shared, total_messages);
 
-    let direct_distinct = run_distinct_channels(messages_per_consumer, ReaderApi::Direct)?;
+    let direct_distinct =
+        run_distinct_channels(messages_per_consumer, warmup_messages_per_consumer, ReaderApi::Direct, &affinity)?;
     print_result(&direct_distinct, total_messages);
 
     print_topology_comparison(&direct_shared, &direct_distinct, total_messages);
@@ -161,11 +182,23 @@ fn messages_per_consumer() -> Result<usize> {
     Ok(count)
 }
 
-fn run_shared_channel(messages_per_consumer: usize, reader_api: ReaderApi) -> Result<CaseResult> {
+fn run_shared_channel(
+    messages_per_consumer: usize,
+    warmup_messages_per_consumer: usize,
+    reader_api: ReaderApi,
+    affinity: &CpuAffinity,
+) -> Result<CaseResult> {
     let total_messages = messages_per_consumer
         .checked_mul(CONSUMER_COUNT)
         .context("total message count overflowed usize")?;
-    let capacity = ring_capacity(total_messages)?;
+    let warmup_messages = warmup_messages_per_consumer
+        .checked_mul(CONSUMER_COUNT)
+        .context("warm-up message count overflowed usize")?;
+    let capacity = ring_capacity(
+        total_messages
+            .checked_add(warmup_messages)
+            .context("ring message count overflowed usize")?,
+    )?;
     let directory =
         tempfile::tempdir_in(SHM_DIRECTORY).context("create shared-channel benchmark directory in /dev/shm")?;
     let path = directory.path().join("shared.bcast");
@@ -176,21 +209,34 @@ fn run_shared_channel(messages_per_consumer: usize, reader_api: ReaderApi) -> Re
 
     let consumers = spawn_consumers(
         Topology::Shared,
-        reader_api,
         std::slice::from_ref(&path),
-        messages_per_consumer,
-        total_messages,
+        ConsumerPlan {
+            reader_api,
+            expected_matches: messages_per_consumer,
+            frames_to_poll: total_messages,
+            warmup_expected_matches: warmup_messages_per_consumer,
+            warmup_frames_to_poll: warmup_messages,
+        },
         Arc::clone(&barrier),
         Arc::clone(&clock),
+        affinity,
     );
 
     let producer_barrier = Arc::clone(&barrier);
     let producer_clock = Arc::clone(&clock);
+    let producer_affinity = affinity.clone();
     let producer = thread::Builder::new()
         .name("mmap-shared-producer".into())
-        .spawn(move || {
+        .spawn(move || -> Result<ProducerStats> {
+            producer_affinity.pin_current(0, "mmap shared producer thread")?;
             let mut writer =
                 writer_storage.into_writer_with_cfg(|config| config.claim_reserve_ratio(CLAIM_RESERVE_RATIO));
+            producer_barrier.wait();
+
+            for sequence in 0..warmup_messages {
+                publish(&mut writer, message_type(sequence), sequence, &producer_clock);
+            }
+
             producer_barrier.wait();
             let started_at = Instant::now();
 
@@ -199,18 +245,27 @@ fn run_shared_channel(messages_per_consumer: usize, reader_api: ReaderApi) -> Re
                 publish(&mut writer, message_type, sequence, &producer_clock);
             }
 
-            ProducerStats {
+            Ok(ProducerStats {
                 started_at,
                 elapsed: started_at.elapsed(),
-            }
+            })
         })
         .context("spawn shared-channel producer")?;
 
     collect_case(Topology::Shared, reader_api, producer, consumers)
 }
 
-fn run_distinct_channels(messages_per_consumer: usize, reader_api: ReaderApi) -> Result<CaseResult> {
-    let capacity = ring_capacity(messages_per_consumer)?;
+fn run_distinct_channels(
+    messages_per_consumer: usize,
+    warmup_messages_per_consumer: usize,
+    reader_api: ReaderApi,
+    affinity: &CpuAffinity,
+) -> Result<CaseResult> {
+    let capacity = ring_capacity(
+        messages_per_consumer
+            .checked_add(warmup_messages_per_consumer)
+            .context("ring message count overflowed usize")?,
+    )?;
     let directory =
         tempfile::tempdir_in(SHM_DIRECTORY).context("create distinct-channel benchmark directory in /dev/shm")?;
     let paths = (0..CONSUMER_COUNT)
@@ -228,23 +283,38 @@ fn run_distinct_channels(messages_per_consumer: usize, reader_api: ReaderApi) ->
 
     let consumers = spawn_consumers(
         Topology::Distinct,
-        reader_api,
         &paths,
-        messages_per_consumer,
-        messages_per_consumer,
+        ConsumerPlan {
+            reader_api,
+            expected_matches: messages_per_consumer,
+            frames_to_poll: messages_per_consumer,
+            warmup_expected_matches: warmup_messages_per_consumer,
+            warmup_frames_to_poll: warmup_messages_per_consumer,
+        },
         Arc::clone(&barrier),
         Arc::clone(&clock),
+        affinity,
     );
 
     let producer_barrier = Arc::clone(&barrier);
     let producer_clock = Arc::clone(&clock);
+    let producer_affinity = affinity.clone();
     let producer = thread::Builder::new()
         .name("mmap-distinct-producer".into())
-        .spawn(move || {
+        .spawn(move || -> Result<ProducerStats> {
+            producer_affinity.pin_current(0, "mmap distinct producer thread")?;
             let mut writers = writer_storages
                 .into_iter()
                 .map(|storage| storage.into_writer_with_cfg(|config| config.claim_reserve_ratio(CLAIM_RESERVE_RATIO)))
                 .collect::<Vec<_>>();
+            producer_barrier.wait();
+
+            for sequence in 0..warmup_messages_per_consumer {
+                for (index, writer) in writers.iter_mut().enumerate() {
+                    publish(writer, (index + 1) as u32, sequence, &producer_clock);
+                }
+            }
+
             producer_barrier.wait();
             let started_at = Instant::now();
 
@@ -254,10 +324,10 @@ fn run_distinct_channels(messages_per_consumer: usize, reader_api: ReaderApi) ->
                 }
             }
 
-            ProducerStats {
+            Ok(ProducerStats {
                 started_at,
                 elapsed: started_at.elapsed(),
-            }
+            })
         })
         .context("spawn distinct-channel producer")?;
 
@@ -266,12 +336,11 @@ fn run_distinct_channels(messages_per_consumer: usize, reader_api: ReaderApi) ->
 
 fn spawn_consumers(
     topology: Topology,
-    reader_api: ReaderApi,
     paths: &[PathBuf],
-    messages_per_consumer: usize,
-    frames_to_poll: usize,
+    plan: ConsumerPlan,
     barrier: Arc<Barrier>,
     clock: Arc<Instant>,
+    affinity: &CpuAffinity,
 ) -> Vec<thread::JoinHandle<Result<ConsumerStats>>> {
     (0..CONSUMER_COUNT)
         .map(|index| {
@@ -282,11 +351,13 @@ fn spawn_consumers(
             let barrier = Arc::clone(&barrier);
             let clock = Arc::clone(&clock);
             let expected_type = (index + 1) as u32;
+            let affinity = affinity.clone();
 
             thread::Builder::new()
                 .name(format!("mmap-consumer-{}", index + 1))
                 .spawn(move || {
-                    consume(&path, reader_api, expected_type, messages_per_consumer, frames_to_poll, barrier, clock)
+                    affinity.pin_current(index + 1, "mmap consumer thread")?;
+                    consume(&path, plan, expected_type, barrier, clock)
                 })
                 .expect("spawn consumer")
         })
@@ -295,10 +366,8 @@ fn spawn_consumers(
 
 fn consume(
     path: &Path,
-    reader_api: ReaderApi,
+    plan: ConsumerPlan,
     expected_type: u32,
-    expected_matches: usize,
-    frames_to_poll: usize,
     barrier: Arc<Barrier>,
     clock: Arc<Instant>,
 ) -> Result<ConsumerStats> {
@@ -307,10 +376,54 @@ fn consume(
         .into_reader_at(0);
     let mut payload = [0u8; PAYLOAD_SIZE];
     let mut latencies = Histogram::<u64>::new(3).context("create latency histogram")?;
-    let polled = Cell::new(0);
-    let mut matched = 0;
 
     barrier.wait();
+
+    consume_phase(
+        &mut reader,
+        plan.reader_api,
+        expected_type,
+        plan.warmup_expected_matches,
+        plan.warmup_frames_to_poll,
+        &mut payload,
+        &clock,
+        None,
+    )?;
+
+    barrier.wait();
+    let (polled, matched) = consume_phase(
+        &mut reader,
+        plan.reader_api,
+        expected_type,
+        plan.expected_matches,
+        plan.frames_to_poll,
+        &mut payload,
+        &clock,
+        Some(&mut latencies),
+    )?;
+
+    Ok(ConsumerStats {
+        message_type: expected_type,
+        polled,
+        matched,
+        finished_at: Instant::now(),
+        latencies,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_phase(
+    reader: &mut bcast::MappedReader,
+    reader_api: ReaderApi,
+    expected_type: u32,
+    expected_matches: usize,
+    frames_to_poll: usize,
+    payload: &mut [u8; PAYLOAD_SIZE],
+    clock: &Instant,
+    mut latencies: Option<&mut Histogram<u64>>,
+) -> Result<(usize, usize)> {
+    let polled = Cell::new(0);
+    let mut matched = 0;
 
     match reader_api {
         ReaderApi::Batch => {
@@ -324,7 +437,7 @@ fn consume(
                 };
 
                 while polled.get() < frames_to_poll {
-                    let Some(message) = batch.receive_next(&mut payload) else {
+                    let Some(message) = batch.receive_next(payload) else {
                         break;
                     };
                     let message = message.map_err(|error| {
@@ -333,14 +446,16 @@ fn consume(
                             polled.get()
                         )
                     })?;
-                    record_latency(message.payload, &clock, &mut latencies)?;
+                    if let Some(latencies) = latencies.as_deref_mut() {
+                        record_latency(message.payload, clock, latencies)?;
+                    }
                     matched += 1;
                 }
             }
         }
         ReaderApi::Direct => {
             while polled.get() < frames_to_poll {
-                let Some(message) = reader.receive_next_with_filter(&mut payload, |user_defined| {
+                let Some(message) = reader.receive_next_with_filter(payload, |user_defined| {
                     polled.set(polled.get() + 1);
                     user_defined == expected_type
                 }) else {
@@ -353,7 +468,9 @@ fn consume(
                         polled.get()
                     )
                 })?;
-                record_latency(message.payload, &clock, &mut latencies)?;
+                if let Some(latencies) = latencies.as_deref_mut() {
+                    record_latency(message.payload, clock, latencies)?;
+                }
                 matched += 1;
             }
         }
@@ -365,13 +482,7 @@ fn consume(
         "consumer {expected_type} matched {matched} messages; expected {expected_matches}"
     );
 
-    Ok(ConsumerStats {
-        message_type: expected_type,
-        polled,
-        matched,
-        finished_at: Instant::now(),
-        latencies,
-    })
+    Ok((polled, matched))
 }
 
 fn record_latency(payload: &[u8], clock: &Instant, latencies: &mut Histogram<u64>) -> Result<()> {
@@ -396,10 +507,10 @@ fn publish<S>(writer: &mut Writer<S>, message_type: u32, sequence: usize, clock:
 fn collect_case(
     topology: Topology,
     reader_api: ReaderApi,
-    producer: thread::JoinHandle<ProducerStats>,
+    producer: thread::JoinHandle<Result<ProducerStats>>,
     consumers: Vec<thread::JoinHandle<Result<ConsumerStats>>>,
 ) -> Result<CaseResult> {
-    let producer = producer.join().map_err(|_| anyhow!("producer thread panicked"))?;
+    let producer = producer.join().map_err(|_| anyhow!("producer thread panicked"))??;
     let consumers = consumers
         .into_iter()
         .map(|consumer| consumer.join().map_err(|_| anyhow!("consumer thread panicked"))?)
@@ -472,12 +583,13 @@ fn print_result(result: &CaseResult, total_messages: usize) {
         messages_per_second(polled, result.end_to_end),
     );
     println!(
-        "  latency ns: min={} p50={} p90={} p99={} p99.9={} max={} samples={}",
+        "  latency ns: min={} p50={} p90={} p99={} p99.9={} p99.99={} max={} samples={}",
         result.latencies.min(),
         result.latencies.value_at_percentile(50.0),
         result.latencies.value_at_percentile(90.0),
         result.latencies.value_at_percentile(99.0),
         result.latencies.value_at_percentile(99.9),
+        result.latencies.value_at_percentile(99.99),
         result.latencies.max(),
         result.latencies.len(),
     );

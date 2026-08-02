@@ -207,12 +207,15 @@ producer first:
 
 ```console
 BCAST_BENCH_CPUS=8,10 RUSTFLAGS="-C target-cpu=native" cargo bench --bench rtt
-BCAST_BENCH_CPUS=8,10 BCAST_RX_INTERVAL_NS=1000 RUSTFLAGS="-C target-cpu=native" cargo bench --bench rx
+BCAST_BENCH_CPUS=8,10 BCAST_RX_INTERVAL_NS=1000 RUSTFLAGS="-C target-cpu=native" cargo bench --features mmap --bench rx
 BCAST_BENCH_CPUS=8,10,0,2,4,6,12,14,16 RUSTFLAGS="-C target-cpu=native" cargo bench --features mmap --bench throughput
 ```
 
-`BCAST_BENCH_WARMUP` controls the RTT and RX warm-up message count. `BCAST_RX_INTERVAL_NS` controls the one-way
-benchmark's offered interval; set it to `0` for an explicit saturation run. The throughput benchmark reports publisher
-time, time until all readers settle, delivery percentage and overruns separately. Its affinity list needs one logical
-CPU for the producer followed by one for each reader in the largest case. It uses independently attached mappings in
-`/dev/shm`; the memory-lock limit must cover the writer mapping plus every reader mapping.
+`BCAST_BENCH_WARMUP` controls the RTT and RX warm-up message count. The RX benchmark uses separate writable and
+read-only mappings in `/dev/shm`; `BCAST_RX_MESSAGES`, `BCAST_RX_PAYLOAD_SIZE`, and `BCAST_RX_BURST_SIZE` configure its
+measured workload. `BCAST_RX_INTERVAL_NS` controls the interval between burst starts; set it to `0` for an explicit
+saturation run. The mmap RX and throughput publishers use `Writer::publish` to construct messages directly in claimed
+ring storage. The throughput benchmark reports publisher time, time until all readers settle, delivery percentage and
+overruns separately. Its affinity list needs one logical CPU for the producer followed by one for each reader in the
+largest case. The mmap benchmarks populate and lock each mapping; the memory-lock limit must cover the writer mapping
+plus every reader mapping.

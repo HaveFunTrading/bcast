@@ -104,7 +104,6 @@ fn run_case(api: ReaderApi, reserve_ratio: f64, reader_count: usize, affinity: &
     let writer_storage =
         MmapMutStorage::new(&path, HEADER_SIZE + CAPACITY).context("create throughput benchmark mmap storage")?;
     let mut writer = writer_storage.into_writer_with_cfg(|config| config.claim_reserve_ratio(reserve_ratio));
-    let payload = [0xAB; MESSAGE_SIZE];
     let published = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(reader_count + 1));
 
@@ -126,7 +125,7 @@ fn run_case(api: ReaderApi, reserve_ratio: f64, reader_count: usize, affinity: &
     barrier.wait();
     let started_at = Instant::now();
     for _ in 0..NUM_MESSAGES {
-        writer.send(black_box(&payload), true);
+        writer.publish(MESSAGE_SIZE, true, |payload| payload.fill(black_box(0xAB)));
     }
     let publisher_elapsed = started_at.elapsed();
     published.store(true, Ordering::Release);

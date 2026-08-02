@@ -4,8 +4,8 @@
 //!
 //! - [`MmapStorage`] and [`MmapMutStorage`] are storage adapters for the generic
 //!   [`Reader`] and [`Writer`] types.
-//! - [`MappedReader`] is a convenience wrapper for opening a reader from a file
-//!   path, while [`MappedWriter`] is an alias for `Writer<MmapMutStorage>`.
+//! - [`MappedReader`] and [`MappedWriter`] are aliases for readers and writers
+//!   backed by the corresponding mapped storage types.
 //!
 //! The mapped file size must be `HEADER_SIZE + capacity`, where `capacity` is a
 //! power of two and at least 16 bytes.
@@ -23,14 +23,14 @@
 //! # Example
 //!
 //! ```no_run
-//! use bcast::{HEADER_SIZE, MappedReader, MappedWriter, MmapMutStorage, StorageExt};
+//! use bcast::{HEADER_SIZE, MappedReader, MappedWriter, MmapMutStorage, MmapStorage, StorageExt};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! let path = std::env::temp_dir().join("bcast-example.mmap");
 //! let size = HEADER_SIZE + 1024;
 //!
 //! let mut writer: MappedWriter = MmapMutStorage::new(&path, size)?.into_writer();
-//! let mut reader = MappedReader::new(&path)?;
+//! let mut reader: MappedReader = MmapStorage::attach(&path)?.into_reader();
 //!
 //! writer.send(b"hello", true);
 //!
@@ -42,20 +42,17 @@
 //! # }
 //! ```
 
-use crate::{Reader, Storage, StorageExt, WriteStorage, Writer};
+use crate::{Reader, Storage, WriteStorage, Writer};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::hint;
-use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
 /// Read-only memory mapped ring storage.
 ///
-/// This adapter owns a read-only [`Mmap`] and can be used with [`Reader`]. Use it
-/// when you want the generic reader API rather than the [`MappedReader`]
-/// convenience wrapper.
+/// This adapter owns a read-only [`Mmap`] and can be converted into a
+/// [`MappedReader`] with the methods on [`crate::StorageExt`].
 pub struct MmapStorage {
     mmap: Mmap,
 }
@@ -108,11 +105,37 @@ unsafe impl Storage for MmapStorage {
     }
 }
 
+/// Reader backed by a read-only memory mapped file.
+///
+/// Construct the read-only storage with [`MmapStorage::attach`] and convert it
+/// with [`crate::StorageExt::into_reader`], [`crate::StorageExt::into_reader_at`],
+/// or [`crate::StorageExt::into_reader_at_last_lap`].
+///
+/// # Example
+///
+/// ```no_run
+/// use bcast::{HEADER_SIZE, MappedReader, MmapMutStorage, MmapStorage, StorageExt};
+///
+/// # fn main() -> std::io::Result<()> {
+/// let path = std::env::temp_dir().join("bcast-reader-example.mmap");
+/// let mut writer = MmapMutStorage::new(&path, HEADER_SIZE + 1024)?.into_writer();
+/// writer.send(b"hello", true);
+///
+/// let mut reader: MappedReader = MmapStorage::attach(&path)?.into_reader_at(0);
+/// let mut payload = [0u8; 16];
+/// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
+/// assert_eq!(b"hello", msg.payload);
+/// # let _ = std::fs::remove_file(path);
+/// # Ok(())
+/// # }
+/// ```
+pub type MappedReader = Reader<MmapStorage>;
+
 /// Writable memory mapped ring storage.
 ///
 /// This adapter owns a writable [`MmapMut`] and an exclusive sidecar writer lock
 /// at `<path>.lock`. Convert it into [`MappedWriter`] with the methods on
-/// [`StorageExt`].
+/// [`crate::StorageExt`].
 pub struct MmapMutStorage {
     mmap: MmapMut,
     _writer_lock: File,
@@ -229,9 +252,9 @@ unsafe impl WriteStorage for MmapMutStorage {}
 /// Writer backed by a writable memory mapped file.
 ///
 /// Construct the writable storage with [`MmapMutStorage::new`] and initialize
-/// it with [`StorageExt::into_writer`], or attach it with
+/// it with [`crate::StorageExt::into_writer`], or attach it with
 /// [`MmapMutStorage::attach`] and continue from the existing producer position
-/// with [`StorageExt::join_writer`].
+/// with [`crate::StorageExt::join_writer`].
 ///
 /// # Example
 ///
@@ -276,102 +299,9 @@ fn writer_lock_path(path: &Path) -> std::io::Result<PathBuf> {
     Ok(path.with_file_name(lock_file_name))
 }
 
-/// Reader backed by a read-only memory mapped file.
-///
-/// `MappedReader` dereferences to [`Reader<MmapStorage>`], so the normal reader
-/// API is available directly.
-///
-/// # Example
-///
-/// ```no_run
-/// use bcast::{HEADER_SIZE, MappedReader, MmapMutStorage, StorageExt};
-///
-/// # fn main() -> std::io::Result<()> {
-/// let path = std::env::temp_dir().join("bcast-reader-example.mmap");
-/// let mut writer = MmapMutStorage::new(&path, HEADER_SIZE + 1024)?.into_writer();
-/// writer.send(b"hello", true);
-///
-/// let mut reader = MappedReader::new_with_position(&path, 0)?;
-/// let mut payload = [0u8; 16];
-/// let msg = reader.receive_next(&mut payload).unwrap().unwrap();
-/// assert_eq!(b"hello", msg.payload);
-/// # let _ = std::fs::remove_file(path);
-/// # Ok(())
-/// # }
-/// ```
-pub struct MappedReader {
-    reader: Reader<MmapStorage>,
-}
-
-impl Deref for MappedReader {
-    type Target = Reader<MmapStorage>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.reader
-    }
-}
-
-impl DerefMut for MappedReader {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.reader
-    }
-}
-
-impl MappedReader {
-    /// Open a reader with its initial position set to the producer's current
-    /// position.
-    ///
-    /// This is suitable for consumers that only want messages published after
-    /// they attach. The call waits until the mapped file has non-zero length;
-    /// the underlying [`Reader`] waits until the ring header is initialized.
-    pub fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new().read(true).open(&path)?;
-        // wait until file has been initialised
-        loop {
-            let len = file.metadata()?.len() as usize;
-            if len > 0 {
-                break;
-            }
-            hint::spin_loop()
-        }
-        Ok(Self {
-            reader: MmapStorage::attach(path)?.into_reader(),
-        })
-    }
-
-    /// Open a reader at a specific stream position.
-    ///
-    /// `position` must be aligned to the frame alignment used by the ring.
-    pub fn new_with_position(path: impl AsRef<Path>, position: usize) -> std::io::Result<Self> {
-        Ok(Self {
-            reader: MmapStorage::attach(path)?.into_reader_at(position),
-        })
-    }
-
-    /// Open a reader at the start of the most recent physical ring lap when that
-    /// position is still retained.
-    ///
-    /// If the lap start has already been overwritten, the reader starts at the
-    /// producer's current position instead.
-    pub fn new_at_last_lap(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new().read(true).open(&path)?;
-        // wait until file has been initialised
-        loop {
-            let len = file.metadata()?.len() as usize;
-            if len > 0 {
-                break;
-            }
-            hint::spin_loop()
-        }
-        Ok(Self {
-            reader: MmapStorage::attach(path)?.into_reader_at_last_lap(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::mmap::{MappedReader, MappedWriter, MmapMutStorage, writer_lock_path};
+    use crate::mmap::{MappedReader, MappedWriter, MmapMutStorage, MmapStorage, writer_lock_path};
     use crate::{HEADER_SIZE, StorageExt};
     use std::io::ErrorKind;
     use tempfile::NamedTempFile;
@@ -383,7 +313,7 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
 
         let mut writer: MappedWriter = MmapMutStorage::new(&file, RING_BUFFER_SIZE).unwrap().into_writer();
-        let mut reader = MappedReader::new(&file).unwrap();
+        let mut reader: MappedReader = MmapStorage::attach(&file).unwrap().into_reader();
 
         writer.claim_with_user_defined(32, true, 100).commit();
         writer.claim_with_user_defined(32, true, 101).commit();
@@ -394,7 +324,7 @@ mod tests {
         assert_eq!(101, batch.receive_next(&mut payload).unwrap().unwrap().user_defined);
 
         // attach another (late) reader
-        let mut late_reader = MappedReader::new_with_position(&file, 0).unwrap();
+        let mut late_reader: MappedReader = MmapStorage::attach(&file).unwrap().into_reader_at(0);
         let mut batch = late_reader.read_batch().unwrap();
         assert_eq!(100, batch.receive_next(&mut payload).unwrap().unwrap().user_defined);
         assert_eq!(101, batch.receive_next(&mut payload).unwrap().unwrap().user_defined);
@@ -415,7 +345,7 @@ mod tests {
         let mut writer: MappedWriter = MmapMutStorage::attach(&file).unwrap().join_writer();
         writer.claim_with_user_defined(32, true, 102).commit();
 
-        let mut reader = MappedReader::new_with_position(&file, 0).unwrap();
+        let mut reader: MappedReader = MmapStorage::attach(&file).unwrap().into_reader_at(0);
         let mut batch = reader.read_batch().unwrap();
         let mut payload = [0u8; 32];
         assert_eq!(100, batch.receive_next(&mut payload).unwrap().unwrap().user_defined);
@@ -435,7 +365,7 @@ mod tests {
         writer.claim_with_user_defined(504, true, 101).commit();
         writer.claim_with_user_defined(16, true, 102).commit();
 
-        let mut reader = MappedReader::new_at_last_lap(&file).unwrap();
+        let mut reader: MappedReader = MmapStorage::attach(&file).unwrap().into_reader_at_last_lap();
         let mut payload = [0u8; 16];
         assert_eq!(102, reader.receive_next(&mut payload).unwrap().unwrap().user_defined);
         assert!(reader.receive_next(&mut payload).is_none());

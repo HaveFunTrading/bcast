@@ -1,4 +1,5 @@
 use crate::common::reader;
+use bcast::{MmapStorage, StorageExt};
 use std::fs::OpenOptions;
 
 mod common;
@@ -17,7 +18,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut reader_handle = bcast::MappedReader::new("test.dat")?;
+    let mut reader_handle: bcast::MappedReader = MmapStorage::attach("test.dat")?.into_reader();
     reader(&mut reader_handle)?;
 
     Ok(())

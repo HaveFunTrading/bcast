@@ -20,14 +20,14 @@ Relative to the latest non-RC release, `0.0.29`, the 1.0 line makes the reader A
 - `BulkIter` now yields the same `Message` type as direct receives, so message metadata has one shape across the reader APIs
 - readers can discard without copying via `Reader::skip_next()` and `Batch::skip_remaining()`
 - readers and writers are now generic over owned storage handles; `LocalStorage`, mmap-backed storage and `SharedStorage` cover in-process and file-backed use cases
-- late readers can start from the retained most recent lap via `storage.into_reader_at_last_lap()` / `MappedReader::new_at_last_lap(...)`
+- late readers can start from the retained most recent lap via `storage.into_reader_at_last_lap()`
 - overrun detection now tracks the producer's claimed overwrite frontier separately from committed readable position, with writer-side claim reservation and reader-side producer-position caching to reduce shared cursor traffic
 - writer claim reservation is configured as a capacity ratio, for example `claim_reserve_ratio(0.05)` for 5%
 - writers can publish via scoped `publish(...)` closures or copy caller-owned payloads via `send(...)`, in addition to the lower-level `claim(...)` API
 - writer publication APIs now require mutable writer access, so the type system prevents multiple open claims from the same writer
 - cursor-advancing reader APIs require mutable reader access; batches and bulk windows borrow the reader exclusively so its cursor cannot advance independently while either is active
 - mmap mappings are populated during construction and, on Unix, locked into RAM for their full lifetime; creating or attaching a mapping fails if the complete mapping cannot be locked, including when `RLIMIT_MEMLOCK` is too small
-- every `MmapMutStorage` owns an exclusive `<path>.lock` sidecar lock for its lifetime, so `StorageExt` writer conversions retain the same single-writer protection; `MappedWriter` is now a type alias for `Writer<MmapMutStorage>`
+- every `MmapMutStorage` owns an exclusive `<path>.lock` sidecar lock for its lifetime, so `StorageExt` writer conversions retain the same single-writer protection; `MappedReader` and `MappedWriter` are type aliases for their storage-backed generic types
 
 ## Supported Platforms
 The crate has been developed and tested exclusively on `x86_64-linux`. It should also work (but it's by 
@@ -126,8 +126,8 @@ if let Some(bulk) = reader.read_bulk() {
 ```
 
 When the `mmap` feature is enabled, `MmapMutStorage` and `MmapStorage` provide writable and read-only file-backed
-storage. `MappedWriter` is a type alias for `Writer<MmapMutStorage>`, while `MappedReader` remains a convenience wrapper
-for opening a reader directly from a path.
+storage. `MappedReader` is a type alias for `Reader<MmapStorage>`, and `MappedWriter` is a type alias for
+`Writer<MmapMutStorage>`.
 
 Every `MmapMutStorage` holds an exclusive sidecar lock at `<path>.lock` for its full lifetime and returns
 `std::io::ErrorKind::WouldBlock` if another writable mapping already owns the channel. The lock therefore remains in
@@ -138,13 +138,13 @@ All mappings are populated during construction. On Unix they are also locked int
 construction fails when the process's memory-lock limit is too small for the complete mapping.
 
 ```rust
-use bcast::{HEADER_SIZE, MappedReader, MappedWriter, MmapMutStorage, StorageExt};
+use bcast::{HEADER_SIZE, MappedReader, MappedWriter, MmapMutStorage, MmapStorage, StorageExt};
 
 let path = "channel.bcast";
 let size = HEADER_SIZE + 1024;
 
 let mut writer: MappedWriter = MmapMutStorage::new(path, size)?.into_writer();
-let mut reader = MappedReader::new(path)?;
+let mut reader: MappedReader = MmapStorage::attach(path)?.into_reader();
 ```
 
 ## Backpressure (and the lack of it)

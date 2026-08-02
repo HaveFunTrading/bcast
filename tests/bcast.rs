@@ -952,7 +952,9 @@ fn should_start_read_from_last_producer_position() {
 #[test]
 fn should_not_start_reader_at_retained_window_start_unless_it_is_a_frame_boundary() {
     let storage = shared_storage::<1024>();
-    let mut writer = storage.clone().into_writer();
+    let mut writer = storage
+        .clone()
+        .into_writer_with_cfg(|config| config.claim_reserve_ratio(0.0));
 
     writer.claim(8, true).commit();
 
@@ -1002,7 +1004,9 @@ fn should_start_read_from_beginning_before_first_lap_completes() {
 #[test]
 fn should_not_advance_last_lap_until_new_frame_starts_at_ring_beginning() {
     let storage = shared_storage::<128>();
-    let mut writer = storage.clone().into_writer();
+    let mut writer = storage
+        .clone()
+        .into_writer_with_cfg(|config| config.claim_reserve_ratio(0.0));
 
     writer.claim_with_user_defined(56, true, 100).commit();
     writer.claim_with_user_defined(56, true, 101).commit();
@@ -1047,6 +1051,18 @@ fn should_start_read_from_last_lap_without_writer_config() {
 
     assert_eq!(100, receive_user_defined(&mut reader));
     assert_no_message(&mut reader);
+}
+
+#[test]
+fn should_reserve_one_percent_of_capacity_by_default() {
+    let storage = shared_storage::<64>();
+    let mut writer = storage.clone().into_writer();
+    let mut reader = storage.into_reader_at(0);
+
+    writer.claim(24, true).commit();
+    writer.claim(24, true).commit();
+
+    assert!(matches!(receive_error(&mut reader), Error::Overrun(0)));
 }
 
 #[test]
@@ -1337,8 +1353,11 @@ fn should_allow_batch_reader_to_recover_from_overrun_when_position_wrapped_aroun
 
 #[test]
 fn should_not_overrun_batch_when_reader_has_not_been_lapped() {
-    let (mut writer, reader) = writer_and_reader::<128>();
-    let mut reader = reader.with_initial_position(0);
+    let storage = shared_storage::<128>();
+    let mut writer = storage
+        .clone()
+        .into_writer_with_cfg(|config| config.claim_reserve_ratio(0.0));
+    let mut reader = storage.into_reader_at(0);
 
     for i in 0..4_u32 {
         writer.claim_with_user_defined(16, true, i).commit();
@@ -1356,8 +1375,11 @@ fn should_not_overrun_batch_when_reader_has_not_been_lapped() {
 
 #[test]
 fn should_allow_receive_next_when_reader_has_not_been_lapped() {
-    let (mut writer, reader) = writer_and_reader::<128>();
-    let mut reader = reader.with_initial_position(0);
+    let storage = shared_storage::<128>();
+    let mut writer = storage
+        .clone()
+        .into_writer_with_cfg(|config| config.claim_reserve_ratio(0.0));
+    let mut reader = storage.into_reader_at(0);
 
     for i in 0..4_u32 {
         writer.claim_with_user_defined(16, true, i).commit();

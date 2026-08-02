@@ -22,7 +22,7 @@ Relative to the latest non-RC release, `0.0.29`, the 1.0 line makes the reader A
 - readers and writers are now generic over owned storage handles; `LocalStorage`, mmap-backed storage and `SharedStorage` cover in-process and file-backed use cases
 - late readers can start from the retained most recent lap via `storage.into_reader_at_last_lap()`
 - overrun detection now tracks the producer's claimed overwrite frontier separately from committed readable position, with writer-side claim reservation and reader-side producer-position caching to reduce shared cursor traffic
-- writer claim reservation is configured as a capacity ratio, for example `claim_reserve_ratio(0.05)` for 5%
+- writer claim reservation defaults to 1% of capacity; it can be tuned with `claim_reserve_ratio(...)` or disabled with `claim_reserve_ratio(0.0)` to retain the full ring capacity
 - writers can publish via scoped `publish(...)` closures or copy caller-owned payloads via `send(...)`, in addition to the lower-level `claim(...)` API
 - writer publication APIs now require mutable writer access, so the type system prevents multiple open claims from the same writer
 - cursor-advancing reader APIs require mutable reader access; batches and bulk windows borrow the reader exclusively so its cursor cannot advance independently while either is active

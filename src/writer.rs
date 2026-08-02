@@ -14,6 +14,7 @@ use std::mem::{ManuallyDrop, size_of};
 use std::sync::atomic::Ordering;
 
 const MAX_CLAIM_RESERVE_RATIO: f64 = 0.5;
+const DEFAULT_CLAIM_RESERVE_RATIO: f64 = 0.01;
 
 /// Configuration used to initialize a writer-backed channel.
 #[derive(Debug, Clone, Copy)]
@@ -27,7 +28,7 @@ impl Default for WriterConfig {
         const fn noop_metadata(_: &mut [u8]) {}
         Self {
             metadata: noop_metadata,
-            claim_reserve_ratio: 0.0,
+            claim_reserve_ratio: DEFAULT_CLAIM_RESERVE_RATIO,
         }
     }
 }
@@ -66,7 +67,9 @@ impl WriterConfig {
     ///
     /// A non-zero value reduces the reader's effective retained window by up to
     /// the reserved amount, but lets the writer avoid updating the shared
-    /// claimed-position cursor on every claim. The default is `0.0`.
+    /// claimed-position cursor on every claim. The default is `0.01` (1%). Set
+    /// the ratio to `0.0` to disable reservation and retain the full ring
+    /// capacity.
     ///
     /// # Panics
     ///

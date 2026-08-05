@@ -63,7 +63,8 @@ impl WriterConfig {
     /// a ratio of ring capacity.
     ///
     /// For example, `0.01` reserves 1% and `0.5` reserves 50%. The computed byte
-    /// reservation is rounded up to the next power of two.
+    /// reservation is rounded up to the next power of two and every non-zero
+    /// reservation is at least the 8-byte frame alignment.
     ///
     /// A non-zero value reduces the reader's effective retained window by up to
     /// the reserved amount, but lets the writer avoid updating the shared

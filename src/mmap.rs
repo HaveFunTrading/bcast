@@ -10,6 +10,10 @@
 //! The mapped file size must be `HEADER_SIZE + capacity`, where `capacity` is a
 //! power of two and at least 16 bytes.
 //!
+//! Mapped channel paths must be absolute. Every process attached to a channel
+//! must use the same path without symlink or hard-link aliases so writable
+//! mappings contend on the same sidecar writer lock.
+//!
 //! Mappings are populated when they are created so page-table faults happen
 //! during construction rather than on the reader or writer hot path. On Unix,
 //! mappings are also locked into RAM for their full lifetime; construction
@@ -73,7 +77,8 @@ impl MmapStorage {
     /// # Errors
     ///
     /// Returns an I/O error if the file cannot be opened or mapped, or if the
-    /// operating system refuses to lock the complete mapping into RAM.
+    /// operating system refuses to lock the complete mapping into RAM. Returns
+    /// [`std::io::ErrorKind::InvalidInput`] if `path` is not absolute.
     ///
     /// # Example
     ///
@@ -88,7 +93,9 @@ impl MmapStorage {
     /// # }
     /// ```
     pub fn attach(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new().read(true).open(&path)?;
+        let path = path.as_ref();
+        validate_channel_path(path)?;
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
         let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
         #[cfg(unix)]
         mmap.lock()?;
@@ -161,7 +168,8 @@ impl MmapMutStorage {
     ///
     /// Returns an I/O error if the writer lock cannot be acquired, the file
     /// cannot be created, sized or mapped, or the mapping cannot be locked into
-    /// RAM.
+    /// RAM. Returns [`std::io::ErrorKind::InvalidInput`] if `path` is not
+    /// absolute.
     ///
     /// # Example
     ///
@@ -228,7 +236,8 @@ impl MmapMutStorage {
     ///
     /// Returns an I/O error if the writer lock cannot be acquired, the file
     /// cannot be opened or mapped, or the operating system refuses to lock the
-    /// complete mapping into RAM.
+    /// complete mapping into RAM. Returns [`std::io::ErrorKind::InvalidInput`]
+    /// if `path` is not absolute.
     pub fn attach(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref();
         let writer_lock = acquire_writer_lock(path)?;
@@ -260,11 +269,11 @@ impl MmapMutStorage {
     ///
     /// # Errors
     ///
-    /// Returns [`std::io::ErrorKind::InvalidInput`] when `size` is not a valid
-    /// bcast storage size, and [`std::io::ErrorKind::InvalidData`] when an
-    /// existing file has a different size or an invalid channel header. Other
-    /// file, mapping, memory-lock, and writer-lock failures are returned as I/O
-    /// errors.
+    /// Returns [`std::io::ErrorKind::InvalidInput`] when `path` is not absolute
+    /// or `size` is not a valid bcast storage size, and
+    /// [`std::io::ErrorKind::InvalidData`] when an existing file has a different
+    /// size or an invalid channel header. Other file, mapping, memory-lock, and
+    /// writer-lock failures are returned as I/O errors.
     ///
     /// # Example
     ///
@@ -413,12 +422,16 @@ fn validate_existing_channel(storage: &MmapMutStorage) -> std::io::Result<()> {
     }
     let producer_position = header.producer_position.load(Ordering::Relaxed);
     let claimed_position = header.claimed_position.load(Ordering::Relaxed);
-    if !producer_position.is_multiple_of(align_of::<FrameHeader>())
-        || !claimed_position.is_multiple_of(align_of::<FrameHeader>())
-    {
+    if !producer_position.is_multiple_of(align_of::<FrameHeader>()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "mapped channel contains an unaligned writer position",
+            "mapped channel contains an unaligned producer position",
+        ));
+    }
+    if !claimed_position.is_multiple_of(align_of::<FrameHeader>()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mapped channel contains an unaligned claimed position",
         ));
     }
 
@@ -426,6 +439,8 @@ fn validate_existing_channel(storage: &MmapMutStorage) -> std::io::Result<()> {
 }
 
 fn acquire_writer_lock(path: &Path) -> std::io::Result<File> {
+    validate_channel_path(path)?;
+
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
@@ -441,6 +456,14 @@ fn acquire_writer_lock(path: &Path) -> std::io::Result<File> {
     Ok(lock)
 }
 
+fn validate_channel_path(path: &Path) -> std::io::Result<()> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "mapped channel path must be absolute"));
+    }
+
+    Ok(())
+}
+
 fn writer_lock_path(path: &Path) -> std::io::Result<PathBuf> {
     let file_name = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "mapped writer path must include a file name")
@@ -453,8 +476,10 @@ fn writer_lock_path(path: &Path) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::mmap::{MappedReader, MappedWriter, MmapMutStorage, MmapStorage, OpenedMmap, writer_lock_path};
+    use crate::ring::RingBuffer;
     use crate::{HEADER_SIZE, StorageExt};
     use std::io::ErrorKind;
+    use std::sync::atomic::Ordering;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -643,5 +668,138 @@ mod tests {
         };
         assert_eq!(ErrorKind::WouldBlock, err.kind());
         drop(opened);
+    }
+
+    #[test]
+    fn should_align_default_claim_reservation() {
+        const RING_BUFFER_SIZE: usize = HEADER_SIZE + 64;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("channel.bcast");
+        {
+            let mut writer = MmapMutStorage::open_or_create(&path, RING_BUFFER_SIZE)
+                .unwrap()
+                .into_writer();
+            writer.send(b"x", true);
+        }
+
+        {
+            let storage = MmapMutStorage::attach(&path).unwrap();
+            let claimed_position = RingBuffer::from_storage(&storage)
+                .header()
+                .claimed_position
+                .load(Ordering::Relaxed);
+            assert!(claimed_position.is_multiple_of(8));
+        }
+
+        let opened = MmapMutStorage::open_or_create(&path, RING_BUFFER_SIZE).unwrap();
+        assert!(matches!(opened, OpenedMmap::Existing(_)));
+    }
+
+    #[test]
+    fn should_align_custom_claim_reservation() {
+        const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("channel.bcast");
+        {
+            let mut writer = MmapMutStorage::open_or_create(&path, RING_BUFFER_SIZE)
+                .unwrap()
+                .into_writer_with_cfg(|config| config.claim_reserve_ratio(0.0001));
+            writer.send(b"x", true);
+        }
+
+        {
+            let storage = MmapMutStorage::attach(&path).unwrap();
+            let claimed_position = RingBuffer::from_storage(&storage)
+                .header()
+                .claimed_position
+                .load(Ordering::Relaxed);
+            assert!(claimed_position.is_multiple_of(8));
+        }
+
+        let opened = MmapMutStorage::open_or_create(&path, RING_BUFFER_SIZE).unwrap();
+        assert!(matches!(opened, OpenedMmap::Existing(_)));
+    }
+
+    #[test]
+    fn should_reject_existing_channel_with_unaligned_producer_position() {
+        const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("channel.bcast");
+        {
+            let _writer = MmapMutStorage::open_or_create(&path, RING_BUFFER_SIZE)
+                .unwrap()
+                .into_writer();
+        }
+        {
+            let storage = MmapMutStorage::attach(&path).unwrap();
+            RingBuffer::from_storage(&storage)
+                .header()
+                .producer_position
+                .store(1, Ordering::Relaxed);
+        }
+
+        let err = match MmapMutStorage::open_or_create(&path, RING_BUFFER_SIZE) {
+            Ok(_) => panic!("channel with an unaligned producer position was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(ErrorKind::InvalidData, err.kind());
+    }
+
+    #[test]
+    fn should_reject_existing_channel_with_unaligned_claimed_position() {
+        const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("channel.bcast");
+        {
+            let _writer = MmapMutStorage::open_or_create(&path, RING_BUFFER_SIZE)
+                .unwrap()
+                .into_writer();
+        }
+        {
+            let storage = MmapMutStorage::attach(&path).unwrap();
+            RingBuffer::from_storage(&storage)
+                .header()
+                .claimed_position
+                .store(1, Ordering::Relaxed);
+        }
+
+        let err = match MmapMutStorage::open_or_create(&path, RING_BUFFER_SIZE) {
+            Ok(_) => panic!("channel with an unaligned claimed position was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(ErrorKind::InvalidData, err.kind());
+    }
+
+    #[test]
+    fn should_reject_relative_mapped_channel_paths() {
+        const RING_BUFFER_SIZE: usize = HEADER_SIZE + 1024;
+
+        let reader_err = match MmapStorage::attach("channel.bcast") {
+            Ok(_) => panic!("relative reader path was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(ErrorKind::InvalidInput, reader_err.kind());
+
+        let new_writer_err = match MmapMutStorage::new("channel.bcast", RING_BUFFER_SIZE) {
+            Ok(_) => panic!("relative new-writer path was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(ErrorKind::InvalidInput, new_writer_err.kind());
+
+        let attached_writer_err = match MmapMutStorage::attach("channel.bcast") {
+            Ok(_) => panic!("relative attached-writer path was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(ErrorKind::InvalidInput, attached_writer_err.kind());
+
+        let open_or_create_err = match MmapMutStorage::open_or_create("channel.bcast", RING_BUFFER_SIZE) {
+            Ok(_) => panic!("relative open-or-create path was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(ErrorKind::InvalidInput, open_or_create_err.kind());
     }
 }

@@ -8,7 +8,8 @@ mod common;
 /// attach a reader to it. The memory mapped file must be initialised (it's length set) by the
 /// writer before it can be used.
 fn main() -> anyhow::Result<()> {
-    let file = OpenOptions::new().read(true).open("test.dat")?;
+    let path = std::env::current_dir()?.join("test.dat");
+    let file = OpenOptions::new().read(true).open(&path)?;
 
     // wait until file has been initialised
     loop {
@@ -18,7 +19,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut reader_handle: bcast::MappedReader = MmapStorage::attach("test.dat")?.into_reader();
+    let mut reader_handle: bcast::MappedReader = MmapStorage::attach(path)?.into_reader();
     reader(&mut reader_handle)?;
 
     Ok(())

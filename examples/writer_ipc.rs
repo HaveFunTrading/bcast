@@ -8,7 +8,7 @@ mod common;
 /// If the file exists it will be removed so that any potential readers can detect message
 /// loss and act accordingly.
 fn main() -> anyhow::Result<()> {
-    let path = Path::new("test.dat");
+    let path = std::env::current_dir()?.join(Path::new("test.dat"));
     let mut writer_handle = MmapMutStorage::new(path, HEADER_SIZE + 1024)?.into_writer();
     writer(&mut writer_handle);
 

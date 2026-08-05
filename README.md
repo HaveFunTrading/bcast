@@ -145,13 +145,16 @@ Every `MmapMutStorage` holds an exclusive sidecar lock at `<path>.lock` for its 
 effect when the storage is converted through `StorageExt`. Read-only `MmapStorage` and `MappedReader` handles do not
 take writer locks.
 
+Mapped channel paths must be absolute. Every producer and consumer attached to a channel must use the same path without
+symlink or hard-link aliases, ensuring that writable mappings contend on the same sidecar lock.
+
 All mappings are populated during construction. On Unix they are also locked into RAM for their full lifetime, so
 construction fails when the process's memory-lock limit is too small for the complete mapping.
 
 ```rust
 use bcast::{HEADER_SIZE, MappedReader, MappedWriter, MmapMutStorage, MmapStorage, StorageExt};
 
-let path = "channel.bcast";
+let path = "/run/my-service/channel.bcast";
 let size = HEADER_SIZE + 1024;
 
 let mut writer: MappedWriter = MmapMutStorage::open_or_create(path, size)?.into_writer();

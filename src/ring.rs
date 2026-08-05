@@ -270,7 +270,10 @@ pub const fn is_position_at_or_after(position: usize, base: usize) -> bool {
     position == base || is_position_after(position, base)
 }
 
-/// Convert a claim-reserve ratio into rounded byte capacity.
+/// Convert a claim-reserve ratio into aligned, rounded byte capacity.
+///
+/// Every non-zero reservation is at least one frame-header alignment so adding
+/// it to an aligned claim end keeps the shared claimed position aligned.
 #[inline]
 pub const fn claim_reserve_bytes(capacity: usize, ratio: f64) -> usize {
     if ratio <= 0.0 {
@@ -278,7 +281,12 @@ pub const fn claim_reserve_bytes(capacity: usize, ratio: f64) -> usize {
     }
 
     let bytes = (capacity as f64 * ratio).ceil() as usize;
-    bytes.next_power_of_two()
+    let rounded = bytes.next_power_of_two();
+    if rounded < align_of::<FrameHeader>() {
+        align_of::<FrameHeader>()
+    } else {
+        rounded
+    }
 }
 
 /// Non-owning view of a storage-backed ring buffer.
@@ -440,6 +448,14 @@ mod tests {
         assert!(frame.is_padding());
         assert!(!frame.is_heartbeat());
         assert_eq!(0, frame.payload_len());
+    }
+
+    #[test]
+    fn should_align_non_zero_claim_reservations_to_frame_headers() {
+        assert_eq!(0, claim_reserve_bytes(64, 0.0));
+        assert_eq!(8, claim_reserve_bytes(64, 0.01));
+        assert_eq!(8, claim_reserve_bytes(1024, 0.0001));
+        assert_eq!(16, claim_reserve_bytes(1024, 0.01));
     }
 
     #[test]

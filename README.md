@@ -67,6 +67,9 @@ if let Some(bulk) = reader.read_bulk() {
 ```
 
 When the `mmap` feature is enabled, `MappedWriter` and `MappedReader` provide file-backed wrappers over the same API for IPC-style usage.
+On Unix, `MappedWriter` locks its complete mapping into RAM for its full lifetime. On Linux kernels that support
+`MADV_POPULATE_WRITE`, it also prefaults the mapping writable during construction. Writer construction fails when
+writable prefaulting or memory locking fails, including when `RLIMIT_MEMLOCK` is too small.
 
 ## Backpressure (and the lack of it)
 `bcast` design is to allow producer to process and publish messages at full line rate and deliver the same latency irrespective

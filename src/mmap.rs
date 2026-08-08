@@ -1,12 +1,18 @@
 //! Provides wrappers for `Reader` and `Writer` to work with memory mapped files.
 
 use crate::{Reader, RingBuffer, Writer};
+#[cfg(target_os = "linux")]
+use memmap2::Advice;
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use std::hint;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
 /// Writer backed by memory mapped object.
+///
+/// On Linux kernels that support `MADV_POPULATE_WRITE`, the complete mapping is
+/// prefaulted writable during construction. On Unix, it is also locked into RAM
+/// for the writer's full lifetime. Construction fails if either operation fails.
 pub struct MappedWriter {
     writer: Writer,
     #[allow(dead_code)]
@@ -50,6 +56,12 @@ impl MappedWriter {
         file.sync_all()?;
 
         let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        #[cfg(target_os = "linux")]
+        if Advice::PopulateWrite.is_supported() {
+            mmap.advise(Advice::PopulateWrite)?;
+        }
+        #[cfg(unix)]
+        mmap.lock()?;
         let bytes = mmap.as_ref();
         Ok(Self {
             writer: RingBuffer::new(bytes).into_writer(),
@@ -62,6 +74,12 @@ impl MappedWriter {
     pub fn join(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
         let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        #[cfg(target_os = "linux")]
+        if Advice::PopulateWrite.is_supported() {
+            mmap.advise(Advice::PopulateWrite)?;
+        }
+        #[cfg(unix)]
+        mmap.lock()?;
         let bytes = mmap.as_ref();
         Ok(Self {
             writer: RingBuffer::new(bytes).join_writer(),

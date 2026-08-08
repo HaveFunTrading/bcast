@@ -14,10 +14,11 @@
 //! must use the same path without symlink or hard-link aliases so writable
 //! mappings contend on the same sidecar writer lock.
 //!
-//! Mappings are populated when they are created so page-table faults happen
-//! during construction rather than on the reader or writer hot path. On Unix,
-//! mappings are also locked into RAM for their full lifetime; construction
-//! fails if the operating system refuses to lock the complete mapping.
+//! On Unix, mappings are locked into RAM for their full lifetime, which also
+//! prefaults them readable during construction. On Linux kernels that support
+//! `MADV_POPULATE_WRITE`, writable mappings are prefaulted writable before they
+//! are locked so their initial write faults happen during construction rather
+//! than on the writer hot path. Construction fails if either operation fails.
 //!
 //! Every [`MmapMutStorage`] holds an exclusive sidecar lock at `<path>.lock` for
 //! its full lifetime. Writable storage construction fails with
@@ -48,6 +49,8 @@
 
 use crate::ring::{FrameHeader, HEADER_MAGIC, HEADER_VERSION, RingBuffer};
 use crate::{HEADER_SIZE, Reader, Storage, WriteStorage, Writer, WriterConfig};
+#[cfg(target_os = "linux")]
+use memmap2::Advice;
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -71,8 +74,8 @@ impl MmapStorage {
     /// the ring header through [`Reader::new`] or [`Reader::new_at_last_lap`],
     /// not here.
     ///
-    /// The mapping is populated during construction and, on Unix, locked into
-    /// RAM for its full lifetime.
+    /// On Unix, the mapping is prefaulted readable and locked into RAM during
+    /// construction and remains locked for its full lifetime.
     ///
     /// # Errors
     ///
@@ -96,7 +99,7 @@ impl MmapStorage {
         let path = path.as_ref();
         validate_channel_path(path)?;
         let file = std::fs::OpenOptions::new().read(true).open(path)?;
-        let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
         #[cfg(unix)]
         mmap.lock()?;
         Ok(Self { mmap })
@@ -161,15 +164,15 @@ impl MmapMutStorage {
     /// ring construction: `HEADER_SIZE + capacity`, where `capacity` is a power
     /// of two and at least 16 bytes.
     ///
-    /// The mapping is populated during construction and, on Unix, locked into
-    /// RAM for its full lifetime.
+    /// On supported Linux kernels, the mapping is prefaulted writable during
+    /// construction. On Unix, it is also locked into RAM for its full lifetime.
     ///
     /// # Errors
     ///
     /// Returns an I/O error if the writer lock cannot be acquired, the file
-    /// cannot be created, sized or mapped, or the mapping cannot be locked into
-    /// RAM. Returns [`std::io::ErrorKind::InvalidInput`] if `path` is not
-    /// absolute.
+    /// cannot be created, sized or mapped, or the mapping cannot be prefaulted
+    /// writable or locked into RAM. Returns [`std::io::ErrorKind::InvalidInput`]
+    /// if `path` is not absolute.
     ///
     /// # Example
     ///
@@ -211,7 +214,11 @@ impl MmapMutStorage {
         file.set_len(size as u64)?;
         file.sync_all()?;
 
-        let mmap = unsafe { MmapOptions::new().populate().map_mut(&file)? };
+        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        #[cfg(target_os = "linux")]
+        if Advice::PopulateWrite.is_supported() {
+            mmap.advise(Advice::PopulateWrite)?;
+        }
         #[cfg(unix)]
         mmap.lock()?;
         Ok(Self {
@@ -226,8 +233,8 @@ impl MmapMutStorage {
     /// [`Writer::join_with_cfg`] with the returned storage to continue writing to
     /// an existing channel.
     ///
-    /// The mapping is populated during construction and, on Unix, locked into
-    /// RAM for its full lifetime.
+    /// On supported Linux kernels, the mapping is prefaulted writable during
+    /// construction. On Unix, it is also locked into RAM for its full lifetime.
     ///
     /// The writer lock at `<path>.lock` is acquired before the mapped file is
     /// opened.
@@ -235,9 +242,9 @@ impl MmapMutStorage {
     /// # Errors
     ///
     /// Returns an I/O error if the writer lock cannot be acquired, the file
-    /// cannot be opened or mapped, or the operating system refuses to lock the
-    /// complete mapping into RAM. Returns [`std::io::ErrorKind::InvalidInput`]
-    /// if `path` is not absolute.
+    /// cannot be opened or mapped, or the mapping cannot be prefaulted writable
+    /// or locked completely into RAM. Returns
+    /// [`std::io::ErrorKind::InvalidInput`] if `path` is not absolute.
     pub fn attach(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref();
         let writer_lock = acquire_writer_lock(path)?;
@@ -247,7 +254,11 @@ impl MmapMutStorage {
 
     fn attach_locked(path: &Path, writer_lock: File) -> std::io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mmap = unsafe { MmapOptions::new().populate().map_mut(&file)? };
+        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        #[cfg(target_os = "linux")]
+        if Advice::PopulateWrite.is_supported() {
+            mmap.advise(Advice::PopulateWrite)?;
+        }
         #[cfg(unix)]
         mmap.lock()?;
         Ok(Self {
@@ -272,8 +283,8 @@ impl MmapMutStorage {
     /// Returns [`std::io::ErrorKind::InvalidInput`] when `path` is not absolute
     /// or `size` is not a valid bcast storage size, and
     /// [`std::io::ErrorKind::InvalidData`] when an existing file has a different
-    /// size or an invalid channel header. Other file, mapping, memory-lock, and
-    /// writer-lock failures are returned as I/O errors.
+    /// size or an invalid channel header. Other file, mapping, writable-prefault,
+    /// memory-lock, and writer-lock failures are returned as I/O errors.
     ///
     /// # Example
     ///

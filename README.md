@@ -26,7 +26,7 @@ Relative to the latest non-RC release, `0.0.29`, the 1.0 line makes the reader A
 - writers can publish via scoped `publish(...)` closures or copy caller-owned payloads via `send(...)`, in addition to the lower-level `claim(...)` API
 - writer publication APIs now require mutable writer access, so the type system prevents multiple open claims from the same writer
 - cursor-advancing reader APIs require mutable reader access; batches and bulk windows borrow the reader exclusively so its cursor cannot advance independently while either is active
-- mmap mappings are populated during construction and, on Unix, locked into RAM for their full lifetime; creating or attaching a mapping fails if the complete mapping cannot be locked, including when `RLIMIT_MEMLOCK` is too small
+- mmap mappings are prefaulted readable and, on Unix, locked into RAM for their full lifetime; on supported Linux kernels, writable mappings are prefaulted writable as well; creating or attaching a mapping fails if the complete mapping cannot be locked, including when `RLIMIT_MEMLOCK` is too small
 - every `MmapMutStorage` owns an exclusive `<path>.lock` sidecar lock for its lifetime, so `StorageExt` writer conversions retain the same single-writer protection; `MappedReader` and `MappedWriter` are type aliases for their storage-backed generic types
 
 ## Platform scope
@@ -148,8 +148,10 @@ take writer locks.
 Mapped channel paths must be absolute. Every producer and consumer attached to a channel must use the same path without
 symlink or hard-link aliases, ensuring that writable mappings contend on the same sidecar lock.
 
-All mappings are populated during construction. On Unix they are also locked into RAM for their full lifetime, so
-construction fails when the process's memory-lock limit is too small for the complete mapping.
+On Unix, all mappings are prefaulted readable and locked into RAM during construction, and remain locked for their full
+lifetime. On Linux kernels that support `MADV_POPULATE_WRITE`, writable mappings are prefaulted writable before they
+are locked, moving their initial write faults out of the writer hot path. Construction fails when writable prefaulting
+fails or when the process's memory-lock limit is too small for the complete mapping.
 
 ```rust
 use bcast::{HEADER_SIZE, MappedReader, MappedWriter, MmapMutStorage, MmapStorage, StorageExt};
@@ -220,5 +222,5 @@ measured workload. `BCAST_RX_INTERVAL_NS` controls the interval between burst st
 saturation run. The mmap RX and throughput publishers use `Writer::publish` to construct messages directly in claimed
 ring storage. The throughput benchmark reports publisher time, time until all readers settle, delivery percentage and
 overruns separately. Its affinity list needs one logical CPU for the producer followed by one for each reader in the
-largest case. The mmap benchmarks populate and lock each mapping; the memory-lock limit must cover the writer mapping
+largest case. The mmap benchmarks prefault and lock each mapping; the memory-lock limit must cover the writer mapping
 plus every reader mapping.

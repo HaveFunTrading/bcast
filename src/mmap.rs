@@ -139,6 +139,10 @@ impl MappedReader {
             hint::spin_loop()
         }
         let mmap = unsafe { MmapOptions::new().map(&file)? };
+        #[cfg(target_os = "linux")]
+        if Advice::PopulateRead.is_supported() {
+            mmap.advise(Advice::PopulateRead)?;
+        }
         let bytes = mmap.as_ref();
         Ok(Self {
             reader: RingBuffer::new(bytes).into_reader(),
@@ -150,6 +154,10 @@ impl MappedReader {
     pub fn new_with_position(path: impl AsRef<Path>, position: usize) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new().read(true).open(path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
+        #[cfg(target_os = "linux")]
+        if Advice::PopulateRead.is_supported() {
+            mmap.advise(Advice::PopulateRead)?;
+        }
         let bytes = mmap.as_ref();
         Ok(Self {
             reader: RingBuffer::new(bytes).into_reader().with_initial_position(position),
